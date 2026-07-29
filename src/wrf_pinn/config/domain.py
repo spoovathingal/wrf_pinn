@@ -4,7 +4,8 @@ The residual code should treat space and time as continuous variables, but WRF
 and HRRR data arrive on discrete grids. These small configuration objects keep
 those ideas separate: physical extents define the continuous PINN domain, while
 optional grid spacing and grid counts document the numerical/data grid used to
-sample that domain.
+sample that domain. Coordinate normalization and data scaling are expected to
+happen before data enters this codebase.
 """
 
 from __future__ import annotations
@@ -42,16 +43,6 @@ class CoordinateRange:
         """Return the midpoint of the coordinate interval."""
 
         return 0.5 * (self.minimum + self.maximum)
-
-    def normalize(self, value: float) -> float:
-        """Map a physical coordinate value to [-1, 1]."""
-
-        return 2.0 * (value - self.minimum) / self.length - 1.0
-
-    def denormalize(self, value: float) -> float:
-        """Map a normalized coordinate value in [-1, 1] back to physical units."""
-
-        return self.minimum + 0.5 * (value + 1.0) * self.length
 
 
 @dataclass(frozen=True)
@@ -127,38 +118,6 @@ class CartesianWRFDomain:
             return None
 
         return self.t.length / (self.grid.nt - 1)
-
-    def normalize_point(
-        self,
-        x: float,
-        y: float,
-        z: float,
-        t: float,
-    ) -> tuple[float, float, float, float]:
-        """Map a physical space-time point to normalized coordinates."""
-
-        return (
-            self.x.normalize(x),
-            self.y.normalize(y),
-            self.z.normalize(z),
-            self.t.normalize(t),
-        )
-
-    def denormalize_point(
-        self,
-        x: float,
-        y: float,
-        z: float,
-        t: float,
-    ) -> tuple[float, float, float, float]:
-        """Map a normalized space-time point back to physical coordinates."""
-
-        return (
-            self.x.denormalize(x),
-            self.y.denormalize(y),
-            self.z.denormalize(z),
-            self.t.denormalize(t),
-        )
 
     def as_bounds(self) -> dict[AxisName, tuple[float, float]]:
         """Return coordinate bounds in a sampler-friendly dictionary."""

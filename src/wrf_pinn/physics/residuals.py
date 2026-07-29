@@ -38,10 +38,11 @@ def _gradient(field: torch.Tensor, coordinates: torch.Tensor) -> torch.Tensor:
         create_graph=True,
         retain_graph=True,
         only_inputs=True,
+        allow_unused=True,
     )[0]
 
     if gradient is None:
-        raise RuntimeError("Could not compute gradient for residual evaluation.")
+        gradient = torch.zeros_like(coordinates)
 
     return gradient
 

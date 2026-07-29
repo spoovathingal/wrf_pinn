@@ -18,8 +18,9 @@ class ModelConfig:
     """Configuration for the first Cartesian WRF PINN neural network.
 
     The default is intentionally conservative: a standard fully connected MLP
-    that maps continuous coordinates (x, y, z, t) to the reduced physics state
-    (u, v, w, rho).
+    that maps normalized continuous coordinates (x, y, z, t) to the normalized
+    reduced physics state (u, v, w, rho). Data normalization and scaling happen
+    outside this codebase before tensors are passed to the model.
     """
 
     family: ModelFamily = "mlp"
@@ -29,8 +30,6 @@ class ModelConfig:
     hidden_layers: int = 6
     activation: ActivationName = "tanh"
     initializer: InitializerName = "xavier_uniform"
-    use_input_normalization: bool = True
-    use_output_scaling: bool = True
     residual_connection: bool = False
 
     def __post_init__(self) -> None:

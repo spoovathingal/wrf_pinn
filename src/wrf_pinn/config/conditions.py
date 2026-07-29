@@ -1,8 +1,9 @@
 """Training-condition configuration for WRF PINN experiments.
 
 This module describes which constraints are active during training and how they
-are weighted. It does not compute losses; loss assembly belongs in the training
-package.
+are weighted. The current default recipe uses dense flow-field data and PDE
+residuals only. It does not compute losses; loss assembly belongs in the
+training package.
 """
 
 from __future__ import annotations
@@ -43,9 +44,9 @@ class ConditionsConfig:
     """Top-level configuration for active PINN training conditions."""
 
     pde: ConditionSpec = ConditionSpec("pde", active=True, weight=1.0)
-    initial: ConditionSpec = ConditionSpec("initial", active=True, weight=1.0)
+    initial: ConditionSpec = ConditionSpec("initial", active=False, weight=0.0)
     boundary: ConditionSpec = ConditionSpec("boundary", active=False, weight=0.0)
-    data: ConditionSpec = ConditionSpec("data", active=False, weight=0.0)
+    data: ConditionSpec = ConditionSpec("data", active=True, weight=1.0)
     regularization: ConditionSpec = ConditionSpec(
         "regularization",
         active=False,
