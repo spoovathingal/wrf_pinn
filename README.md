@@ -119,6 +119,8 @@ src/wrf_pinn/
 - `physics/` evaluates PDE and no-slip residuals.
 - `training/losses.py` assembles weighted mean-squared losses.
 - `training/train_pinn.py` performs optimization and records loss history.
+- `evaluation/` writes result files and streams a live training monitor
+  (see [Live training monitor](#live-training-monitor)).
 
 ## Data formats
 
@@ -209,6 +211,59 @@ required whenever PDE loss is active.
 
 `train_pinn` mutates the supplied model and returns a `TrainingHistory`
 containing total and component losses for every epoch.
+
+## Live training monitor
+
+`LiveTrainingMonitor` (in `wrf_pinn.evaluation`) streams training progress to
+disk *as the run proceeds*, so long runs can be watched without waiting for
+completion. It is fully opt-in: `train_pinn` takes an optional `monitor`
+argument that defaults to `None`, so existing scripts are unaffected.
+
+On the logging cadence (`training.log_every`) it writes, into its `output_dir`:
+
+```text
+loss_history.csv   appended each interval (epoch, total, <components>)
+loss_curves.png    re-rendered each interval (open in any viewer; it refreshes)
+loss_curves.gif    time-lapse rebuilt from per-interval frames in frames/
+```
+
+It plots the total plus whichever component losses are active (`pde`,
+`boundary`, `sensor_data`, `flow_field_data`); components that stay zero for the
+whole run are dropped from the plot. All rendering is exception-isolated, so a
+plotting failure logs a warning and never interrupts training.
+
+### Enabling it
+
+The monitor is created in the driver script and passed to `train_pinn`:
+
+```python
+from wrf_pinn.evaluation import LiveTrainingMonitor
+from wrf_pinn.training.train_pinn import COMPONENT_LOSS_NAMES, train_pinn
+
+monitor = LiveTrainingMonitor(
+    output_dir=results_dir / "live",
+    component_names=COMPONENT_LOSS_NAMES,
+    total_epochs=training.epochs,
+)
+history = train_pinn(model=model, ..., monitor=monitor)
+```
+
+Without the `monitor=` argument, training runs exactly as before with no live
+output. `plt`/`matplotlib` is required only when a monitor is used.
+
+## Results output
+
+After a run, `write_training_results` (also in `wrf_pinn.evaluation`) saves an
+organized set of files a separate plotting script can read:
+
+```text
+loss_history.csv   per-epoch total and component losses
+predictions.csv    coordinates with predicted and true state per point
+run_metadata.json  config, dataset shape, final losses, and a file manifest
+```
+
+`predict_flow_field` evaluates a trained model to plain NumPy arrays for the
+predictions file.
 
 ## Installation and dependencies
 
