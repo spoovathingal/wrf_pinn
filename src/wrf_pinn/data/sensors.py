@@ -108,9 +108,14 @@ def read_sensor_data_csv(
     if not coordinate_rows:
         raise ValueError(f"Sensor CSV contains no data rows: {csv_path}.")
 
+    coordinates = np.asarray(coordinate_rows, dtype=np.float32)
+    targets = np.asarray(target_rows, dtype=np.float32)
+    _check_finite(csv_path, "coordinate", columns.coordinates, coordinates)
+    _check_finite(csv_path, "value", columns.values, targets)
+
     return SensorData(
-        coordinates=np.asarray(coordinate_rows, dtype=np.float32),
-        targets=np.asarray(target_rows, dtype=np.float32),
+        coordinates=coordinates,
+        targets=targets,
         coordinate_names=columns.coordinates,
         target_names=columns.values,
     )
@@ -126,3 +131,23 @@ def _validate_columns(
     missing = sorted(required - available)
     if missing:
         raise ValueError(f"Missing sensor columns in {path}: {missing}.")
+
+
+def _check_finite(
+    path: Path,
+    kind: str,
+    names: tuple[str, ...],
+    array: np.ndarray,
+) -> None:
+    """Reject NaN or infinite entries, which would silently poison training."""
+
+    finite = np.isfinite(array)
+    if finite.all():
+        return
+
+    bad_columns = sorted(
+        {names[col] for col in np.unique(np.where(~finite)[1])}
+    )
+    raise ValueError(
+        f"Non-finite (NaN or inf) {kind} values in {path}, columns: {bad_columns}."
+    )
