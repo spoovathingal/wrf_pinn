@@ -13,6 +13,7 @@ separate from the collocation points used to enforce the governing equations.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Protocol
 
 import torch
 from torch import nn
@@ -31,6 +32,15 @@ from wrf_pinn.sampling import sample_collocation_points
 from wrf_pinn.training.losses import LossBreakdown, assemble_pinn_loss
 
 
+#: Component loss names recorded in ``TrainingHistory`` (excludes ``total``).
+COMPONENT_LOSS_NAMES: tuple[str, ...] = (
+    "pde",
+    "boundary",
+    "sensor_data",
+    "flow_field_data",
+)
+
+
 @dataclass
 class TrainingHistory:
     """Loss history recorded during training."""
@@ -40,6 +50,23 @@ class TrainingHistory:
     boundary: list[float] = field(default_factory=list)
     sensor_data: list[float] = field(default_factory=list)
     flow_field_data: list[float] = field(default_factory=list)
+
+
+class TrainingMonitor(Protocol):
+    """Optional live monitor called during training.
+
+    Any object providing these methods can be passed as ``monitor`` to stream
+    progress (for example, an incremental loss plot). ``update`` receives the
+    current epoch, the total loss, and a dict of the component losses named by
+    ``COMPONENT_LOSS_NAMES``. The concrete ``LiveTrainingMonitor`` in
+    ``wrf_pinn.evaluation.live_monitor`` implements this protocol.
+    """
+
+    def update(self, *, epoch: int, total: float, components: dict[str, float]) -> None:
+        ...
+
+    def finalize(self) -> None:
+        ...
 
 
 def train_pinn(
@@ -53,6 +80,7 @@ def train_pinn(
     conditions: ConditionsConfig = DEFAULT_CONDITIONS,
     sampling: SamplingConfig = DEFAULT_SAMPLING,
     physics: PhysicsConfig = DEFAULT_PHYSICS,
+    monitor: TrainingMonitor | None = None,
 ) -> TrainingHistory:
     """Train a WRF PINN using the globally active condition modes.
 
@@ -82,6 +110,11 @@ def train_pinn(
         ``conditions.pde.active`` is true.
     physics:
         Physics configuration passed to the PDE residual evaluator.
+    monitor:
+        Optional live monitor. When given, its ``update`` method is called on
+        the logging cadence with the current epoch's total and component losses,
+        and ``finalize`` is called once training ends. This lets a live plot
+        stream progress during long runs without affecting the training loop.
 
     Returns
     -------
@@ -184,6 +217,18 @@ def train_pinn(
 
         if _should_log(epoch, training):
             _print_progress(epoch, training.epochs, loss)
+            if monitor is not None:
+                monitor.update(
+                    epoch=epoch,
+                    total=float(loss.total.detach().cpu()),
+                    components={
+                        name: float(loss.terms[name].detach().cpu())
+                        for name in COMPONENT_LOSS_NAMES
+                    },
+                )
+
+    if monitor is not None:
+        monitor.finalize()
 
     return history
 
