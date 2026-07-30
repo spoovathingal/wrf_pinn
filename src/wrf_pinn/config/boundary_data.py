@@ -1,8 +1,9 @@
 """Boundary-condition configuration for WRF PINN experiments.
 
 At this stage, the only supported boundary constraint is a no-slip wall. Wall
-boundary points are read from a CSV containing normalized space-time
-coordinates, usually ``x,y,z,t``.
+surface geometry is read from a CSV containing normalized spatial coordinates,
+usually ``x,y,z``. Time-dependent boundary training points can be generated
+later by combining this surface geometry with a training-time sampler.
 """
 
 from __future__ import annotations
@@ -11,21 +12,21 @@ from dataclasses import dataclass
 from typing import Literal
 
 
-WallBoundaryPointFormat = Literal["csv"]
+WallSurfaceFormat = Literal["csv"]
 
 
 @dataclass(frozen=True)
-class WallBoundaryPointConfig:
-    """CSV source for no-slip wall space-time points."""
+class WallSurfaceConfig:
+    """CSV source for no-slip wall surface geometry."""
 
     path: str = ""
-    file_format: WallBoundaryPointFormat = "csv"
-    coordinate_columns: tuple[str, str, str, str] = ("x", "y", "z", "t")
+    file_format: WallSurfaceFormat = "csv"
+    coordinate_columns: tuple[str, str, str] = ("x", "y", "z")
 
     def __post_init__(self) -> None:
-        if len(self.coordinate_columns) != 4:
+        if len(self.coordinate_columns) != 3:
             raise ValueError(
-                "Wall boundary coordinate_columns must contain exactly four "
+                "Wall surface coordinate_columns must contain exactly three "
                 f"columns; got {self.coordinate_columns}."
             )
 
@@ -34,7 +35,7 @@ class WallBoundaryPointConfig:
 class NoSlipWallConfig:
     """Configuration for the no-slip wall residual definition."""
 
-    points: WallBoundaryPointConfig = WallBoundaryPointConfig()
+    surface: WallSurfaceConfig = WallSurfaceConfig()
     velocity_components: tuple[str, ...] = ("u", "v", "w")
 
     def __post_init__(self) -> None:

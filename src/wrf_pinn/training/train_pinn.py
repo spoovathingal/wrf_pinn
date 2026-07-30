@@ -18,17 +18,18 @@ from typing import Protocol
 import torch
 from torch import nn
 
+from wrf_pinn.config.boundary_data import DEFAULT_BOUNDARIES, BoundaryConfig
 from wrf_pinn.config.conditions import DEFAULT_CONDITIONS, ConditionsConfig
 from wrf_pinn.config.domain import CartesianWRFDomain
 from wrf_pinn.config.physics import DEFAULT_PHYSICS, PhysicsConfig
 from wrf_pinn.config.sampling import DEFAULT_SAMPLING, SamplingConfig
 from wrf_pinn.config.training import DEFAULT_TRAINING, OptimizerConfig, TrainingConfig
-from wrf_pinn.data.boundary import WallBoundaryPoints
 from wrf_pinn.data.flow_field import FlowFieldData
 from wrf_pinn.data.sensors import SensorData
 from wrf_pinn.physics.residuals_boundary import no_slip_wall_residuals
 from wrf_pinn.physics.residuals_pde import cartesian_zero_forcing_residuals
 from wrf_pinn.sampling import sample_collocation_points
+from wrf_pinn.sampling import sample_wall_boundary_points
 from wrf_pinn.training.losses import LossBreakdown, assemble_pinn_loss
 
 
@@ -75,7 +76,7 @@ def train_pinn(
     domain: CartesianWRFDomain | None = None,
     flow_field_data: FlowFieldData | None = None,
     sensor_data: SensorData | None = None,
-    boundary_points: WallBoundaryPoints | None = None,
+    boundaries: BoundaryConfig = DEFAULT_BOUNDARIES,
     training: TrainingConfig = DEFAULT_TRAINING,
     conditions: ConditionsConfig = DEFAULT_CONDITIONS,
     sampling: SamplingConfig = DEFAULT_SAMPLING,
@@ -98,9 +99,9 @@ def train_pinn(
     sensor_data:
         Optional sparse normalized sensor data with ``x, y, z, t, u, v, w``.
         This is required only when ``conditions.sensor_data.active`` is true.
-    boundary_points:
-        Optional normalized wall coordinates with ``x, y, z, t``. This is
-        required only when ``conditions.boundary.active`` is true.
+    boundaries:
+        Boundary-condition configuration. The no-slip wall surface path is used
+        by ``sampling.boundary`` when ``conditions.boundary.active`` is true.
     training:
         Optimizer, device, epoch count, and logging configuration.
     conditions:
@@ -126,7 +127,7 @@ def train_pinn(
         domain=domain,
         flow_field_data=flow_field_data,
         sensor_data=sensor_data,
-        boundary_points=boundary_points,
+        boundaries=boundaries,
         conditions=conditions,
     )
 
@@ -145,10 +146,6 @@ def train_pinn(
     sensor_targets: torch.Tensor | None = None
     if sensor_data is not None:
         sensor_coordinates, sensor_targets = sensor_data.as_torch(device=device)
-
-    boundary_coordinates: torch.Tensor | None = None
-    if boundary_points is not None:
-        boundary_coordinates = boundary_points.as_torch(device=device)
 
     for epoch in range(1, training.epochs + 1):
         optimizer.zero_grad()
@@ -172,7 +169,14 @@ def train_pinn(
             )
 
         if conditions.boundary.active:
-            wall_coordinates = _require_tensor(boundary_coordinates, "boundary_points")
+            wall_coordinates = sample_wall_boundary_points(
+                boundary=boundaries.no_slip_wall,
+                sampling=sampling.boundary,
+                flow_field_data=flow_field_data,
+                sensor_data=sensor_data,
+                seed=sampling.seed,
+                device=device,
+            )
             wall_state = model(wall_coordinates)
             boundary_residuals = no_slip_wall_residuals(wall_state)
 
@@ -260,7 +264,7 @@ def _validate_active_inputs(
     domain: CartesianWRFDomain | None,
     flow_field_data: FlowFieldData | None,
     sensor_data: SensorData | None,
-    boundary_points: WallBoundaryPoints | None,
+    boundaries: BoundaryConfig,
     conditions: ConditionsConfig,
 ) -> None:
     """Fail early when an active objective has no corresponding data source."""
@@ -276,8 +280,18 @@ def _validate_active_inputs(
     if conditions.sensor_data.active and sensor_data is None:
         raise ValueError("conditions.sensor_data is active, but sensor_data is None.")
 
-    if conditions.boundary.active and boundary_points is None:
-        raise ValueError("conditions.boundary is active, but boundary_points is None.")
+    if conditions.boundary.active:
+        if not boundaries.no_slip_wall.surface.path:
+            raise ValueError(
+                "conditions.boundary is active, but no no-slip wall surface "
+                "path is configured."
+            )
+
+        if flow_field_data is None and sensor_data is None:
+            raise ValueError(
+                "conditions.boundary is active, but no flow_field_data or "
+                "sensor_data was provided to supply boundary times."
+            )
 
 
 def _sample_pde_coordinates(

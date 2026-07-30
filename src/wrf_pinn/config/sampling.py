@@ -12,7 +12,7 @@ from typing import Literal
 
 
 CollocationSamplingMethod = Literal["random_uniform", "latin_hypercube", "grid"]
-DatasetSamplingMethod = Literal["random", "sequential", "all"]
+DatasetSamplingMethod = Literal["random", "all"]
 
 
 def _validate_optional_n_points(name: str, value: int | None) -> None:

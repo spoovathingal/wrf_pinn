@@ -38,6 +38,18 @@ class SensorData:
 
         return self.targets.shape[1]
 
+    @property
+    def time_index(self) -> int:
+        """Return the coordinate-column index for time."""
+
+        return self.coordinate_names.index("t")
+
+    @property
+    def unique_times(self) -> np.ndarray:
+        """Return sorted unique sensor time values."""
+
+        return np.unique(self.coordinates[:, self.time_index])
+
     def as_torch(self, *, dtype: object | None = None, device: object | None = None):
         """Return coordinates and targets as torch tensors."""
 
