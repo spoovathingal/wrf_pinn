@@ -68,7 +68,7 @@ class GridSpec:
 class CartesianWRFDomain:
     """Continuous Cartesian domain for WRF-style atmospheric PINNs.
 
-    Coordinates use SI-oriented physical units by convention:
+    Coordinates should be appropriateley on:
     x, y, z are in meters and t is in seconds. The vertical coordinate is
     geometric height here; WRF eta-coordinate transforms can be layered on later
     without changing the rest of the training configuration.

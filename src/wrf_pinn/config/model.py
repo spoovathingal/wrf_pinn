@@ -30,7 +30,6 @@ class ModelConfig:
     hidden_layers: int = 6
     activation: ActivationName = "tanh"
     initializer: InitializerName = "xavier_uniform"
-    residual_connection: bool = False
 
     def __post_init__(self) -> None:
         if self.input_dim < 1:

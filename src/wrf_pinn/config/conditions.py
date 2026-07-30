@@ -1,9 +1,8 @@
-"""Training-condition configuration for WRF PINN experiments.
+"""Global loss-mode configuration for WRF PINN experiments.
 
-This module describes which constraints are active during training and how they
-are weighted. The current default recipe uses dense flow-field data and PDE
-residuals only. It does not compute losses; loss assembly belongs in the
-training package.
+This module controls which major training modes are active and how strongly
+each mode contributes to the total loss. It does not read data, evaluate
+residuals, or assemble losses; those responsibilities live elsewhere.
 """
 
 from __future__ import annotations
@@ -14,17 +13,16 @@ from typing import Literal
 
 ConditionName = Literal[
     "pde",
-    "initial",
     "boundary",
-    "data",
-    "regularization",
+    "sensor_data",
+    "flow_field_data",
 ]
 ReductionName = Literal["mean", "sum"]
 
 
 @dataclass(frozen=True)
 class ConditionSpec:
-    """Configuration for one training condition."""
+    """Activation, weight, and reduction for one loss mode."""
 
     name: ConditionName
     active: bool = True
@@ -41,16 +39,15 @@ class ConditionSpec:
 
 @dataclass(frozen=True)
 class ConditionsConfig:
-    """Top-level configuration for active PINN training conditions."""
+    """Top-level configuration for active global loss modes."""
 
     pde: ConditionSpec = ConditionSpec("pde", active=True, weight=1.0)
-    initial: ConditionSpec = ConditionSpec("initial", active=False, weight=0.0)
     boundary: ConditionSpec = ConditionSpec("boundary", active=False, weight=0.0)
-    data: ConditionSpec = ConditionSpec("data", active=True, weight=1.0)
-    regularization: ConditionSpec = ConditionSpec(
-        "regularization",
-        active=False,
-        weight=0.0,
+    sensor_data: ConditionSpec = ConditionSpec("sensor_data", active=False, weight=0.0)
+    flow_field_data: ConditionSpec = ConditionSpec(
+        "flow_field_data",
+        active=True,
+        weight=1.0,
     )
 
     @property
@@ -64,10 +61,9 @@ class ConditionsConfig:
 
         return (
             self.pde,
-            self.initial,
             self.boundary,
-            self.data,
-            self.regularization,
+            self.sensor_data,
+            self.flow_field_data,
         )
 
     def weights(self) -> dict[ConditionName, float]:

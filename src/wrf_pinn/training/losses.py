@@ -72,9 +72,9 @@ def _group_loss(
 def assemble_pinn_loss(
     *,
     pde_residuals: TensorMap | None = None,
-    data_errors: TensorMap | None = None,
-    initial_errors: TensorMap | None = None,
-    boundary_errors: TensorMap | None = None,
+    boundary_residuals: TensorMap | None = None,
+    sensor_data_errors: TensorMap | None = None,
+    flow_field_data_errors: TensorMap | None = None,
     conditions: ConditionsConfig = DEFAULT_CONDITIONS,
 ) -> LossBreakdown:
     """Assemble the weighted PINN training loss.
@@ -84,12 +84,13 @@ def assemble_pinn_loss(
     pde_residuals:
         Residual tensors such as ``mass``, ``x_momentum``, ``y_momentum``, and
         ``z_momentum``.
-    data_errors:
-        Prediction-minus-measurement tensors for WRF, HRRR, or observation data.
-    initial_errors:
-        Prediction-minus-target tensors at the initial time boundary.
-    boundary_errors:
-        Prediction-minus-target tensors on active spatial or temporal boundaries.
+    boundary_residuals:
+        Boundary-condition residual tensors such as no-slip wall velocity
+        residuals.
+    sensor_data_errors:
+        Prediction-minus-measurement tensors for sparse sensor data.
+    flow_field_data_errors:
+        Prediction-minus-measurement tensors for dense flowfield data.
     conditions:
         Condition activation, weighting, and reduction configuration.
 
@@ -101,26 +102,28 @@ def assemble_pinn_loss(
 
     zero = _zero_like_available(
         pde_residuals,
-        data_errors,
-        initial_errors,
-        boundary_errors,
+        boundary_residuals,
+        sensor_data_errors,
+        flow_field_data_errors,
     )
 
     terms: TensorMap = {
         "pde": _group_loss(pde_residuals, conditions.pde, zero),
-        "initial": _group_loss(initial_errors, conditions.initial, zero),
-        "boundary": _group_loss(boundary_errors, conditions.boundary, zero),
-        "data": _group_loss(data_errors, conditions.data, zero),
-        "regularization": zero,
+        "boundary": _group_loss(boundary_residuals, conditions.boundary, zero),
+        "sensor_data": _group_loss(sensor_data_errors, conditions.sensor_data, zero),
+        "flow_field_data": _group_loss(
+            flow_field_data_errors,
+            conditions.flow_field_data,
+            zero,
+        ),
     }
     weighted_terms: TensorMap = {
         name: terms[name] * condition.weight
         for name, condition in (
             ("pde", conditions.pde),
-            ("initial", conditions.initial),
             ("boundary", conditions.boundary),
-            ("data", conditions.data),
-            ("regularization", conditions.regularization),
+            ("sensor_data", conditions.sensor_data),
+            ("flow_field_data", conditions.flow_field_data),
         )
     }
     total = torch.stack(tuple(weighted_terms.values())).sum()

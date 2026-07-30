@@ -1,4 +1,4 @@
-"""Readers for normalized dense flow-field training data."""
+"""Readers for normalized sensor data."""
 
 from __future__ import annotations
 
@@ -8,21 +8,21 @@ from pathlib import Path
 
 import numpy as np
 
-from wrf_pinn.config.flow_field_data import FlowFieldColumnConfig, FlowFieldDataConfig
+from wrf_pinn.config.sensors_data import SensorColumnConfig, SensorDataConfig
 
 
 @dataclass(frozen=True)
-class FlowFieldData:
-    """Normalized coordinate and target arrays for flow-field training."""
+class SensorData:
+    """Normalized sensor coordinates and velocity targets."""
 
     coordinates: np.ndarray
     targets: np.ndarray
-    coordinate_names: tuple[str, ...]
-    target_names: tuple[str, ...]
+    coordinate_names: tuple[str, str, str, str]
+    target_names: tuple[str, str, str]
 
     @property
     def n_points(self) -> int:
-        """Return the number of flow-field samples."""
+        """Return the number of sensor samples."""
 
         return self.coordinates.shape[0]
 
@@ -39,11 +39,7 @@ class FlowFieldData:
         return self.targets.shape[1]
 
     def as_torch(self, *, dtype: object | None = None, device: object | None = None):
-        """Return coordinates and targets as torch tensors.
-
-        PyTorch is imported lazily so this module can still be imported in
-        environments where only NumPy-based data inspection is available.
-        """
+        """Return coordinates and targets as torch tensors."""
 
         import torch
 
@@ -61,32 +57,27 @@ class FlowFieldData:
         return coordinates, targets
 
 
-def read_flow_field(config: FlowFieldDataConfig) -> FlowFieldData:
-    """Read normalized flow-field data from a configured file."""
+def read_sensor_data(config: SensorDataConfig) -> SensorData:
+    """Read normalized sensor data from the configured source."""
 
     if config.file_format != "csv":
-        raise ValueError(f"Unsupported flow-field format: {config.file_format}.")
+        raise ValueError(f"Unsupported sensor data format: {config.file_format}.")
 
-    return read_flow_field_csv(
+    return read_sensor_data_csv(
         path=config.path,
         columns=config.columns,
     )
 
 
-def read_flow_field_csv(
+def read_sensor_data_csv(
     path: str | Path,
-    columns: FlowFieldColumnConfig = FlowFieldColumnConfig(),
-) -> FlowFieldData:
-    """Read normalized flow-field CSV data.
-
-    The CSV file must contain coordinate columns, by default ``x, y, z, t``, and
-    target columns, by default ``u, v, w, rho``. The values are assumed to have
-    already been normalized and scaled outside this package.
-    """
+    columns: SensorColumnConfig = SensorColumnConfig(),
+) -> SensorData:
+    """Read normalized sensor ``x,y,z,t,u,v,w`` data from a CSV file."""
 
     csv_path = Path(path)
     if not csv_path.exists():
-        raise FileNotFoundError(f"Flow-field data file not found: {csv_path}.")
+        raise FileNotFoundError(f"Sensor data file not found: {csv_path}.")
 
     coordinate_rows: list[list[float]] = []
     target_rows: list[list[float]] = []
@@ -94,7 +85,7 @@ def read_flow_field_csv(
     with csv_path.open(newline="") as file:
         reader = csv.DictReader(file)
         if reader.fieldnames is None:
-            raise ValueError(f"Flow-field CSV has no header: {csv_path}.")
+            raise ValueError(f"Sensor CSV has no header: {csv_path}.")
 
         _validate_columns(csv_path, reader.fieldnames, columns)
 
@@ -103,9 +94,9 @@ def read_flow_field_csv(
             target_rows.append([float(row[name]) for name in columns.values])
 
     if not coordinate_rows:
-        raise ValueError(f"Flow-field CSV contains no data rows: {csv_path}.")
+        raise ValueError(f"Sensor CSV contains no data rows: {csv_path}.")
 
-    return FlowFieldData(
+    return SensorData(
         coordinates=np.asarray(coordinate_rows, dtype=np.float32),
         targets=np.asarray(target_rows, dtype=np.float32),
         coordinate_names=columns.coordinates,
@@ -116,10 +107,10 @@ def read_flow_field_csv(
 def _validate_columns(
     path: Path,
     fieldnames: list[str],
-    columns: FlowFieldColumnConfig,
+    columns: SensorColumnConfig,
 ) -> None:
     required = set(columns.coordinates) | set(columns.values)
     available = set(fieldnames)
     missing = sorted(required - available)
     if missing:
-        raise ValueError(f"Missing columns in {path}: {missing}.")
+        raise ValueError(f"Missing sensor columns in {path}: {missing}.")

@@ -1,8 +1,8 @@
-"""Sampling configuration for WRF PINN training points.
+"""Sampling configuration for WRF PINN training.
 
-This module describes how many points should be sampled from different parts of
-the domain. It does not generate points; samplers belong in the data or training
-packages.
+This module controls sample counts and sampling methods only. It does not
+decide whether a loss term is active and it does not set lambda weights. Those
+global objective controls live in ``config.conditions``.
 """
 
 from __future__ import annotations
@@ -10,96 +10,101 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from wrf_pinn.config.boundaries import BOUNDARY_NAMES, BoundaryName
+
+CollocationSamplingMethod = Literal["random_uniform", "latin_hypercube", "grid"]
+DatasetSamplingMethod = Literal["random", "sequential", "all"]
 
 
-SamplingMethod = Literal["random_uniform", "latin_hypercube", "grid"]
+def _validate_optional_n_points(name: str, value: int | None) -> None:
+    if value is not None and value < 1:
+        raise ValueError(f"{name} must be positive when provided; got {value}.")
 
 
 @dataclass(frozen=True)
 class CollocationSamplingConfig:
-    """Interior points where PDE residuals are evaluated."""
+    """Sampling settings for PDE residual collocation points."""
 
     n_points: int = 10000
-    method: SamplingMethod = "latin_hypercube"
-    include_boundaries: bool = False
+    method: CollocationSamplingMethod = "latin_hypercube"
 
     def __post_init__(self) -> None:
         if self.n_points < 1:
-            raise ValueError(f"n_points must be positive; got {self.n_points}.")
+            raise ValueError(f"collocation n_points must be positive; got {self.n_points}.")
 
 
 @dataclass(frozen=True)
 class BoundarySamplingConfig:
-    """Points sampled on named boundary faces."""
+    """Sampling settings for wall boundary coordinate rows."""
 
-    n_points_per_boundary: int = 1000
-    active_boundaries: tuple[BoundaryName, ...] = ("initial",)
-    method: SamplingMethod = "random_uniform"
+    n_points: int | None = None
+    method: DatasetSamplingMethod = "all"
 
     def __post_init__(self) -> None:
-        if self.n_points_per_boundary < 1:
-            msg = (
-                "n_points_per_boundary must be positive; "
-                f"got {self.n_points_per_boundary}."
-            )
-            raise ValueError(msg)
-
-        unknown = set(self.active_boundaries) - set(BOUNDARY_NAMES)
-        if unknown:
-            raise ValueError(f"Unknown active boundaries: {sorted(unknown)}.")
+        _validate_optional_n_points("boundary n_points", self.n_points)
 
 
 @dataclass(frozen=True)
-class DataSamplingConfig:
-    """Points sampled from discrete WRF, HRRR, or synthetic datasets."""
+class SensorSamplingConfig:
+    """Sampling settings for normalized sensor-data rows."""
 
-    n_points: int = 5000
-    source_names: tuple[str, ...] = ("wrf", "hrrr")
-    method: SamplingMethod = "random_uniform"
-    require_all_sources: bool = False
+    n_points: int | None = None
+    method: DatasetSamplingMethod = "all"
 
     def __post_init__(self) -> None:
-        if self.n_points < 1:
-            raise ValueError(f"n_points must be positive; got {self.n_points}.")
+        _validate_optional_n_points("sensor n_points", self.n_points)
 
-        if not self.source_names:
-            raise ValueError("At least one data source name is required.")
+
+@dataclass(frozen=True)
+class FlowFieldSamplingConfig:
+    """Sampling settings for normalized dense flowfield rows."""
+
+    n_points: int | None = None
+    method: DatasetSamplingMethod = "all"
+
+    def __post_init__(self) -> None:
+        _validate_optional_n_points("flowfield n_points", self.n_points)
 
 
 @dataclass(frozen=True)
 class ValidationSamplingConfig:
-    """Held-out points used to check model behavior during development."""
+    """Sampling settings for validation rows or points."""
 
-    n_points: int = 2000
-    method: SamplingMethod = "random_uniform"
+    n_points: int | None = None
+    method: DatasetSamplingMethod = "all"
 
     def __post_init__(self) -> None:
-        if self.n_points < 1:
-            raise ValueError(f"n_points must be positive; got {self.n_points}.")
+        _validate_optional_n_points("validation n_points", self.n_points)
 
 
 @dataclass(frozen=True)
 class SamplingConfig:
-    """Top-level sampling configuration for one experiment."""
+    """Top-level sampling configuration for one training run."""
 
     collocation: CollocationSamplingConfig = CollocationSamplingConfig()
     boundary: BoundarySamplingConfig = BoundarySamplingConfig()
-    data: DataSamplingConfig = DataSamplingConfig()
+    sensor_data: SensorSamplingConfig = SensorSamplingConfig()
+    flow_field_data: FlowFieldSamplingConfig = FlowFieldSamplingConfig()
     validation: ValidationSamplingConfig = ValidationSamplingConfig()
     seed: int = 42
 
     @property
-    def total_requested_points(self) -> int:
-        """Return the total nominal number of requested sample points."""
+    def requested_finite_points(self) -> int:
+        """Return finite sample counts explicitly requested by this config.
 
-        return (
-            self.collocation.n_points
-            + self.boundary.n_points_per_boundary
-            * len(self.boundary.active_boundaries)
-            + self.data.n_points
-            + self.validation.n_points
-        )
+        Dataset configs with ``n_points=None`` mean "use all available rows" and
+        are therefore not included in this count.
+        """
+
+        total = self.collocation.n_points
+        for dataset_sampling in (
+            self.boundary,
+            self.sensor_data,
+            self.flow_field_data,
+            self.validation,
+        ):
+            if dataset_sampling.n_points is not None:
+                total += dataset_sampling.n_points
+        return total
 
 
 DEFAULT_SAMPLING = SamplingConfig()
