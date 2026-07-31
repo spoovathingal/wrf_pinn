@@ -280,6 +280,44 @@ The project metadata should declare NumPy and PyTorch before relying on a clean
 `pip install -e .` installation. Until then, the command above uses the existing
 project virtual environment and sets `PYTHONPATH=src` explicitly.
 
+## Testing
+
+A pytest suite under `tests/` verifies the data-reading path, the loss-mode
+conditions, and the end-to-end read-to-model pipeline. Tests are self-contained
+(each writes its own input data under a temporary directory that pytest removes
+after the run, so nothing persists) and use distinguishable fixture data
+(coordinates are asymmetric and each value column is a distinct function of the
+coordinates: `u=x, v=y, w=z, rho=t`) so a shuffled row, dropped column, or
+swapped axis is detected rather than passing silently.
+
+Install the test dependency and run:
+
+```bash
+pip install -e ".[test]"     # or: pip install pytest
+pytest -v                    # per-test pass/fail
+pytest -v -s                 # also print the actual verified values
+```
+
+`pytest -v` gives the standard pass/fail list. Adding `-s` reveals the values
+each test confirmed (the read-back coordinate and target arrays), which is hidden
+by default to keep output clean; on failure, NumPy's `assert_allclose` prints the
+exact expected-vs-actual arrays automatically.
+
+What is covered:
+
+```text
+test_flow_field.py   read_flow_field: shape, column metadata, per-point values,
+                     and rejection of missing columns, empty files, NaN, and inf
+test_sensors.py      read_sensor_data: same, plus the sensor-only time_index and
+                     unique_times helpers (targets are u,v,w with no density)
+test_conditions.py   ConditionSpec/ConditionsConfig activation and weight rules,
+                     and that on/off state and weights flow through to the
+                     assembled loss (inactive -> zero, weight scales the term)
+test_pipeline.py     end-to-end read -> tensors -> model: the tensors fed to the
+                     model hold correct values/shape/dtype, and the MLP consumes
+                     them and returns a finite (n, 4) state
+```
+
 ## Current limitations
 
 - The PDE is a reduced pressureless, inviscid transport system, not full WRF
