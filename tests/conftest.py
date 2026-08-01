@@ -119,3 +119,34 @@ def sensor_csv(tmp_path: Path):
     path = tmp_path / "sensor.csv"
     _write_csv(path, ("x", "y", "z", "t"), ("u", "v", "w"), rows)
     return path, rows
+
+
+# Constant uniform-flow state for the training-case tests. A constant field is
+# the physically correct fixture here: it is the case Savio specified, and its
+# PDE residual is zero, so a model that learns it drives the loss down.
+UNIFORM_STATE = {"u": 5.0, "v": 2.0, "w": 0.0, "rho": 1.225}
+
+
+def _uniform_grid() -> list[tuple[float, float, float, float]]:
+    """Return a small but non-trivial (x, y, z, t) grid for training tests."""
+
+    axis = (0.0, 0.25, 0.5, 0.75, 1.0)
+    return [(x, y, z, t) for x in axis for y in axis for z in axis for t in axis]
+
+
+@pytest.fixture
+def uniform_flow_csv(tmp_path: Path):
+    """Write a constant uniform flow-field CSV and return (path, rows).
+
+    Every point has the same velocity and density (``UNIFORM_STATE``). Used by
+    the training-case tests, which check that a training run on this data
+    completes and that the loss decreases.
+    """
+
+    rows = [
+        {"x": x, "y": y, "z": z, "t": t, **UNIFORM_STATE}
+        for (x, y, z, t) in _uniform_grid()
+    ]
+    path = tmp_path / "uniform_flow.csv"
+    _write_csv(path, ("x", "y", "z", "t"), ("u", "v", "w", "rho"), rows)
+    return path, rows
