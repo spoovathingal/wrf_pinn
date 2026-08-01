@@ -65,3 +65,36 @@ def no_slip_wall_residuals(
         "no_slip_v": state[:, v_index],
         "no_slip_w": state[:, w_index],
     }
+
+
+def no_penetration_z_wall_residuals(
+    state: torch.Tensor,
+    w_index: int = 2,
+) -> dict[str, torch.Tensor]:
+    """Return no-penetration residuals for a flat wall at ``z = 0``.
+
+    For this special test case, the wall normal is assumed to be aligned with
+    the vertical direction. The no-penetration condition is therefore:
+
+    ``u dot n = w = 0``.
+
+    Since the target value is zero, the residual is simply the predicted
+    vertical velocity component at the sampled wall points.
+    """
+
+    if state.ndim != 2:
+        raise ValueError(
+            "state must be a 2D tensor with shape "
+            "(num_wall_points, num_state_variables)."
+        )
+
+    num_state_variables = state.shape[1]
+    if w_index < 0 or w_index >= num_state_variables:
+        raise ValueError(
+            "w_index is outside the state tensor columns; "
+            f"got index {w_index} for {num_state_variables} columns."
+        )
+
+    return {
+        "no_penetration_w": state[:, w_index],
+    }

@@ -26,6 +26,7 @@ from wrf_pinn.config.sampling import DEFAULT_SAMPLING, SamplingConfig
 from wrf_pinn.config.training import DEFAULT_TRAINING, OptimizerConfig, TrainingConfig
 from wrf_pinn.data.flow_field import FlowFieldData
 from wrf_pinn.data.sensors import SensorData
+from wrf_pinn.physics.residuals_boundary import no_penetration_z_wall_residuals
 from wrf_pinn.physics.residuals_boundary import no_slip_wall_residuals
 from wrf_pinn.physics.residuals_pde import cartesian_zero_forcing_residuals
 from wrf_pinn.sampling import sample_collocation_points
@@ -82,6 +83,7 @@ def train_pinn(
     sampling: SamplingConfig = DEFAULT_SAMPLING,
     physics: PhysicsConfig = DEFAULT_PHYSICS,
     monitor: TrainingMonitor | None = None,
+    use_no_penetration_z_wall: bool = False,
 ) -> TrainingHistory:
     """Train a WRF PINN using the globally active condition modes.
 
@@ -178,7 +180,11 @@ def train_pinn(
                 device=device,
             )
             wall_state = model(wall_coordinates)
-            boundary_residuals = no_slip_wall_residuals(wall_state)
+
+            if use_no_penetration_z_wall:
+                boundary_residuals = no_penetration_z_wall_residuals(wall_state)
+            else:
+                boundary_residuals = no_slip_wall_residuals(wall_state)
 
         if conditions.sensor_data.active:
             coordinates = _require_tensor(sensor_coordinates, "sensor_data.coordinates")
