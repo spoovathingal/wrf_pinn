@@ -10,7 +10,9 @@ This module implements the reduced system described in
 
 The residuals are evaluated at continuous PINN collocation points. Inputs are
 expected in coordinate order (x, y, z, t), and state outputs are expected in
-physics-variable order (u, v, w, rho).
+physics-variable order (u, v, w, rho). Coordinates and state outputs may be
+normalized; residual scaling maps them back to physical units before the PDE
+terms are assembled.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from collections.abc import Mapping
 import torch
 
 from wrf_pinn.config.physics import DEFAULT_PHYSICS, PhysicsConfig
+from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING, ResidualScalingConfig
 
 
 TensorDict = dict[str, torch.Tensor]
@@ -47,6 +50,32 @@ def _gradient(field: torch.Tensor, coordinates: torch.Tensor) -> torch.Tensor:
     return gradient
 
 
+def _physical_gradient(
+    field: torch.Tensor,
+    coordinates: torch.Tensor,
+    scaling: ResidualScalingConfig,
+) -> torch.Tensor:
+    """Return physical-coordinate gradient of a scalar field.
+
+    Autograd differentiates with respect to the model coordinates supplied to
+    the network. Those coordinates may be normalized. If
+
+    ``x_physical = offset + scale * x_normalized``,
+
+    then
+
+    ``d(field) / d(x_physical) = d(field) / d(x_normalized) / scale``.
+    """
+
+    gradient = _gradient(field, coordinates)
+    coordinate_scales = torch.tensor(
+        scaling.coordinate_scales(),
+        dtype=gradient.dtype,
+        device=gradient.device,
+    ).reshape(1, -1)
+    return gradient / coordinate_scales
+
+
 def _split_state(
     state: torch.Tensor,
     physics: PhysicsConfig,
@@ -71,6 +100,22 @@ def _split_state(
         physics.variable_index("rho") : physics.variable_index("rho") + 1,
     ]
     return u, v, w, rho
+
+
+def _to_physical_state(
+    u: torch.Tensor,
+    v: torch.Tensor,
+    w: torch.Tensor,
+    rho: torch.Tensor,
+    scaling: ResidualScalingConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Map normalized state variables to physical state variables."""
+
+    u_physical = scaling.u.offset + scaling.u.scale * u
+    v_physical = scaling.v.offset + scaling.v.scale * v
+    w_physical = scaling.w.offset + scaling.w.scale * w
+    rho_physical = scaling.rho.offset + scaling.rho.scale * rho
+    return u_physical, v_physical, w_physical, rho_physical
 
 
 def _validate_physics_config(physics: PhysicsConfig) -> None:
@@ -106,6 +151,7 @@ def cartesian_zero_forcing_residuals(
     coordinates: torch.Tensor,
     state: torch.Tensor,
     physics: PhysicsConfig = DEFAULT_PHYSICS,
+    scaling: ResidualScalingConfig = DEFAULT_RESIDUAL_SCALING,
 ) -> TensorDict:
     """Compute reduced Cartesian continuity and momentum residuals.
 
@@ -120,6 +166,10 @@ def cartesian_zero_forcing_residuals(
     physics:
         Physics configuration. Only the default reduced configuration is
         supported by this implementation.
+    scaling:
+        Affine maps from normalized coordinates/state variables to physical
+        coordinates/state variables. Identity scaling preserves the old
+        behavior.
 
     Returns
     -------
@@ -136,15 +186,25 @@ def cartesian_zero_forcing_residuals(
     if not coordinates.requires_grad:
         raise ValueError("coordinates must have requires_grad=True.")
 
-    u, v, w, rho = _split_state(state, physics)
+    u_normalized, v_normalized, w_normalized, rho_normalized = _split_state(
+        state,
+        physics,
+    )
+    u, v, w, rho = _to_physical_state(
+        u_normalized,
+        v_normalized,
+        w_normalized,
+        rho_normalized,
+        scaling,
+    )
 
-    grad_u = _gradient(u, coordinates)
-    grad_v = _gradient(v, coordinates)
-    grad_w = _gradient(w, coordinates)
-    grad_rho = _gradient(rho, coordinates)
-    grad_rho_u = _gradient(rho * u, coordinates)
-    grad_rho_v = _gradient(rho * v, coordinates)
-    grad_rho_w = _gradient(rho * w, coordinates)
+    grad_u = _physical_gradient(u, coordinates, scaling)
+    grad_v = _physical_gradient(v, coordinates, scaling)
+    grad_w = _physical_gradient(w, coordinates, scaling)
+    grad_rho = _physical_gradient(rho, coordinates, scaling)
+    grad_rho_u = _physical_gradient(rho * u, coordinates, scaling)
+    grad_rho_v = _physical_gradient(rho * v, coordinates, scaling)
+    grad_rho_w = _physical_gradient(rho * w, coordinates, scaling)
 
     u_x, u_y, u_z, u_t = grad_u.split(1, dim=1)
     v_x, v_y, v_z, v_t = grad_v.split(1, dim=1)

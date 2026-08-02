@@ -23,6 +23,7 @@ from wrf_pinn.config.conditions import DEFAULT_CONDITIONS, ConditionsConfig
 from wrf_pinn.config.domain import CartesianWRFDomain
 from wrf_pinn.config.physics import DEFAULT_PHYSICS, PhysicsConfig
 from wrf_pinn.config.sampling import DEFAULT_SAMPLING, SamplingConfig
+from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING, ResidualScalingConfig
 from wrf_pinn.config.training import DEFAULT_TRAINING, OptimizerConfig, TrainingConfig
 from wrf_pinn.data.flow_field import FlowFieldData
 from wrf_pinn.data.sensors import SensorData
@@ -82,6 +83,7 @@ def train_pinn(
     conditions: ConditionsConfig = DEFAULT_CONDITIONS,
     sampling: SamplingConfig = DEFAULT_SAMPLING,
     physics: PhysicsConfig = DEFAULT_PHYSICS,
+    scaling: ResidualScalingConfig = DEFAULT_RESIDUAL_SCALING,
     monitor: TrainingMonitor | None = None,
     use_no_penetration_z_wall: bool = False,
 ) -> TrainingHistory:
@@ -113,6 +115,9 @@ def train_pinn(
         ``conditions.pde.active`` is true.
     physics:
         Physics configuration passed to the PDE residual evaluator.
+    scaling:
+        Affine scaling metadata used by PDE and boundary residuals to map
+        normalized model coordinates/outputs to physical variables.
     monitor:
         Optional live monitor. When given, its ``update`` method is called on
         the logging cadence with the current epoch's total and component losses,
@@ -168,6 +173,7 @@ def train_pinn(
                 pde_coordinates,
                 pde_state,
                 physics=physics,
+                scaling=scaling,
             )
 
         if conditions.boundary.active:
@@ -182,9 +188,15 @@ def train_pinn(
             wall_state = model(wall_coordinates)
 
             if use_no_penetration_z_wall:
-                boundary_residuals = no_penetration_z_wall_residuals(wall_state)
+                boundary_residuals = no_penetration_z_wall_residuals(
+                    wall_state,
+                    scaling=scaling,
+                )
             else:
-                boundary_residuals = no_slip_wall_residuals(wall_state)
+                boundary_residuals = no_slip_wall_residuals(
+                    wall_state,
+                    scaling=scaling,
+                )
 
         if conditions.sensor_data.active:
             coordinates = _require_tensor(sensor_coordinates, "sensor_data.coordinates")
