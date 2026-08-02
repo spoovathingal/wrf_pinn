@@ -26,6 +26,8 @@ from wrf_pinn.config.conditions import ConditionSpec, ConditionsConfig
 from wrf_pinn.config.domain import make_cartesian_wrf_domain
 from wrf_pinn.config.flow_field_data import FlowFieldDataConfig
 from wrf_pinn.config.sampling import CollocationSamplingConfig, SamplingConfig
+from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING, ResidualScalingConfig
+from wrf_pinn.config.scaling import VariableScale
 from wrf_pinn.config.training import OptimizerConfig, TrainingConfig
 from wrf_pinn.data.flow_field import read_flow_field
 from wrf_pinn.evaluation.predict import predict_flow_field
@@ -164,13 +166,32 @@ def _pde_only_conditions():
     )
 
 
-def _run_pde_uniformity(path, report, label, *, collocation_points):
+# A realistic non-identity residual scaling, mapping normalized [0,1] coordinates
+# and outputs to physical WRF-like magnitudes (domain ~1 km, winds ~10 m/s, rho
+# ~1.225). Used to exercise the chain-rule scaling path through training, not
+# just the identity default. Direct scaling-math tests live in test_scaling.py.
+PHYSICAL_SCALING = ResidualScalingConfig(
+    x=VariableScale(0.0, 1000.0),
+    y=VariableScale(0.0, 950.0),
+    z=VariableScale(0.0, 1062.0),
+    t=VariableScale(0.0, 600.0),
+    u=VariableScale(0.0, 10.0),
+    v=VariableScale(0.0, 10.0),
+    w=VariableScale(0.0, 1.0),
+    rho=VariableScale(0.0, 1.225),
+)
+
+
+def _run_pde_uniformity(
+    path, report, label, *, collocation_points, scaling=DEFAULT_RESIDUAL_SCALING
+):
     """Train pde-only with ``collocation_points`` and assert a uniform field.
 
     The true uniform field has zero PDE residual, so an untrained model starts
     with nonzero residual loss that should fall as it learns a constant state.
     With no data anchor the PDE cannot recover the specific constants, so the
-    known-result check is spatial uniformity (near-zero per-variable std).
+    known-result check is spatial uniformity (near-zero per-variable std). The
+    optional ``scaling`` exercises the residual chain-rule scaling path.
     """
 
     torch.manual_seed(0)
@@ -188,6 +209,7 @@ def _run_pde_uniformity(path, report, label, *, collocation_points):
         domain=_domain_from(flow_data),
         conditions=_pde_only_conditions(),
         sampling=sampling,
+        scaling=scaling,
         training=TrainingConfig(
             epochs=600,
             log_every=200,
@@ -234,4 +256,23 @@ def test_uniform_flow_pde_collocation_counts(
         report,
         f"uniform flow, pde only [{collocation_points} collocation pts]",
         collocation_points=collocation_points,
+    )
+
+
+def test_uniform_flow_pde_with_physical_scaling(uniform_flow_csv, report):
+    """pde-only reaches a uniform field under realistic non-identity scaling.
+
+    Exercises the residual chain-rule scaling through the full training path
+    (Task 1.2: ensure the scaling implementation works). The direct scaling-math
+    checks are in test_scaling.py; this confirms training still converges to a
+    uniform solution when the residual is evaluated in physical units.
+    """
+
+    path, _ = uniform_flow_csv
+    _run_pde_uniformity(
+        path,
+        report,
+        "uniform flow, pde only [physical scaling]",
+        collocation_points=200,
+        scaling=PHYSICAL_SCALING,
     )
