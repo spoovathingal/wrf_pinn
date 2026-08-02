@@ -19,6 +19,7 @@ will be added once the no-penetration boundary condition exists.
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
 from wrf_pinn.config.conditions import ConditionSpec, ConditionsConfig
@@ -80,68 +81,112 @@ def _assert_loss_decreased(history, report, label):
     )
 
 
-def test_uniform_flow_field_only(uniform_flow_csv, report):
-    """flow_field data loss only (pde/boundary/sensor off)."""
-
-    path, _ = uniform_flow_csv
-    torch.manual_seed(0)
-    flow_data = read_flow_field(FlowFieldDataConfig(path=str(path)))
-
-    conditions = ConditionsConfig(
+def _flow_field_only_conditions():
+    return ConditionsConfig(
         pde=ConditionSpec("pde", active=False, weight=0.0),
         boundary=ConditionSpec("boundary", active=False, weight=0.0),
         sensor_data=ConditionSpec("sensor_data", active=False, weight=0.0),
         flow_field_data=ConditionSpec("flow_field_data", active=True, weight=1.0),
     )
 
+
+def _run_flow_field_reproduction(path, report, label):
+    """Train flow_field-only on ``path`` and assert the true field is reproduced.
+
+    Returns the per-variable MAE so callers can report it. This is shared by the
+    baseline case and the parameterized flow-condition / domain-size cases.
+    """
+
+    torch.manual_seed(0)
+    flow_data = read_flow_field(FlowFieldDataConfig(path=str(path)))
+
     model = MLP()
     history = train_pinn(
         model,
         flow_field_data=flow_data,
-        conditions=conditions,
+        conditions=_flow_field_only_conditions(),
         training=_training(),
     )
-    _assert_loss_decreased(history, report, "uniform flow, flow_field only")
+    _assert_loss_decreased(history, report, label)
 
-    # Known-result check: the trained model reproduces the true constant field.
     _, predictions, targets = predict_flow_field(model, flow_data)
     mae = np.abs(predictions - targets).mean(axis=0)
     assert (mae < REPRODUCTION_TOL).all()
     report(
-        "uniform flow, flow_field only: reproduces true field",
+        f"{label}: reproduces true field",
         true_state=targets[0],
         predicted_mean=predictions.mean(axis=0),
         per_variable_mae=mae,
     )
+    return mae
 
 
-def test_uniform_flow_pde_only(uniform_flow_csv, report):
-    """PDE residual loss only (flow_field/boundary/sensor off).
-
-    The true uniform field has zero PDE residual, so an untrained model starts
-    with nonzero residual loss that should fall as it learns a constant state.
-    """
+def test_uniform_flow_field_only(uniform_flow_csv, report):
+    """flow_field data loss only (pde/boundary/sensor off), normalized coords."""
 
     path, _ = uniform_flow_csv
-    torch.manual_seed(0)
-    flow_data = read_flow_field(FlowFieldDataConfig(path=str(path)))
+    _run_flow_field_reproduction(path, report, "uniform flow, flow_field only")
 
-    conditions = ConditionsConfig(
+
+# Task 1.2: vary the flow conditions (state) and the domain size (coordinate
+# range) to confirm the pipeline reproduces the field regardless of numeric
+# scale. Tolerances calibrated from measured MAE (max observed ~0.03 at 300
+# epochs across these cases; REPRODUCTION_TOL = 0.05).
+FLOW_CONDITION_CASES = [
+    ("baseline_unit_domain", {"u": 5.0, "v": 2.0, "w": 0.0, "rho": 1.225}, (0.0, 1.0)),
+    ("symmetric_domain", {"u": 5.0, "v": 2.0, "w": 0.0, "rho": 1.225}, (-1.0, 1.0)),
+    ("large_domain", {"u": 5.0, "v": 2.0, "w": 0.0, "rho": 1.225}, (0.0, 10.0)),
+    ("small_magnitude_flow", {"u": 0.1, "v": 0.05, "w": 0.0, "rho": 1.0}, (0.0, 1.0)),
+    ("large_mixed_sign_flow", {"u": 20.0, "v": -8.0, "w": 3.0, "rho": 1.3}, (0.0, 1.0)),
+]
+
+
+@pytest.mark.parametrize(
+    "label, state, coordinate_range",
+    FLOW_CONDITION_CASES,
+    ids=[case[0] for case in FLOW_CONDITION_CASES],
+)
+def test_uniform_flow_field_reproduction_across_conditions(
+    uniform_flow_csv_factory, report, label, state, coordinate_range
+):
+    """flow_field-only reproduces the field across flow conditions and domains."""
+
+    path, _ = uniform_flow_csv_factory(state, coordinate_range)
+    _run_flow_field_reproduction(path, report, f"uniform flow [{label}]")
+
+
+def _pde_only_conditions():
+    return ConditionsConfig(
         pde=ConditionSpec("pde", active=True, weight=1.0),
         boundary=ConditionSpec("boundary", active=False, weight=0.0),
         sensor_data=ConditionSpec("sensor_data", active=False, weight=0.0),
         flow_field_data=ConditionSpec("flow_field_data", active=False, weight=0.0),
     )
+
+
+def _run_pde_uniformity(path, report, label, *, collocation_points):
+    """Train pde-only with ``collocation_points`` and assert a uniform field.
+
+    The true uniform field has zero PDE residual, so an untrained model starts
+    with nonzero residual loss that should fall as it learns a constant state.
+    With no data anchor the PDE cannot recover the specific constants, so the
+    known-result check is spatial uniformity (near-zero per-variable std).
+    """
+
+    torch.manual_seed(0)
+    flow_data = read_flow_field(FlowFieldDataConfig(path=str(path)))
+
     sampling = SamplingConfig(
-        collocation=CollocationSamplingConfig(n_points=200, method="latin_hypercube"),
+        collocation=CollocationSamplingConfig(
+            n_points=collocation_points, method="latin_hypercube"
+        ),
         seed=0,
     )
-
     model = MLP()
     history = train_pinn(
         model,
         domain=_domain_from(flow_data),
-        conditions=conditions,
+        conditions=_pde_only_conditions(),
         sampling=sampling,
         training=TrainingConfig(
             epochs=600,
@@ -149,17 +194,44 @@ def test_uniform_flow_pde_only(uniform_flow_csv, report):
             optimizer=OptimizerConfig(name="adam", learning_rate=1.0e-3),
         ),
     )
-    _assert_loss_decreased(history, report, "uniform flow, pde only")
+    _assert_loss_decreased(history, report, label)
 
-    # Known-result check: with no data anchor the PDE cannot recover the specific
-    # constants, but a zero-residual solution must be spatially uniform. Assert
-    # the predicted field has near-zero spatial std per variable (std, not max
-    # spread, so a few stubborn collocation points do not make the check flaky).
     _, predictions, _ = predict_flow_field(model, flow_data)
     spatial_std = predictions.std(axis=0)
     assert (spatial_std < UNIFORMITY_STD_TOL).all()
     report(
-        "uniform flow, pde only: predicted field is spatially uniform",
+        f"{label}: predicted field is spatially uniform",
+        collocation_points=np.array([collocation_points]),
         predicted_mean=predictions.mean(axis=0),
         per_variable_std=spatial_std,
+    )
+
+
+def test_uniform_flow_pde_only(uniform_flow_csv, report):
+    """PDE residual loss only (flow_field/boundary/sensor off)."""
+
+    path, _ = uniform_flow_csv
+    _run_pde_uniformity(
+        path, report, "uniform flow, pde only", collocation_points=200
+    )
+
+
+# Task 1.3: vary the number of collocation points for the pde case to confirm
+# the pipeline is robust to sampling-config changes. (Boundary point counts are
+# deferred with the boundary-condition test cases; see future_work.md.)
+COLLOCATION_POINT_CASES = [64, 200, 512, 1024]
+
+
+@pytest.mark.parametrize("collocation_points", COLLOCATION_POINT_CASES)
+def test_uniform_flow_pde_collocation_counts(
+    uniform_flow_csv, report, collocation_points
+):
+    """pde-only stays uniform across different collocation point counts."""
+
+    path, _ = uniform_flow_csv
+    _run_pde_uniformity(
+        path,
+        report,
+        f"uniform flow, pde only [{collocation_points} collocation pts]",
+        collocation_points=collocation_points,
     )

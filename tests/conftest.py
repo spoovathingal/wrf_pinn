@@ -127,26 +127,64 @@ def sensor_csv(tmp_path: Path):
 UNIFORM_STATE = {"u": 5.0, "v": 2.0, "w": 0.0, "rho": 1.225}
 
 
-def _uniform_grid() -> list[tuple[float, float, float, float]]:
-    """Return a small but non-trivial (x, y, z, t) grid for training tests."""
+def _uniform_grid(
+    coordinate_range: tuple[float, float] = (0.0, 1.0),
+    n_per_axis: int = 5,
+) -> list[tuple[float, float, float, float]]:
+    """Return a grid of (x, y, z, t) points spanning ``coordinate_range``."""
 
-    axis = (0.0, 0.25, 0.5, 0.75, 1.0)
+    lo, hi = coordinate_range
+    axis = [lo + (hi - lo) * i / (n_per_axis - 1) for i in range(n_per_axis)]
     return [(x, y, z, t) for x in axis for y in axis for z in axis for t in axis]
+
+
+def _write_uniform_flow_csv(
+    path: Path,
+    state: dict[str, float],
+    coordinate_range: tuple[float, float] = (0.0, 1.0),
+    n_per_axis: int = 5,
+) -> list[dict[str, float]]:
+    """Write a constant uniform flow-field CSV; return the rows written."""
+
+    rows = [
+        {"x": x, "y": y, "z": z, "t": t, **state}
+        for (x, y, z, t) in _uniform_grid(coordinate_range, n_per_axis)
+    ]
+    _write_csv(path, ("x", "y", "z", "t"), ("u", "v", "w", "rho"), rows)
+    return rows
 
 
 @pytest.fixture
 def uniform_flow_csv(tmp_path: Path):
     """Write a constant uniform flow-field CSV and return (path, rows).
 
-    Every point has the same velocity and density (``UNIFORM_STATE``). Used by
-    the training-case tests, which check that a training run on this data
-    completes and that the loss decreases.
+    Every point has the same velocity and density (``UNIFORM_STATE``) on the
+    normalized ``[0, 1]`` coordinate range.
     """
 
-    rows = [
-        {"x": x, "y": y, "z": z, "t": t, **UNIFORM_STATE}
-        for (x, y, z, t) in _uniform_grid()
-    ]
     path = tmp_path / "uniform_flow.csv"
-    _write_csv(path, ("x", "y", "z", "t"), ("u", "v", "w", "rho"), rows)
+    rows = _write_uniform_flow_csv(path, UNIFORM_STATE)
     return path, rows
+
+
+@pytest.fixture
+def uniform_flow_csv_factory(tmp_path: Path):
+    """Return a factory that writes a uniform flow CSV for a given case.
+
+    Lets a parameterized test vary the flow conditions (state) and the domain
+    size (coordinate range). Each call writes a distinct file under ``tmp_path``.
+    """
+
+    counter = {"n": 0}
+
+    def _make(
+        state: dict[str, float],
+        coordinate_range: tuple[float, float] = (0.0, 1.0),
+        n_per_axis: int = 5,
+    ):
+        counter["n"] += 1
+        path = tmp_path / f"uniform_flow_{counter['n']}.csv"
+        rows = _write_uniform_flow_csv(path, state, coordinate_range, n_per_axis)
+        return path, rows
+
+    return _make
