@@ -19,7 +19,7 @@ class ModelConfig:
 
     The default is intentionally conservative: a standard fully connected MLP
     that maps normalized continuous coordinates (x, y, z, t) to the normalized
-    reduced physics state (u, v, w, rho). Data normalization and scaling happen
+    physics state (u, v, w, theta, p_prime). Data normalization and scaling happen
     outside this codebase before tensors are passed to the model.
     """
 

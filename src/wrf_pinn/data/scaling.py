@@ -7,7 +7,7 @@ from pathlib import Path
 from wrf_pinn.config.scaling import ResidualScalingConfig, VariableScale
 
 
-_REQUIRED_NAMES = ("x", "y", "z", "t", "u", "v", "w", "rho")
+_REQUIRED_NAMES = ("x", "y", "z", "t", "u", "v", "w", "theta", "p_prime")
 
 
 def read_residual_scaling_txt(path: str | Path) -> ResidualScalingConfig:
@@ -25,7 +25,8 @@ def read_residual_scaling_txt(path: str | Path) -> ResidualScalingConfig:
     Example
     -------
     ``x   0.0   1000.0``
-    ``rho 0.0   1.225``
+    ``theta  290.0  30.0``
+    ``p_prime -500.0 1000.0``
     """
 
     metadata_path = Path(path)
@@ -87,5 +88,6 @@ def read_residual_scaling_txt(path: str | Path) -> ResidualScalingConfig:
         u=scales["u"],
         v=scales["v"],
         w=scales["w"],
-        rho=scales["rho"],
+        theta=scales["theta"],
+        p_prime=scales["p_prime"],
     )

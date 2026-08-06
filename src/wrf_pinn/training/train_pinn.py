@@ -93,13 +93,13 @@ def train_pinn(
     ----------
     model:
         Neural network mapping normalized ``(x, y, z, t)`` inputs to normalized
-        ``(u, v, w, rho)`` outputs.
+        ``(u, v, w, theta, p_prime)`` outputs.
     domain:
         Continuous Cartesian domain used to generate PDE collocation points.
         This is required only when ``conditions.pde.active`` is true.
     flow_field_data:
-        Optional dense normalized data with ``x, y, z, t, u, v, w, rho``. This
-        is required only when ``conditions.flow_field_data.active`` is true.
+        Optional dense normalized data with ``x, y, z, t, u, v, w, theta, p_prime``.
+        This is required only when ``conditions.flow_field_data.active`` is true.
     sensor_data:
         Optional sparse normalized sensor data with ``x, y, z, t, u, v, w``.
         This is required only when ``conditions.sensor_data.active`` is true.

@@ -11,9 +11,8 @@ from typing import Literal
 
 
 CoordinateSystem = Literal["local_cartesian"]
-PhysicsVariable = Literal["u", "v", "w", "rho"]
-ResidualName = Literal["mass", "x_momentum", "y_momentum", "z_momentum"]
-
+PhysicsVariable = Literal["u", "v", "w", "theta", "p_prime"]
+ResidualName = Literal["mass", "x_momentum", "y_momentum", "z_momentum", "potential_temperature"]
 
 @dataclass(frozen=True)
 class PhysicalConstants:
@@ -32,6 +31,7 @@ class PhysicalConstants:
     reference_pressure: float = 100000.0
     earth_rotation_rate: float = 7.2921e-5
     earth_radius: float = 6370000.0
+    eddy_viscosity: float = 0.003853  # K_m [m^2/s]
 
     @property
     def kappa(self) -> float:
@@ -48,29 +48,32 @@ class PhysicalConstants:
 
 @dataclass(frozen=True)
 class PhysicsConfig:
-    """Configuration for the reduced atmospheric physics model.
+    """Configuration for the dry neutral boundary layer model.
 
     Assumptions:
     - local Cartesian coordinates
     - zero external forcing
-    - no temperature or thermodynamic residual
-    - active state contains only velocity components and density
+    - dry atmospheric thermodynamics
+    - constant momentum eddy viscosity
+    - density is derived from theta and p_prime
+    - active state is u, v, w, theta, and p_prime
     """
 
     coordinate_system: CoordinateSystem = "local_cartesian"
-    active_variables: tuple[PhysicsVariable, ...] = ("u", "v", "w", "rho")
+    active_variables: tuple[PhysicsVariable, ...] = ("u", "v", "w", "theta", "p_prime")
     residuals: tuple[ResidualName, ...] = (
         "mass",
         "x_momentum",
         "y_momentum",
         "z_momentum",
+        "potential_temperature",
     )
     include_coriolis: bool = False
-    include_gravity: bool = False
-    include_pressure_gradient: bool = False
-    include_temperature: bool = False
+    include_gravity: bool = True
+    include_pressure_gradient: bool = True
+    include_temperature: bool = True
     include_moisture: bool = False
-    include_turbulence: bool = False
+    include_turbulence: bool = True
     include_microphysics: bool = False
     forcing_is_zero: bool = True
     constants: PhysicalConstants = PhysicalConstants()

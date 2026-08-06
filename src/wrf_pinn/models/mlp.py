@@ -11,8 +11,8 @@ from wrf_pinn.config.model import DEFAULT_MODEL, ModelConfig
 class MLP(nn.Module):
     """Coordinate-to-state multilayer perceptron.
 
-    The model maps continuous coordinates ``(x, y, z, t)`` to the reduced
-    atmospheric state ``(u, v, w, rho)``. Inputs and targets are expected to be
+    The model maps continuous coordinates ``(x, y, z, t)`` to the atmospheric
+    state ``(u, v, w, theta, p_prime)``. Inputs and targets are expected to be
     normalized before they reach this model.
     """
 

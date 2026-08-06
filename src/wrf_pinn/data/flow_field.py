@@ -80,7 +80,7 @@ def read_flow_field_csv(
     """Read normalized flow-field CSV data.
 
     The CSV file must contain coordinate columns, by default ``x, y, z, t``, and
-    target columns, by default ``u, v, w, rho``. The values are assumed to have
+    target columns, by default ``u, v, w, theta, p_prime``. The values are assumed to have
     already been normalized and scaled outside this package.
     """
 

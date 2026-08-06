@@ -2,7 +2,7 @@
 
 Flowfield data is assumed to be preprocessed outside this codebase. By the time
 it reaches this package, it should already be collated, normalized, and scaled
-into a CSV with columns ``x,y,z,t,u,v,w,rho`` by default.
+into a CSV with columns ``x,y,z,t,u,v,w,theta,p_prime`` by default.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ class FlowFieldColumnConfig:
     """Column names for normalized dense flowfield coordinates and values."""
 
     coordinates: tuple[str, str, str, str] = ("x", "y", "z", "t")
-    values: tuple[str, str, str, str] = ("u", "v", "w", "rho")
+    values: tuple[str, str, str, str] = ("u", "v", "w", "theta", "p_prime")
 
     def __post_init__(self) -> None:
         if len(self.coordinates) != 4:
@@ -28,10 +28,10 @@ class FlowFieldColumnConfig:
                 f"columns for x,y,z,t; got {self.coordinates}."
             )
 
-        if len(self.values) != 4:
+        if len(self.values) != 5:
             raise ValueError(
                 "Flowfield value columns must contain exactly four columns "
-                f"for u,v,w,rho; got {self.values}."
+                f"for u,v,w,theta,p_prime; got {self.values}."
             )
 
 
