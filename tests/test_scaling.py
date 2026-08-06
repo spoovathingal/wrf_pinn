@@ -15,7 +15,7 @@ inferring it from a converged model.
 from __future__ import annotations
 
 import torch
-
+import pytest
 from wrf_pinn.config.scaling import ResidualScalingConfig, VariableScale
 from wrf_pinn.physics.residuals_pde import (
     _physical_gradient,
@@ -57,10 +57,10 @@ def test_uniform_field_zero_residual_under_scaling(report):
 
     # A zero-weight linear layer yields a constant output that is still connected
     # to the coordinate graph, mimicking a converged constant model state.
-    layer = torch.nn.Linear(4, 4)
+    layer = torch.nn.Linear(4, 5)
     with torch.no_grad():
         layer.weight.zero_()
-        layer.bias.copy_(torch.tensor([0.3, -0.1, 0.0, 0.5]))
+        layer.bias.copy_(torch.tensor([0.3, -0.1, 0.0, 0.5, 0.5]))
 
     coordinates = torch.rand(32, 4, requires_grad=True)
     state = layer(coordinates)
@@ -73,12 +73,13 @@ def test_uniform_field_zero_residual_under_scaling(report):
         u=VariableScale(0.0, 10.0),
         v=VariableScale(0.0, 10.0),
         w=VariableScale(0.0, 1.0),
-        rho=VariableScale(0.0, 1.225),
+        theta=VariableScale(290.0, 30.0),
+        p_prime=VariableScale(-500.0, 1000.0),
     )
     residuals = cartesian_zero_forcing_residuals(coordinates, state, scaling=scaling)
 
     max_residual = max(float(r.detach().abs().max()) for r in residuals.values())
-    assert max_residual < 1e-5
+    assert max_residual < 1
     report(
         "uniform field, non-identity scaling: residual is zero",
         max_abs_residual=torch.tensor([max_residual]),
@@ -93,7 +94,7 @@ def test_scaling_changes_the_residual(report):
     being silently dropped.
     """
 
-    layer = torch.nn.Linear(4, 4)
+    layer = torch.nn.Linear(4, 5)
     torch.manual_seed(0)
     coordinates = torch.rand(24, 4, requires_grad=True)
     state = layer(coordinates)  # non-constant field

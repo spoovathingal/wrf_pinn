@@ -23,7 +23,7 @@ def test_flow_field_shape(flow_csv):
     data = read_flow_field(FlowFieldDataConfig(path=str(path)))
 
     assert data.coordinates.shape == (len(rows), 4)
-    assert data.targets.shape == (len(rows), 4)
+    assert data.targets.shape == (len(rows), 5)
 
 
 def test_flow_field_metadata(flow_csv):
@@ -37,7 +37,7 @@ def test_flow_field_metadata(flow_csv):
     data = read_flow_field(FlowFieldDataConfig(path=str(path)))
 
     assert data.coordinate_names == ("x", "y", "z", "t")
-    assert data.target_names == ("u", "v", "w", "rho")
+    assert data.target_names == ("u", "v", "w", "theta", "p_prime")
 
 
 def test_flow_field_values(flow_csv, report):
@@ -54,7 +54,7 @@ def test_flow_field_values(flow_csv, report):
         [[row["x"], row["y"], row["z"], row["t"]] for row in rows]
     )
     expected_targets = np.array(
-        [[row["u"], row["v"], row["w"], row["rho"]] for row in rows]
+        [[row["u"], row["v"], row["w"], row["theta"], row["p_prime"]] for row in rows]
     )
 
     np.testing.assert_allclose(data.coordinates, expected_coordinates)
@@ -70,8 +70,8 @@ def test_flow_field_values(flow_csv, report):
 def test_flow_field_missing_column_raises(tmp_path):
     """A CSV missing a required target column is rejected."""
 
-    path = tmp_path / "missing_rho.csv"
-    path.write_text("x,y,z,t,u,v,w\n0,0,0,0,1,2,3\n")
+    path = tmp_path / "missing_p_prime.csv"
+    path.write_text("x,y,z,t,u,v,w,theta\n0,0,0,0,1,2,3,300\n")
 
     with pytest.raises(ValueError, match="Missing columns"):
         read_flow_field(FlowFieldDataConfig(path=str(path)))
@@ -81,7 +81,7 @@ def test_flow_field_empty_file_raises(tmp_path):
     """A header-only CSV with no data rows is rejected."""
 
     path = tmp_path / "empty.csv"
-    path.write_text("x,y,z,t,u,v,w,rho\n")
+    path.write_text("x,y,z,t,u,v,w,theta,p_prime\n")
 
     with pytest.raises(ValueError, match="no data rows"):
         read_flow_field(FlowFieldDataConfig(path=str(path)))
@@ -91,7 +91,7 @@ def test_flow_field_nan_raises(tmp_path):
     """A NaN value is rejected instead of silently poisoning training."""
 
     path = tmp_path / "nan.csv"
-    path.write_text("x,y,z,t,u,v,w,rho\n1,1,1,1,NaN,1,1,1\n")
+    path.write_text("x,y,z,t,u,v,w,theta,p_prime\n1,1,1,1,NaN,1,1,1,1\n")
 
     with pytest.raises(ValueError, match="Non-finite"):
         read_flow_field(FlowFieldDataConfig(path=str(path)))
@@ -101,7 +101,7 @@ def test_flow_field_inf_raises(tmp_path):
     """An infinite value is rejected."""
 
     path = tmp_path / "inf.csv"
-    path.write_text("x,y,z,t,u,v,w,rho\n1,1,1,1,inf,1,1,1\n")
+    path.write_text("x,y,z,t,u,v,w,theta,p_prime\n1,1,1,1,inf,1,1,1,1\n")
 
     with pytest.raises(ValueError, match="Non-finite"):
         read_flow_field(FlowFieldDataConfig(path=str(path)))

@@ -91,15 +91,17 @@ def flow_csv(tmp_path: Path):
     """Write a distinguishable flow-field CSV and return (path, rows).
 
     Values are derived from coordinates so the coordinate-to-value mapping is
-    verifiable: ``u = x``, ``v = y``, ``w = z``, ``rho = t``.
+    verifiable: ``u = x``, ``v = y``, ``w = z``.
     """
 
     rows = [
-        {"x": x, "y": y, "z": z, "t": t, "u": x, "v": y, "w": z, "rho": t}
+        {"x": x, "y": y, "z": z, "t": t,
+          "u": x, "v": y, "w": z, "theta": t,
+          "p_prime": x + 2.0 * y + 3.0 * z + 4.0 * t}
         for (x, y, z, t) in _distinct_grid()
     ]
     path = tmp_path / "flow.csv"
-    _write_csv(path, ("x", "y", "z", "t"), ("u", "v", "w", "rho"), rows)
+    _write_csv(path, ("x", "y", "z", "t"), ("u", "v", "w", "theta", "p_prime"), rows)
     return path, rows
 
 
@@ -124,7 +126,7 @@ def sensor_csv(tmp_path: Path):
 # Constant uniform-flow state for the training-case tests. A constant field is
 # the physically correct fixture here: it is the case Savio specified, and its
 # PDE residual is zero, so a model that learns it drives the loss down.
-UNIFORM_STATE = {"u": 5.0, "v": 2.0, "w": 0.0, "rho": 1.225}
+UNIFORM_STATE = {"u": 5.0, "v": 2.0, "w": 0.0, "theta": 0.5, "p_prime": 0.5}
 
 
 def _uniform_grid(
@@ -150,7 +152,7 @@ def _write_uniform_flow_csv(
         {"x": x, "y": y, "z": z, "t": t, **state}
         for (x, y, z, t) in _uniform_grid(coordinate_range, n_per_axis)
     ]
-    _write_csv(path, ("x", "y", "z", "t"), ("u", "v", "w", "rho"), rows)
+    _write_csv(path, ("x", "y", "z", "t"), ("u", "v", "w", "theta", "p_prime"), rows)
     return rows
 
 

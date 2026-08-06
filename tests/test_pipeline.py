@@ -35,12 +35,12 @@ def test_pipeline_pre_model_values(flow_csv, report):
         [[r["x"], r["y"], r["z"], r["t"]] for r in rows], dtype=np.float32
     )
     expected_targets = np.array(
-        [[r["u"], r["v"], r["w"], r["rho"]] for r in rows], dtype=np.float32
+        [[r["u"], r["v"], r["w"], r["theta"], r["p_prime"]] for r in rows], dtype=np.float32
     )
 
     # shape and dtype are what the model expects
     assert coordinates.shape == (len(rows), 4)
-    assert targets.shape == (len(rows), 4)
+    assert targets.shape == (len(rows), 5)
     assert coordinates.dtype == torch.float32
     assert targets.dtype == torch.float32
 
@@ -70,7 +70,7 @@ def test_pipeline_model_consumes_inputs(flow_csv, report):
     with torch.no_grad():
         predictions = model(coordinates)
 
-    assert predictions.shape == (len(rows), 4)  # (u, v, w, rho)
+    assert predictions.shape == (len(rows), 5)  # (u, v, w, theta, p_prime)
     assert torch.isfinite(predictions).all()
 
     report(
