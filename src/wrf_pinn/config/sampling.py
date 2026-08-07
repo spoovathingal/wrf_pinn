@@ -64,7 +64,6 @@ class FlowFieldSamplingConfig:
     def __post_init__(self) -> None:
         _validate_optional_n_points("flowfield n_points", self.n_points)
 
-
 @dataclass(frozen=True)
 class ValidationSamplingConfig:
     """Sampling settings for validation rows or points."""

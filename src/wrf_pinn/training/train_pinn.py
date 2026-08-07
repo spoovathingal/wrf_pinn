@@ -32,7 +32,7 @@ from wrf_pinn.physics.residuals_boundary import no_slip_wall_residuals
 from wrf_pinn.physics.residuals_pde import cartesian_zero_forcing_residuals
 from wrf_pinn.sampling import sample_collocation_points
 from wrf_pinn.sampling import sample_wall_boundary_points
-from wrf_pinn.training.losses import LossBreakdown, assemble_pinn_loss
+from wrf_pinn.training.losses import DEFAULT_PDE_RESIDUAL_SCALES, LossBreakdown, PDEResidualScales, assemble_pinn_loss
 
 
 #: Component loss names recorded in ``TrainingHistory`` (excludes ``total``).
@@ -84,6 +84,7 @@ def train_pinn(
     sampling: SamplingConfig = DEFAULT_SAMPLING,
     physics: PhysicsConfig = DEFAULT_PHYSICS,
     scaling: ResidualScalingConfig = DEFAULT_RESIDUAL_SCALING,
+    pde_residual_scales: PDEResidualScales = DEFAULT_PDE_RESIDUAL_SCALES,
     monitor: TrainingMonitor | None = None,
     use_no_penetration_z_wall: bool = False,
 ) -> TrainingHistory:
@@ -223,10 +224,28 @@ def train_pinn(
             sensor_data_errors=sensor_data_errors,
             flow_field_data_errors=flow_field_data_errors,
             conditions=conditions,
+            pde_residual_scales=pde_residual_scales,
         )
-
+        if not bool(torch.isfinite(loss.total).item()):
+            raise FloatingPointError(
+                f"Non-finite total loss at optimizer step {epoch}."
+            )
+        
         loss.total.backward()
 
+        nonfinite_gradients = [
+            name
+            for name, parameter in model.named_parameters()
+            if parameter.grad is not None
+            and not bool(torch.isfinite(parameter.grad).all().item())
+        ]
+
+        if nonfinite_gradients:
+            raise FloatingPointError(
+                "Non-finite gradients at optimizer step "
+                f"{epoch}: {nonfinite_gradients}."
+            )
+        
         if training.gradient_clip_norm is not None:
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(),
@@ -326,7 +345,7 @@ def _sample_pde_coordinates(
     coordinates = sample_collocation_points(
         domain=domain,
         sampling=sampling.collocation,
-        seed=sampling.seed,
+        seed=None,
         device=device,
     )
     return coordinates.requires_grad_(True)
@@ -379,4 +398,16 @@ def _print_progress(epoch: int, epochs: int, loss: LossBreakdown) -> None:
         f"sensor_data={float(loss.terms['sensor_data'].detach().cpu()):.6e}",
         f"flow_field_data={float(loss.terms['flow_field_data'].detach().cpu()):.6e}",
     ]
+
+    for name, raw_mse in loss.pde_raw_mse.items():
+        scaled_mse = loss.pde_scaled_mse[name]
+        parts.extend(
+            (
+                f"{name}_raw_mse="
+                f"{float(raw_mse.detach().cpu()):.6e}",
+                f"{name}_scaled_mse="
+                f"{float(scaled_mse.detach().cpu()):.6e}",
+            )
+        )
+        
     print(" | ".join(parts))
