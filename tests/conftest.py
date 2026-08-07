@@ -188,3 +188,33 @@ def uniform_flow_csv_factory(tmp_path: Path):
         return path, rows
 
     return _make
+
+
+@pytest.fixture
+def uniform_sensor_csv(tmp_path: Path):
+    """Write a sparse uniform sensor CSV (x,y,z,t,u,v,w); return (path, rows).
+
+    Sensors carry the same constant velocity as ``UNIFORM_STATE`` but at a sparse
+    subset of grid points, mimicking real point measurements.
+    """
+
+    coarse = (0.0, 0.5, 1.0)
+    rows = [
+        {"x": x, "y": y, "z": z, "t": t,
+         "u": UNIFORM_STATE["u"], "v": UNIFORM_STATE["v"], "w": UNIFORM_STATE["w"]}
+        for x in coarse for y in coarse for z in coarse for t in coarse
+    ]
+    path = tmp_path / "uniform_sensor.csv"
+    _write_csv(path, ("x", "y", "z", "t"), ("u", "v", "w"), rows)
+    return path, rows
+
+
+@pytest.fixture
+def bottom_wall_csv(tmp_path: Path):
+    """Write a bottom-wall surface CSV (x,y,z at z=0); return the path."""
+
+    axis = (0.0, 0.25, 0.5, 0.75, 1.0)
+    rows = [{"x": x, "y": y, "z": 0.0} for x in axis for y in axis]
+    path = tmp_path / "bottom_wall.csv"
+    _write_csv(path, ("x", "y", "z"), (), rows)
+    return path
