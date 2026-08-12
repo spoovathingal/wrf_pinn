@@ -6,11 +6,11 @@ This module implements the dry neutral boundary layer system described in
 - local Cartesian coordinates
 - zero external forcing
 - no moisture equations
-- active state variables are u, v, w, theta, p_prime
+- active state variables are u, v, w, theta, p_prime, k_m
 
 The residuals are evaluated at continuous PINN collocation points. Inputs are
 expected in coordinate order (x, y, z, t), and state outputs are expected in
-physics-variable order (u, v, w, theta, p_prime). Coordinates and state outputs may be
+physics-variable order (u, v, w, theta, p_prime, k_m_unconstrained). Coordinates and state outputs may be
 normalized; residual scaling maps them back to physical units before the PDE
 terms are assembled.
 """
@@ -115,8 +115,8 @@ def _hydrostatic_reference_state(
 def _split_state(
     state: torch.Tensor,
     physics: PhysicsConfig,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return u, v, w, theta, and p_prime columns from the model state output."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return u, v, w, theta, p_prime, and unconstrained k_m columns from the model state output."""
 
     if state.ndim != 2:
         raise ValueError("state must have shape (n_points, n_variables).")
@@ -133,7 +133,8 @@ def _split_state(
     w = state[:, physics.variable_index("w") : physics.variable_index("w") + 1]
     theta = state[:, physics.variable_index("theta") : physics.variable_index("theta") + 1]
     p_prime = state[:, physics.variable_index("p_prime") : physics.variable_index("p_prime") + 1]
-    return u, v, w, theta, p_prime
+    k_m_unconstrained = state[:, physics.variable_index("k_m") : physics.variable_index("k_m") + 1]
+    return u, v, w, theta, p_prime, k_m_unconstrained
 
 
 def _to_physical_state(
@@ -153,6 +154,18 @@ def _to_physical_state(
     p_prime_physical = scaling.p_prime.offset + scaling.p_prime.scale * p_prime
     return u_physical, v_physical, w_physical, theta_physical, p_prime_physical
 
+def _to_physical_eddy_viscosity(
+    k_m_unconstrained: torch.Tensor,
+    physics: PhysicsConfig,
+) -> torch.Tensor:
+    """Map the unconstrained network output to bounded physical K_m. 0< K_m <100"""
+
+    k_m_min = physics.constants.eddy_viscosity_min
+    k_m_max = physics.constants.eddy_viscosity_max
+
+    return k_m_min + (k_m_max - k_m_min) * torch.sigmoid(
+        k_m_unconstrained
+    )
 
 def _validate_physics_config(physics: PhysicsConfig) -> None:
     """Ensure this implementation is used only for the supported reduced system."""
@@ -160,8 +173,8 @@ def _validate_physics_config(physics: PhysicsConfig) -> None:
     if physics.coordinate_system != "local_cartesian":
         raise ValueError("Only local_cartesian coordinates are supported.")
 
-    if physics.active_variables != ("u", "v", "w", "theta", "p_prime"):
-        raise ValueError("Residuals currently require active variables u, v, w, theta, p_prime")
+    if physics.active_variables != ("u", "v", "w", "theta", "p_prime", "k_m"):
+        raise ValueError("Residuals currently require active variables u, v, w, theta, p_prime", "k_m")
 
     expected_residuals = ("mass", "x_momentum", "y_momentum", "z_momentum", "potential_temperature")
     if physics.residuals != expected_residuals:
@@ -205,8 +218,8 @@ def cartesian_zero_forcing_residuals(
         Collocation coordinates with shape ``(n_points, 4)`` and column order
         ``(x, y, z, t)``. The tensor must have ``requires_grad=True``.
     state:
-        Model outputs with shape ``(n_points, 5)`` and column order
-        ``(u, v, w, theta, p')``.
+        Model outputs with shape ``(n_points, 6)`` and column order
+        ``(u, v, w, theta, p', k_m_unconstrained)``.
     physics:
         Physics configuration. Only the default reduced configuration is
         supported by this implementation.
@@ -230,12 +243,13 @@ def cartesian_zero_forcing_residuals(
     if not coordinates.requires_grad:
         raise ValueError("coordinates must have requires_grad=True.")
 
-    u_normalized, v_normalized, w_normalized, theta_normalized, p_prime_normalized = _split_state(
-        state, physics)
+    (u_normalized, v_normalized, w_normalized, theta_normalized, p_prime_normalized,
+      k_m_unconstrained) = _split_state(state, physics)
 
     u, v, w, theta, p_prime = _to_physical_state(
         u_normalized, v_normalized, w_normalized,
         theta_normalized, p_prime_normalized, scaling)
+    k_m = _to_physical_eddy_viscosity(k_m_unconstrained, physics)
 
     z = scaling.z.offset + scaling.z.scale * coordinates[:, 2:3]
     p_h, rho_h = _hydrostatic_reference_state(z, physics)
@@ -285,8 +299,6 @@ def cartesian_zero_forcing_residuals(
     rho_w_theta_z = _physical_gradient(rho * w * theta, coordinates, scaling)[:, 2:3]
 
     divergence = u_x + v_y + w_z
-
-    k_m = physics.constants.eddy_viscosity
 
     tau_xx = rho * k_m * (2.0 * u_x - (2.0 / 3.0) * divergence)
     tau_yy = rho * k_m * (2.0 * v_y - (2.0 / 3.0) * divergence)

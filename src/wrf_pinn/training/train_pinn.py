@@ -29,7 +29,7 @@ from wrf_pinn.data.flow_field import FlowFieldData
 from wrf_pinn.data.sensors import SensorData
 from wrf_pinn.physics.residuals_boundary import no_penetration_z_wall_residuals
 from wrf_pinn.physics.residuals_boundary import no_slip_wall_residuals
-from wrf_pinn.physics.residuals_pde import cartesian_zero_forcing_residuals
+from wrf_pinn.physics.residuals_pde import cartesian_zero_forcing_residuals, _to_physical_eddy_viscosity
 from wrf_pinn.sampling import sample_collocation_points
 from wrf_pinn.sampling import sample_wall_boundary_points
 from wrf_pinn.training.losses import DEFAULT_PDE_RESIDUAL_SCALES, LossBreakdown, PDEResidualScales, assemble_pinn_loss
@@ -94,7 +94,8 @@ def train_pinn(
     ----------
     model:
         Neural network mapping normalized ``(x, y, z, t)`` inputs to normalized
-        ``(u, v, w, theta, p_prime)`` outputs.
+        ``(u, v, w, theta, p_prime, k_m_unconstrained)`` outputs. k_m is transformed
+        into bounded physical eddy viscosity by the PDE evaluator
     domain:
         Continuous Cartesian domain used to generate PDE collocation points.
         This is required only when ``conditions.pde.active`` is true.
@@ -118,7 +119,8 @@ def train_pinn(
         Physics configuration passed to the PDE residual evaluator.
     scaling:
         Affine scaling metadata used by PDE and boundary residuals to map
-        normalized model coordinates/outputs to physical variables.
+        normalized model coordinates/outputs to physical variables. Eddy viscosity is mapped to
+        physical units using its configured bounds.
     monitor:
         Optional live monitor. When given, its ``update`` method is called on
         the logging cadence with the current epoch's total and component losses,
@@ -258,6 +260,10 @@ def train_pinn(
 
         if _should_log(epoch, training):
             _print_progress(epoch, training.epochs, loss)
+            if conditions.pde.active:
+                i = physics.variable_index("k_m")
+                km = _to_physical_eddy_viscosity(pde_state[:, i:i+1], physics)
+                print(f"k_m: min={km.min().item():.6e} mean={km.mean().item():.6e} max={km.max().item():.6e}")
             if monitor is not None:
                 monitor.update(
                     epoch=epoch,
@@ -345,7 +351,7 @@ def _sample_pde_coordinates(
     coordinates = sample_collocation_points(
         domain=domain,
         sampling=sampling.collocation,
-        seed=None,
+        seed=sampling.seed,
         device=device,
     )
     return coordinates.requires_grad_(True)

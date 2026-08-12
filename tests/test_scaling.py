@@ -16,9 +16,12 @@ from __future__ import annotations
 
 import torch
 import pytest
+from wrf_pinn.models.mlp import MLP
+from wrf_pinn.config.physics import DEFAULT_PHYSICS
 from wrf_pinn.config.scaling import ResidualScalingConfig, VariableScale
 from wrf_pinn.physics.residuals_pde import (
     _physical_gradient,
+    _to_physical_eddy_viscosity,
     cartesian_zero_forcing_residuals,
 )
 
@@ -57,10 +60,10 @@ def test_uniform_field_zero_residual_under_scaling(report):
 
     # A zero-weight linear layer yields a constant output that is still connected
     # to the coordinate graph, mimicking a converged constant model state.
-    layer = torch.nn.Linear(4, 5)
+    layer = torch.nn.Linear(4, 6)
     with torch.no_grad():
         layer.weight.zero_()
-        layer.bias.copy_(torch.tensor([0.3, -0.1, 0.0, 0.5, 0.5]))
+        layer.bias.copy_(torch.tensor([0.3, -0.1, 0.0, 0.5, 0.5, 0.0]))
 
     coordinates = torch.rand(32, 4, requires_grad=True)
     state = layer(coordinates)
@@ -94,7 +97,7 @@ def test_scaling_changes_the_residual(report):
     being silently dropped.
     """
 
-    layer = torch.nn.Linear(4, 5)
+    layer = torch.nn.Linear(4, 6)
     torch.manual_seed(0)
     coordinates = torch.rand(24, 4, requires_grad=True)
     state = layer(coordinates)  # non-constant field
@@ -120,3 +123,67 @@ def test_scaling_changes_the_residual(report):
         "scaling changes the residual (vs identity)",
         max_abs_difference=torch.tensor([difference]),
     )
+
+def test_eddy_viscosity_transform_respects_bounds():
+    raw = torch.tensor([[-10.0], [0.0], [10.0]])
+
+    k_m = _to_physical_eddy_viscosity(
+        raw,
+        DEFAULT_PHYSICS,
+    )
+
+    k_m_min = DEFAULT_PHYSICS.constants.eddy_viscosity_min
+    k_m_max = DEFAULT_PHYSICS.constants.eddy_viscosity_max
+    midpoint = 0.5 * (k_m_min + k_m_max)
+
+    assert (k_m > k_m_min).all()
+    assert (k_m < k_m_max).all()
+    assert float(k_m[1]) == pytest.approx(midpoint)
+    assert k_m[0] < k_m[1] < k_m[2]
+
+def test_momentum_residuals_backpropagate_to_eddy_viscosity_output():
+    """Momentum PDE loss must train the unlabeled K_m output."""
+
+    torch.manual_seed(0)
+    model = MLP()
+
+    coordinates = torch.rand(32, 4, requires_grad=True)
+    state = model(coordinates)
+
+    scaling = ResidualScalingConfig(
+        x=VariableScale(0.0, 1000.0),
+        y=VariableScale(0.0, 1000.0),
+        z=VariableScale(0.0, 1000.0),
+        t=VariableScale(0.0, 600.0),
+        u=VariableScale(0.0, 10.0),
+        v=VariableScale(0.0, 10.0),
+        w=VariableScale(0.0, 1.0),
+        theta=VariableScale(300.0, 1.0),
+        p_prime=VariableScale(0.0, 10.0),
+    )
+
+    residuals = cartesian_zero_forcing_residuals(
+        coordinates,
+        state,
+        scaling=scaling,
+    )
+
+    momentum_loss = torch.stack(
+        [
+            residuals["x_momentum"].square().mean(),
+            residuals["y_momentum"].square().mean(),
+            residuals["z_momentum"].square().mean(),
+        ]
+    ).sum()
+
+    momentum_loss.backward()
+
+    output_layer = model.network[-1]
+    k_m_index = DEFAULT_PHYSICS.variable_index("k_m")
+
+    weight_gradient = output_layer.weight.grad[k_m_index]
+    bias_gradient = output_layer.bias.grad[k_m_index]
+
+    assert torch.isfinite(weight_gradient).all()
+    assert torch.isfinite(bias_gradient)
+    assert weight_gradient.abs().sum() + bias_gradient.abs() > 0.0

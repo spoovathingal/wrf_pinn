@@ -11,7 +11,6 @@ import numpy as np
 
 from wrf_pinn.data.flow_field import FlowFieldData
 
-
 def predict_flow_field(model, flow_data: FlowFieldData, *, device: str = "cpu"):
     """Return coordinates, predictions, and targets as NumPy arrays.
 
@@ -34,12 +33,9 @@ def predict_flow_field(model, flow_data: FlowFieldData, *, device: str = "cpu"):
     finally:
         model.train(was_training)
 
+    supervised_predictions = predictions[:, : targets.shape[1]]
     return (
         coordinates.detach().cpu().numpy(),
-        predictions.detach().cpu().numpy(),
+        supervised_predictions.detach().cpu().numpy(),
         targets.detach().cpu().numpy(),
     )
-
-
-def _as_numpy(tensor) -> np.ndarray:
-    return tensor.detach().cpu().numpy()

@@ -15,6 +15,8 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from wrf_pinn.config.physics import DEFAULT_PHYSICS
+from wrf_pinn.physics.residuals_pde import _to_physical_eddy_viscosity
 from wrf_pinn.config.flow_field_data import FlowFieldDataConfig
 from wrf_pinn.data.flow_field import read_flow_field
 from wrf_pinn.models.mlp import MLP
@@ -70,8 +72,22 @@ def test_pipeline_model_consumes_inputs(flow_csv, report):
     with torch.no_grad():
         predictions = model(coordinates)
 
-    assert predictions.shape == (len(rows), 5)  # (u, v, w, theta, p_prime)
+    assert predictions.shape == (len(rows), 6)  # (u, v, w, theta, p_prime, k_m unconstrianed)
     assert torch.isfinite(predictions).all()
+
+    k_m = _to_physical_eddy_viscosity(
+        predictions[:, 5:6],
+        DEFAULT_PHYSICS,
+    )
+
+    expected_k_m = torch.full_like(
+        k_m,
+        DEFAULT_PHYSICS.constants.eddy_viscosity_initial,
+    )
+
+    assert torch.allclose(k_m, expected_k_m, rtol=1.0e-5, atol=1.0e-7)
+    assert (k_m > DEFAULT_PHYSICS.constants.eddy_viscosity_min).all()
+    assert (k_m < DEFAULT_PHYSICS.constants.eddy_viscosity_max).all()
 
     report(
         f"post-pipeline model output ({len(rows)} points)",

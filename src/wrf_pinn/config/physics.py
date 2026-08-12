@@ -5,13 +5,13 @@ residual equations; the physics package will consume this configuration later.
 """
 
 from __future__ import annotations
-
+import math
 from dataclasses import dataclass
 from typing import Literal
 
 
 CoordinateSystem = Literal["local_cartesian"]
-PhysicsVariable = Literal["u", "v", "w", "theta", "p_prime"]
+PhysicsVariable = Literal["u", "v", "w", "theta", "p_prime", "k_m"]
 ResidualName = Literal["mass", "x_momentum", "y_momentum", "z_momentum", "potential_temperature"]
 
 @dataclass(frozen=True)
@@ -31,7 +31,43 @@ class PhysicalConstants:
     reference_pressure: float = 100000.0
     earth_rotation_rate: float = 7.2921e-5
     earth_radius: float = 6370000.0
-    eddy_viscosity: float = 0.003853  # K_m [m^2/s]
+    eddy_viscosity_min: float = 0.0       # K_m lower bound [m^2/s]
+    eddy_viscosity_max: float = 100.0     # K_m upper bound [m^2/s]
+    eddy_viscosity_initial: float = 0.003853  # Initial guess only [m^2/s]
+
+    # Check k_m positivity | numeric
+    def __post_init__(self) -> None:
+        values = {
+            "eddy_viscosity_min": self.eddy_viscosity_min,
+            "eddy_viscosity_max": self.eddy_viscosity_max,
+            "eddy_viscosity_initial": self.eddy_viscosity_initial,
+        }
+
+        for name, value in values.items():
+            if not math.isfinite(value):
+                raise ValueError(f"{name} must be finite; got {value}.")
+
+        if self.eddy_viscosity_min < 0.0:
+            raise ValueError(
+                "eddy_viscosity_min must be nonnegative; "
+                f"got {self.eddy_viscosity_min}."
+            )
+
+        if self.eddy_viscosity_max <= self.eddy_viscosity_min:
+            raise ValueError(
+                "eddy_viscosity_max must be greater than "
+                "eddy_viscosity_min."
+            )
+
+        if not (
+            self.eddy_viscosity_min
+            < self.eddy_viscosity_initial
+            < self.eddy_viscosity_max
+        ):
+            raise ValueError(
+                "eddy_viscosity_initial must lie between "
+                "eddy_viscosity_min and eddy_viscosity_max."
+            )
 
     @property
     def kappa(self) -> float:
@@ -54,13 +90,13 @@ class PhysicsConfig:
     - local Cartesian coordinates
     - zero external forcing
     - dry atmospheric thermodynamics
-    - constant momentum eddy viscosity
+    - varying momentum eddy viscosity
     - density is derived from theta and p_prime
-    - active state is u, v, w, theta, and p_prime
+    - active state is u, v, w, theta, p_prime, k_m
     """
 
     coordinate_system: CoordinateSystem = "local_cartesian"
-    active_variables: tuple[PhysicsVariable, ...] = ("u", "v", "w", "theta", "p_prime")
+    active_variables: tuple[PhysicsVariable, ...] = ("u", "v", "w", "theta", "p_prime", "k_m")
     residuals: tuple[ResidualName, ...] = (
         "mass",
         "x_momentum",
