@@ -32,7 +32,7 @@ from wrf_pinn.config.training import OptimizerConfig, TrainingConfig
 from wrf_pinn.data.flow_field import read_flow_field
 from wrf_pinn.evaluation.predict import predict_flow_field
 from wrf_pinn.models.mlp import MLP
-from wrf_pinn.training.train_pinn import train_pinn
+from wrf_pinn.training.train_pinn import train_pinn, TrainingSetup
 
 
 # Mean-absolute tolerance for reproducing the true field (flow_field case). At
@@ -105,9 +105,11 @@ def _run_flow_field_reproduction(path, report, label):
     model = MLP()
     history = train_pinn(
         model,
-        flow_field_data=flow_data,
-        conditions=_flow_field_only_conditions(),
-        training=_training(),
+        TrainingSetup(
+            flow_field_data=flow_data,
+            conditions=_flow_field_only_conditions(),
+            training=_training(),
+        ),
     )
     _assert_loss_decreased(history, report, label)
 
@@ -206,14 +208,16 @@ def _run_pde_uniformity(
     model = MLP()
     history = train_pinn(
         model,
-        domain=_domain_from(flow_data),
-        conditions=_pde_only_conditions(),
-        sampling=sampling,
-        scaling=scaling,
-        training=TrainingConfig(
-            epochs=600,
-            log_every=200,
-            optimizer=OptimizerConfig(name="adam", learning_rate=1.0e-3),
+        TrainingSetup(
+            domain=_domain_from(flow_data),
+            conditions=_pde_only_conditions(),
+            sampling=sampling,
+            scaling=scaling,
+            training=TrainingConfig(
+                epochs=600,
+                log_every=200,
+                optimizer=OptimizerConfig(name="adam", learning_rate=1.0e-3),
+            ),
         ),
     )
     _assert_loss_decreased(history, report, label)

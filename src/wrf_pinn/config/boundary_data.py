@@ -14,6 +14,11 @@ from typing import Literal
 
 WallSurfaceFormat = Literal["csv"]
 
+#: Which wall constraint the boundary residual enforces. ``no_slip`` drives all
+#: velocity components to zero on the wall; ``no_penetration_z`` only constrains
+#: the wall-normal (z) component.
+WallCondition = Literal["no_slip", "no_penetration_z"]
+
 
 @dataclass(frozen=True)
 class WallSurfaceConfig:
@@ -33,10 +38,16 @@ class WallSurfaceConfig:
 
 @dataclass(frozen=True)
 class NoSlipWallConfig:
-    """Configuration for the no-slip wall residual definition."""
+    """Configuration for the wall residual definition.
+
+    ``condition`` selects which wall constraint the residual enforces, so the
+    boundary behavior is self-describing here rather than being toggled by a
+    loose boolean at the training call site.
+    """
 
     surface: WallSurfaceConfig = WallSurfaceConfig()
     velocity_components: tuple[str, ...] = ("u", "v", "w")
+    condition: WallCondition = "no_slip"
 
     def __post_init__(self) -> None:
         if not self.velocity_components:

@@ -72,20 +72,37 @@ class TrainingMonitor(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class TrainingSetup:
+    """Everything a training run needs, assembled once and validated once.
+
+    Grouping the per-run configuration and data here keeps ``train_pinn`` down
+    to three parameters (model, setup, monitor). Callers already build these
+    objects individually, so bundling them is free at the call site.
+
+    Notes
+    -----
+    ``flow_field_data`` and ``sensor_data`` are the current, format-specific data
+    inputs. They are expected to be replaced by a single normalized ``Case`` seam
+    (see the Change 2 roadmap), so no abstraction is layered over them here.
+    """
+
+    domain: CartesianWRFDomain | None = None
+    flow_field_data: FlowFieldData | None = None
+    sensor_data: SensorData | None = None
+    boundaries: BoundaryConfig = DEFAULT_BOUNDARIES
+    conditions: ConditionsConfig = DEFAULT_CONDITIONS
+    sampling: SamplingConfig = DEFAULT_SAMPLING
+    physics: PhysicsConfig = DEFAULT_PHYSICS
+    scaling: ResidualScalingConfig = DEFAULT_RESIDUAL_SCALING
+    training: TrainingConfig = DEFAULT_TRAINING
+
+
 def train_pinn(
     model: nn.Module,
+    setup: TrainingSetup = TrainingSetup(),
     *,
-    domain: CartesianWRFDomain | None = None,
-    flow_field_data: FlowFieldData | None = None,
-    sensor_data: SensorData | None = None,
-    boundaries: BoundaryConfig = DEFAULT_BOUNDARIES,
-    training: TrainingConfig = DEFAULT_TRAINING,
-    conditions: ConditionsConfig = DEFAULT_CONDITIONS,
-    sampling: SamplingConfig = DEFAULT_SAMPLING,
-    physics: PhysicsConfig = DEFAULT_PHYSICS,
-    scaling: ResidualScalingConfig = DEFAULT_RESIDUAL_SCALING,
     monitor: TrainingMonitor | None = None,
-    use_no_penetration_z_wall: bool = False,
 ) -> TrainingHistory:
     """Train a WRF PINN using the globally active condition modes.
 
@@ -94,30 +111,10 @@ def train_pinn(
     model:
         Neural network mapping normalized ``(x, y, z, t)`` inputs to normalized
         ``(u, v, w, rho)`` outputs.
-    domain:
-        Continuous Cartesian domain used to generate PDE collocation points.
-        This is required only when ``conditions.pde.active`` is true.
-    flow_field_data:
-        Optional dense normalized data with ``x, y, z, t, u, v, w, rho``. This
-        is required only when ``conditions.flow_field_data.active`` is true.
-    sensor_data:
-        Optional sparse normalized sensor data with ``x, y, z, t, u, v, w``.
-        This is required only when ``conditions.sensor_data.active`` is true.
-    boundaries:
-        Boundary-condition configuration. The no-slip wall surface path is used
-        by ``sampling.boundary`` when ``conditions.boundary.active`` is true.
-    training:
-        Optimizer, device, epoch count, and logging configuration.
-    conditions:
-        Global active/inactive switches and lambda weights.
-    sampling:
-        Sampling settings. The collocation subsection is used when
-        ``conditions.pde.active`` is true.
-    physics:
-        Physics configuration passed to the PDE residual evaluator.
-    scaling:
-        Affine scaling metadata used by PDE and boundary residuals to map
-        normalized model coordinates/outputs to physical variables.
+    setup:
+        The bundled run configuration and data (domain, flow/sensor data,
+        boundary/conditions/sampling/physics/scaling/training configs). See
+        ``TrainingSetup``.
     monitor:
         Optional live monitor. When given, its ``update`` method is called on
         the logging cadence with the current epoch's total and component losses,
@@ -130,129 +127,184 @@ def train_pinn(
         Per-epoch total and component losses.
     """
 
-    _validate_active_inputs(
-        domain=domain,
-        flow_field_data=flow_field_data,
-        sensor_data=sensor_data,
-        boundaries=boundaries,
-        conditions=conditions,
-    )
+    _validate_active_inputs(setup)
 
-    device = _resolve_device(training.device)
+    device = _resolve_device(setup.training.device)
     model.to(device)
 
-    optimizer = build_optimizer(model, training.optimizer)
+    optimizer = build_optimizer(model, setup.training.optimizer)
     history = TrainingHistory()
+    prepared = _PreparedData.from_setup(setup, device=device)
 
-    flow_coordinates: torch.Tensor | None = None
-    flow_targets: torch.Tensor | None = None
-    if flow_field_data is not None:
-        flow_coordinates, flow_targets = flow_field_data.as_torch(device=device)
-
-    sensor_coordinates: torch.Tensor | None = None
-    sensor_targets: torch.Tensor | None = None
-    if sensor_data is not None:
-        sensor_coordinates, sensor_targets = sensor_data.as_torch(device=device)
-
-    for epoch in range(1, training.epochs + 1):
-        optimizer.zero_grad()
-
-        pde_residuals: dict[str, torch.Tensor] | None = None
-        boundary_residuals: dict[str, torch.Tensor] | None = None
-        sensor_data_errors: dict[str, torch.Tensor] | None = None
-        flow_field_data_errors: dict[str, torch.Tensor] | None = None
-
-        if conditions.pde.active:
-            pde_coordinates = _sample_pde_coordinates(
-                domain=domain,
-                sampling=sampling,
-                device=device,
-            )
-            pde_state = model(pde_coordinates)
-            pde_residuals = cartesian_zero_forcing_residuals(
-                pde_coordinates,
-                pde_state,
-                physics=physics,
-                scaling=scaling,
-            )
-
-        if conditions.boundary.active:
-            wall_coordinates = sample_wall_boundary_points(
-                boundary=boundaries.no_slip_wall,
-                sampling=sampling.boundary,
-                flow_field_data=flow_field_data,
-                sensor_data=sensor_data,
-                seed=sampling.seed,
-                device=device,
-            )
-            wall_state = model(wall_coordinates)
-
-            if use_no_penetration_z_wall:
-                boundary_residuals = no_penetration_z_wall_residuals(
-                    wall_state,
-                    scaling=scaling,
-                )
-            else:
-                boundary_residuals = no_slip_wall_residuals(
-                    wall_state,
-                    scaling=scaling,
-                )
-
-        if conditions.sensor_data.active:
-            coordinates = _require_tensor(sensor_coordinates, "sensor_data.coordinates")
-            targets = _require_tensor(sensor_targets, "sensor_data.targets")
-            predictions = model(coordinates)
-            sensor_data_errors = {
-                "sensor_velocity": predictions[:, : targets.shape[1]] - targets,
-            }
-
-        if conditions.flow_field_data.active:
-            coordinates = _require_tensor(
-                flow_coordinates,
-                "flow_field_data.coordinates",
-            )
-            targets = _require_tensor(flow_targets, "flow_field_data.targets")
-            predictions = model(coordinates)
-            flow_field_data_errors = {
-                "flow_field": predictions[:, : targets.shape[1]] - targets,
-            }
-
-        loss = assemble_pinn_loss(
-            pde_residuals=pde_residuals,
-            boundary_residuals=boundary_residuals,
-            sensor_data_errors=sensor_data_errors,
-            flow_field_data_errors=flow_field_data_errors,
-            conditions=conditions,
-        )
-
-        loss.total.backward()
-
-        if training.gradient_clip_norm is not None:
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                training.gradient_clip_norm,
-            )
-
-        optimizer.step()
-
+    for epoch in range(1, setup.training.epochs + 1):
+        loss = _training_step(model, optimizer, setup, prepared)
         _record_history(history, loss)
 
-        if _should_log(epoch, training):
-            _print_progress(epoch, training.epochs, loss)
-            if monitor is not None:
-                monitor.update(
-                    epoch=epoch,
-                    total=float(loss.total.detach().cpu()),
-                    components={
-                        name: float(loss.terms[name].detach().cpu())
-                        for name in COMPONENT_LOSS_NAMES
-                    },
-                )
+        if _should_log(epoch, setup.training):
+            _print_progress(epoch, setup.training.epochs, loss)
+            _notify_monitor(monitor, epoch=epoch, loss=loss)
 
     if monitor is not None:
         monitor.finalize()
 
     return history
+
+
+@dataclass
+class _PreparedData:
+    """The resolved device plus the data tensors placed on it.
+
+    Materialized once before the epoch loop. Carrying the device here keeps it
+    with the tensors it applies to, so the per-epoch helpers do not have to pass
+    it around separately.
+    """
+
+    device: torch.device
+    flow_coordinates: torch.Tensor | None = None
+    flow_targets: torch.Tensor | None = None
+    sensor_coordinates: torch.Tensor | None = None
+    sensor_targets: torch.Tensor | None = None
+
+    @classmethod
+    def from_setup(cls, setup: TrainingSetup, *, device: torch.device) -> "_PreparedData":
+        prepared = cls(device=device)
+        if setup.flow_field_data is not None:
+            prepared.flow_coordinates, prepared.flow_targets = (
+                setup.flow_field_data.as_torch(device=device)
+            )
+        if setup.sensor_data is not None:
+            prepared.sensor_coordinates, prepared.sensor_targets = (
+                setup.sensor_data.as_torch(device=device)
+            )
+        return prepared
+
+
+def _training_step(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    setup: TrainingSetup,
+    prepared: _PreparedData,
+) -> LossBreakdown:
+    """Run one optimizer step and return the loss breakdown for the epoch."""
+
+    optimizer.zero_grad()
+    objectives = _evaluate_active_objectives(model, setup, prepared)
+    loss = assemble_pinn_loss(conditions=setup.conditions, **objectives)
+
+    loss.total.backward()
+    if setup.training.gradient_clip_norm is not None:
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            setup.training.gradient_clip_norm,
+        )
+    optimizer.step()
+    return loss
+
+
+def _evaluate_active_objectives(
+    model: nn.Module,
+    setup: TrainingSetup,
+    prepared: _PreparedData,
+) -> dict[str, dict[str, torch.Tensor] | None]:
+    """Evaluate residuals/errors for each active objective.
+
+    Returns a mapping in the keyword shape ``assemble_pinn_loss`` expects, with
+    ``None`` for inactive objectives.
+    """
+
+    conditions = setup.conditions
+    pde_residuals: dict[str, torch.Tensor] | None = None
+    boundary_residuals: dict[str, torch.Tensor] | None = None
+    sensor_data_errors: dict[str, torch.Tensor] | None = None
+    flow_field_data_errors: dict[str, torch.Tensor] | None = None
+
+    if conditions.pde.active:
+        pde_coordinates = _sample_pde_coordinates(
+            domain=setup.domain,
+            sampling=setup.sampling,
+            device=prepared.device,
+        )
+        pde_state = model(pde_coordinates)
+        pde_residuals = cartesian_zero_forcing_residuals(
+            pde_coordinates,
+            pde_state,
+            physics=setup.physics,
+            scaling=setup.scaling,
+        )
+
+    if conditions.boundary.active:
+        boundary_residuals = _boundary_residuals(model, setup, prepared.device)
+
+    if conditions.sensor_data.active:
+        coordinates = _require_tensor(
+            prepared.sensor_coordinates, "sensor_data.coordinates"
+        )
+        targets = _require_tensor(prepared.sensor_targets, "sensor_data.targets")
+        sensor_data_errors = {
+            "sensor_velocity": _data_errors(model, coordinates, targets),
+        }
+
+    if conditions.flow_field_data.active:
+        coordinates = _require_tensor(
+            prepared.flow_coordinates, "flow_field_data.coordinates"
+        )
+        targets = _require_tensor(prepared.flow_targets, "flow_field_data.targets")
+        flow_field_data_errors = {
+            "flow_field": _data_errors(model, coordinates, targets),
+        }
+
+    return {
+        "pde_residuals": pde_residuals,
+        "boundary_residuals": boundary_residuals,
+        "sensor_data_errors": sensor_data_errors,
+        "flow_field_data_errors": flow_field_data_errors,
+    }
+
+
+def _boundary_residuals(
+    model: nn.Module, setup: TrainingSetup, device: torch.device
+) -> dict[str, torch.Tensor]:
+    """Wall residuals for the configured wall condition."""
+
+    wall_coordinates = sample_wall_boundary_points(
+        boundary=setup.boundaries.no_slip_wall,
+        sampling=setup.sampling.boundary,
+        flow_field_data=setup.flow_field_data,
+        sensor_data=setup.sensor_data,
+        seed=setup.sampling.seed,
+        device=device,
+    )
+    wall_state = model(wall_coordinates)
+
+    if setup.boundaries.no_slip_wall.condition == "no_penetration_z":
+        return no_penetration_z_wall_residuals(wall_state, scaling=setup.scaling)
+    return no_slip_wall_residuals(wall_state, scaling=setup.scaling)
+
+
+def _data_errors(
+    model: nn.Module, coordinates: torch.Tensor, targets: torch.Tensor
+) -> torch.Tensor:
+    """Prediction-minus-target error for a data objective."""
+
+    predictions = model(coordinates)
+    return predictions[:, : targets.shape[1]] - targets
+
+
+def _notify_monitor(
+    monitor: TrainingMonitor | None, *, epoch: int, loss: LossBreakdown
+) -> None:
+    """Stream the epoch's losses to the monitor, if one is attached."""
+
+    if monitor is None:
+        return
+    monitor.update(
+        epoch=epoch,
+        total=float(loss.total.detach().cpu()),
+        components={
+            name: float(loss.terms[name].detach().cpu())
+            for name in COMPONENT_LOSS_NAMES
+        },
+    )
 
 
 def build_optimizer(model: nn.Module, config: OptimizerConfig) -> torch.optim.Optimizer:
@@ -277,35 +329,30 @@ def build_optimizer(model: nn.Module, config: OptimizerConfig) -> torch.optim.Op
     raise ValueError(f"Unsupported optimizer: {config.name}.")
 
 
-def _validate_active_inputs(
-    *,
-    domain: CartesianWRFDomain | None,
-    flow_field_data: FlowFieldData | None,
-    sensor_data: SensorData | None,
-    boundaries: BoundaryConfig,
-    conditions: ConditionsConfig,
-) -> None:
+def _validate_active_inputs(setup: TrainingSetup) -> None:
     """Fail early when an active objective has no corresponding data source."""
 
-    if conditions.pde.active and domain is None:
+    conditions = setup.conditions
+
+    if conditions.pde.active and setup.domain is None:
         raise ValueError("conditions.pde is active, but domain is None.")
 
-    if conditions.flow_field_data.active and flow_field_data is None:
+    if conditions.flow_field_data.active and setup.flow_field_data is None:
         raise ValueError(
             "conditions.flow_field_data is active, but flow_field_data is None."
         )
 
-    if conditions.sensor_data.active and sensor_data is None:
+    if conditions.sensor_data.active and setup.sensor_data is None:
         raise ValueError("conditions.sensor_data is active, but sensor_data is None.")
 
     if conditions.boundary.active:
-        if not boundaries.no_slip_wall.surface.path:
+        if not setup.boundaries.no_slip_wall.surface.path:
             raise ValueError(
                 "conditions.boundary is active, but no no-slip wall surface "
                 "path is configured."
             )
 
-        if flow_field_data is None and sensor_data is None:
+        if setup.flow_field_data is None and setup.sensor_data is None:
             raise ValueError(
                 "conditions.boundary is active, but no flow_field_data or "
                 "sensor_data was provided to supply boundary times."
