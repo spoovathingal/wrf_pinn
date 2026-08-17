@@ -316,6 +316,7 @@ def test_uniform_flow_pde_boundary_sensor(
     boundaries = BoundaryConfig(
         no_slip_wall=NoSlipWallConfig(
             surface=WallSurfaceConfig(path=str(bottom_wall_csv)),
+            condition="no_penetration_z",
         )
     )
     conditions = ConditionsConfig(
@@ -333,13 +334,14 @@ def test_uniform_flow_pde_boundary_sensor(
     model = MLP()
     history = train_pinn(
         model,
-        domain=domain,
-        sensor_data=sensor_data,
-        boundaries=boundaries,
-        conditions=conditions,
-        sampling=sampling,
-        use_no_penetration_z_wall=True,
-        training=_training(),
+        TrainingSetup(
+            domain=domain,
+            sensor_data=sensor_data,
+            boundaries=boundaries,
+            conditions=conditions,
+            sampling=sampling,
+            training=_training(),
+        ),
     )
     _assert_loss_decreased(history, report, "uniform flow, pde+boundary+sensor")
 
