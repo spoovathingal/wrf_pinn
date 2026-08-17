@@ -22,14 +22,25 @@ import numpy as np
 import pytest
 import torch
 
+from wrf_pinn.config.boundary_data import (
+    BoundaryConfig,
+    NoSlipWallConfig,
+    WallSurfaceConfig,
+)
 from wrf_pinn.config.conditions import ConditionSpec, ConditionsConfig
 from wrf_pinn.config.domain import make_cartesian_wrf_domain
 from wrf_pinn.config.flow_field_data import FlowFieldDataConfig
-from wrf_pinn.config.sampling import CollocationSamplingConfig, SamplingConfig
+from wrf_pinn.config.sampling import (
+    BoundarySamplingConfig,
+    CollocationSamplingConfig,
+    SamplingConfig,
+)
 from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING, ResidualScalingConfig
 from wrf_pinn.config.scaling import VariableScale
+from wrf_pinn.config.sensors_data import SensorDataConfig
 from wrf_pinn.config.training import OptimizerConfig, TrainingConfig
 from wrf_pinn.data.flow_field import read_flow_field
+from wrf_pinn.data.sensors import read_sensor_data
 from wrf_pinn.evaluation.predict import predict_flow_field
 from wrf_pinn.models.mlp import MLP
 from wrf_pinn.training.train_pinn import train_pinn, TrainingSetup
@@ -279,4 +290,76 @@ def test_uniform_flow_pde_with_physical_scaling(uniform_flow_csv, report):
         "uniform flow, pde only [physical scaling]",
         collocation_points=200,
         scaling=PHYSICAL_SCALING,
+    )
+
+
+def test_uniform_flow_pde_boundary_sensor(
+    uniform_sensor_csv, bottom_wall_csv, report
+):
+    """PDE + boundary + sensor (no flow-field): recovers the sensor field.
+
+    This is the combination missing from the earlier cases. Sensors anchor the
+    solution to the true velocities, the PDE enforces the governing equations at
+    collocation points, and the no-penetration wall constrains the bottom
+    boundary. With a data anchor present, the model must reproduce the sensor
+    values (unlike pde-only, which can only guarantee uniformity).
+    """
+
+    sensor_path, sensor_rows = uniform_sensor_csv
+    torch.manual_seed(0)
+    sensor_data = read_sensor_data(SensorDataConfig(path=str(sensor_path)))
+
+    domain = make_cartesian_wrf_domain(
+        x_min=0.0, x_max=1.0, y_min=0.0, y_max=1.0,
+        z_min=0.0, z_max=1.0, t_min=0.0, t_max=1.0,
+    )
+    boundaries = BoundaryConfig(
+        no_slip_wall=NoSlipWallConfig(
+            surface=WallSurfaceConfig(path=str(bottom_wall_csv)),
+        )
+    )
+    conditions = ConditionsConfig(
+        pde=ConditionSpec("pde", active=True, weight=1.0),
+        boundary=ConditionSpec("boundary", active=True, weight=1.0),
+        sensor_data=ConditionSpec("sensor_data", active=True, weight=1.0),
+        flow_field_data=ConditionSpec("flow_field_data", active=False, weight=0.0),
+    )
+    sampling = SamplingConfig(
+        collocation=CollocationSamplingConfig(n_points=200, method="latin_hypercube"),
+        boundary=BoundarySamplingConfig(n_points=None, method="all"),
+        seed=0,
+    )
+
+    model = MLP()
+    history = train_pinn(
+        model,
+        domain=domain,
+        sensor_data=sensor_data,
+        boundaries=boundaries,
+        conditions=conditions,
+        sampling=sampling,
+        use_no_penetration_z_wall=True,
+        training=_training(),
+    )
+    _assert_loss_decreased(history, report, "uniform flow, pde+boundary+sensor")
+
+    # All three modes are active and contribute.
+    assert history.pde[-1] >= 0.0
+    assert history.boundary[-1] >= 0.0
+    assert history.sensor_data[-1] >= 0.0
+
+    # Known-result check: sensors anchor the field, so predictions at the sensor
+    # points reproduce the true (u, v, w) within tolerance.
+    coordinates, _ = sensor_data.as_torch()
+    with torch.no_grad():
+        predictions = model(coordinates).cpu().numpy()
+    targets = np.array([[r["u"], r["v"], r["w"]] for r in sensor_rows])
+    mae = np.abs(predictions[:, :3] - targets).mean(axis=0)
+    assert (mae < REPRODUCTION_TOL).all()
+    report(
+        "uniform flow, pde+boundary+sensor: reproduces sensor field",
+        per_variable_mae=mae,
+        final_components=np.array(
+            [history.pde[-1], history.boundary[-1], history.sensor_data[-1]]
+        ),
     )
