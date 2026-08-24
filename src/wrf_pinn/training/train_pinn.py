@@ -25,8 +25,7 @@ from wrf_pinn.config.physics import DEFAULT_PHYSICS, PhysicsConfig
 from wrf_pinn.config.sampling import DEFAULT_SAMPLING, SamplingConfig
 from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING, ResidualScalingConfig
 from wrf_pinn.config.training import DEFAULT_TRAINING, OptimizerConfig, TrainingConfig
-from wrf_pinn.data.flow_field import FlowFieldData
-from wrf_pinn.data.sensors import SensorData
+from wrf_pinn.data.case import Case, SRC_INLET, SRC_SIM, SRC_SENSOR
 from wrf_pinn.physics.residuals_boundary import no_penetration_z_wall_residuals
 from wrf_pinn.physics.residuals_boundary import no_slip_wall_residuals
 from wrf_pinn.physics.residuals_pde import cartesian_zero_forcing_residuals
@@ -39,8 +38,9 @@ from wrf_pinn.training.losses import LossBreakdown, assemble_pinn_loss
 COMPONENT_LOSS_NAMES: tuple[str, ...] = (
     "pde",
     "boundary",
-    "sensor_data",
-    "flow_field_data",
+    "inlet",
+    "simulation",
+    "sensor",
 )
 
 
@@ -51,8 +51,9 @@ class TrainingHistory:
     total: list[float] = field(default_factory=list)
     pde: list[float] = field(default_factory=list)
     boundary: list[float] = field(default_factory=list)
-    sensor_data: list[float] = field(default_factory=list)
-    flow_field_data: list[float] = field(default_factory=list)
+    inlet: list[float] = field(default_factory=list)
+    simulation: list[float] = field(default_factory=list)
+    sensor: list[float] = field(default_factory=list)
 
 
 class TrainingMonitor(Protocol):
@@ -76,20 +77,12 @@ class TrainingMonitor(Protocol):
 class TrainingSetup:
     """Everything a training run needs, assembled once and validated once.
 
-    Grouping the per-run configuration and data here keeps ``train_pinn`` down
-    to three parameters (model, setup, monitor). Callers already build these
-    objects individually, so bundling them is free at the call site.
-
-    Notes
-    -----
-    ``flow_field_data`` and ``sensor_data`` are the current, format-specific data
-    inputs. They are expected to be replaced by a single normalized ``Case`` seam
-    (see the Change 2 roadmap), so no abstraction is layered over them here.
+    Data enters as one normalized ``Case`` (from the pre-processor); its rows
+    carry a per-source tag so the data loss is weighted per source.
     """
 
     domain: CartesianWRFDomain | None = None
-    flow_field_data: FlowFieldData | None = None
-    sensor_data: SensorData | None = None
+    case: Case | None = None
     boundaries: BoundaryConfig = DEFAULT_BOUNDARIES
     conditions: ConditionsConfig = DEFAULT_CONDITIONS
     sampling: SamplingConfig = DEFAULT_SAMPLING
@@ -150,32 +143,31 @@ def train_pinn(
     return history
 
 
+#: Condition name -> the source tag whose rows feed that data objective.
+_DATA_SOURCE = {"inlet": SRC_INLET, "simulation": SRC_SIM, "sensor": SRC_SENSOR}
+
+
 @dataclass
 class _PreparedData:
-    """The resolved device plus the data tensors placed on it.
+    """The resolved device plus per-source (coordinates, targets) tensors.
 
-    Materialized once before the epoch loop. Carrying the device here keeps it
-    with the tensors it applies to, so the per-epoch helpers do not have to pass
-    it around separately.
+    Materialized once before the epoch loop by splitting the case's rows by
+    their source tag, so each data objective sees only its source's rows.
     """
 
     device: torch.device
-    flow_coordinates: torch.Tensor | None = None
-    flow_targets: torch.Tensor | None = None
-    sensor_coordinates: torch.Tensor | None = None
-    sensor_targets: torch.Tensor | None = None
+    by_source: dict[int, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
 
     @classmethod
     def from_setup(cls, setup: TrainingSetup, *, device: torch.device) -> "_PreparedData":
         prepared = cls(device=device)
-        if setup.flow_field_data is not None:
-            prepared.flow_coordinates, prepared.flow_targets = (
-                setup.flow_field_data.as_torch(device=device)
-            )
-        if setup.sensor_data is not None:
-            prepared.sensor_coordinates, prepared.sensor_targets = (
-                setup.sensor_data.as_torch(device=device)
-            )
+        if setup.case is None:
+            return prepared
+        coordinates, targets = setup.case.as_torch(device=device)
+        source = torch.as_tensor(setup.case.source, device=device)
+        for code in torch.unique(source).tolist():
+            mask = source == code
+            prepared.by_source[int(code)] = (coordinates[mask], targets[mask])
         return prepared
 
 
@@ -215,8 +207,6 @@ def _evaluate_active_objectives(
     conditions = setup.conditions
     pde_residuals: dict[str, torch.Tensor] | None = None
     boundary_residuals: dict[str, torch.Tensor] | None = None
-    sensor_data_errors: dict[str, torch.Tensor] | None = None
-    flow_field_data_errors: dict[str, torch.Tensor] | None = None
 
     if conditions.pde.active:
         pde_coordinates = _sample_pde_coordinates(
@@ -235,30 +225,20 @@ def _evaluate_active_objectives(
     if conditions.boundary.active:
         boundary_residuals = _boundary_residuals(model, setup, prepared.device)
 
-    if conditions.sensor_data.active:
-        coordinates = _require_tensor(
-            prepared.sensor_coordinates, "sensor_data.coordinates"
-        )
-        targets = _require_tensor(prepared.sensor_targets, "sensor_data.targets")
-        sensor_data_errors = {
-            "sensor_velocity": _data_errors(model, coordinates, targets),
-        }
-
-    if conditions.flow_field_data.active:
-        coordinates = _require_tensor(
-            prepared.flow_coordinates, "flow_field_data.coordinates"
-        )
-        targets = _require_tensor(prepared.flow_targets, "flow_field_data.targets")
-        flow_field_data_errors = {
-            "flow_field": _data_errors(model, coordinates, targets),
-        }
-
-    return {
+    objectives: dict[str, dict[str, torch.Tensor] | None] = {
         "pde_residuals": pde_residuals,
         "boundary_residuals": boundary_residuals,
-        "sensor_data_errors": sensor_data_errors,
-        "flow_field_data_errors": flow_field_data_errors,
     }
+    # One data term per source category (inlet / simulation / sensor), each fed
+    # by that source's rows via the case's source tag.
+    for name, code in _DATA_SOURCE.items():
+        spec = getattr(conditions, name)
+        errors = None
+        if spec.active:
+            coordinates, targets = _require_source_rows(prepared, code, name)
+            errors = {name: _data_errors(model, coordinates, targets)}
+        objectives[f"{name}_errors"] = errors
+    return objectives
 
 
 def _boundary_residuals(
@@ -269,8 +249,7 @@ def _boundary_residuals(
     wall_coordinates = sample_wall_boundary_points(
         boundary=setup.boundaries.no_slip_wall,
         sampling=setup.sampling.boundary,
-        flow_field_data=setup.flow_field_data,
-        sensor_data=setup.sensor_data,
+        case=setup.case,
         seed=setup.sampling.seed,
         device=device,
     )
@@ -337,13 +316,9 @@ def _validate_active_inputs(setup: TrainingSetup) -> None:
     if conditions.pde.active and setup.domain is None:
         raise ValueError("conditions.pde is active, but domain is None.")
 
-    if conditions.flow_field_data.active and setup.flow_field_data is None:
-        raise ValueError(
-            "conditions.flow_field_data is active, but flow_field_data is None."
-        )
-
-    if conditions.sensor_data.active and setup.sensor_data is None:
-        raise ValueError("conditions.sensor_data is active, but sensor_data is None.")
+    data_active = any(getattr(conditions, name).active for name in _DATA_SOURCE)
+    if data_active and setup.case is None:
+        raise ValueError("A data condition is active, but setup.case is None.")
 
     if conditions.boundary.active:
         if not setup.boundaries.no_slip_wall.surface.path:
@@ -351,11 +326,10 @@ def _validate_active_inputs(setup: TrainingSetup) -> None:
                 "conditions.boundary is active, but no no-slip wall surface "
                 "path is configured."
             )
-
-        if setup.flow_field_data is None and setup.sensor_data is None:
+        if setup.case is None:
             raise ValueError(
-                "conditions.boundary is active, but no flow_field_data or "
-                "sensor_data was provided to supply boundary times."
+                "conditions.boundary is active, but no case was provided to "
+                "supply boundary times."
             )
 
 
@@ -379,13 +353,18 @@ def _sample_pde_coordinates(
     return coordinates.requires_grad_(True)
 
 
-def _require_tensor(value: torch.Tensor | None, name: str) -> torch.Tensor:
-    """Return a tensor or raise a descriptive error."""
+def _require_source_rows(
+    prepared: "_PreparedData", code: int, name: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the (coordinates, targets) for a source, or raise if the case has none."""
 
-    if value is None:
-        raise ValueError(f"Required tensor is missing: {name}.")
-
-    return value
+    rows = prepared.by_source.get(code)
+    if rows is None:
+        raise ValueError(
+            f"conditions.{name} is active, but the case has no rows tagged "
+            f"'{name}' (source {code})."
+        )
+    return rows
 
 
 def _resolve_device(device: str) -> torch.device:
@@ -401,12 +380,8 @@ def _record_history(history: TrainingHistory, loss: LossBreakdown) -> None:
     """Append scalar loss values to history."""
 
     history.total.append(float(loss.total.detach().cpu()))
-    history.pde.append(float(loss.terms["pde"].detach().cpu()))
-    history.boundary.append(float(loss.terms["boundary"].detach().cpu()))
-    history.sensor_data.append(float(loss.terms["sensor_data"].detach().cpu()))
-    history.flow_field_data.append(
-        float(loss.terms["flow_field_data"].detach().cpu()),
-    )
+    for name in COMPONENT_LOSS_NAMES:
+        getattr(history, name).append(float(loss.terms[name].detach().cpu()))
 
 
 def _should_log(epoch: int, training: TrainingConfig) -> bool:
@@ -421,9 +396,9 @@ def _print_progress(epoch: int, epochs: int, loss: LossBreakdown) -> None:
     parts = [
         f"epoch={epoch}/{epochs}",
         f"total={float(loss.total.detach().cpu()):.6e}",
-        f"pde={float(loss.terms['pde'].detach().cpu()):.6e}",
-        f"boundary={float(loss.terms['boundary'].detach().cpu()):.6e}",
-        f"sensor_data={float(loss.terms['sensor_data'].detach().cpu()):.6e}",
-        f"flow_field_data={float(loss.terms['flow_field_data'].detach().cpu()):.6e}",
+    ]
+    parts += [
+        f"{name}={float(loss.terms[name].detach().cpu()):.6e}"
+        for name in COMPONENT_LOSS_NAMES
     ]
     print(" | ".join(parts))

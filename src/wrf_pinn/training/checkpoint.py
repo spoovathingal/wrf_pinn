@@ -64,6 +64,7 @@ def _history_to_dict(history: TrainingHistory) -> dict[str, list[float]]:
         "total": list(history.total),
         "pde": list(history.pde),
         "boundary": list(history.boundary),
-        "sensor_data": list(history.sensor_data),
-        "flow_field_data": list(history.flow_field_data),
+        "inlet": list(history.inlet),
+        "simulation": list(history.simulation),
+        "sensor": list(history.sensor),
     }

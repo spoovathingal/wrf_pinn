@@ -15,16 +15,13 @@ from wrf_pinn.config.boundary_data import NoSlipWallConfig
 from wrf_pinn.config.sampling import BoundarySamplingConfig
 from wrf_pinn.data.boundary import read_wall_surface_geometry
 from wrf_pinn.data.boundary import WallSurfaceGeometry
-from wrf_pinn.data.flow_field import FlowFieldData
-from wrf_pinn.data.sensors import SensorData
 
 
 def sample_wall_boundary_points(
     boundary: NoSlipWallConfig,
     sampling: BoundarySamplingConfig,
     *,
-    flow_field_data: FlowFieldData | None = None,
-    sensor_data: SensorData | None = None,
+    case: "object | None" = None,
     seed: int | None = None,
     dtype: torch.dtype = torch.float32,
     device: torch.device | str | None = None,
@@ -69,10 +66,7 @@ def sample_wall_boundary_points(
     """
 
     surface = read_wall_surface_geometry(boundary.surface)
-    times = _training_times_from_data(
-        flow_field_data=flow_field_data,
-        sensor_data=sensor_data,
-    )
+    times = _training_times_from_case(case)
     return sample_wall_boundary_points_from_surface(
         surface=surface,
         times=times,
@@ -198,26 +192,17 @@ def _validate_surface_coordinates(coordinates: torch.Tensor) -> None:
         raise ValueError("Wall surface geometry must contain at least one point.")
 
 
-def _training_times_from_data(
-    *,
-    flow_field_data: FlowFieldData | None,
-    sensor_data: SensorData | None,
-) -> object:
-    """Return the boundary time source from available training data."""
+def _training_times_from_case(case: object | None) -> object:
+    """Return the boundary time source from the case's coordinate times."""
 
-    if flow_field_data is not None:
-        return _unique_times_from_coordinates(
-            coordinates=flow_field_data.coordinates,
-            coordinate_names=flow_field_data.coordinate_names,
-            data_name="flow_field_data",
+    if case is None:
+        raise ValueError(
+            "Boundary sampling requires a case to provide training time values."
         )
-
-    if sensor_data is not None:
-        return sensor_data.unique_times
-
-    raise ValueError(
-        "Boundary sampling requires flow_field_data or sensor_data to provide "
-        "training time values."
+    return _unique_times_from_coordinates(
+        coordinates=case.coordinates,
+        coordinate_names=case.coordinate_names,
+        data_name="case",
     )
 
 

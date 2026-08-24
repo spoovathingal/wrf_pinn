@@ -73,63 +73,34 @@ def assemble_pinn_loss(
     *,
     pde_residuals: TensorMap | None = None,
     boundary_residuals: TensorMap | None = None,
-    sensor_data_errors: TensorMap | None = None,
-    flow_field_data_errors: TensorMap | None = None,
+    inlet_errors: TensorMap | None = None,
+    simulation_errors: TensorMap | None = None,
+    sensor_errors: TensorMap | None = None,
     conditions: ConditionsConfig = DEFAULT_CONDITIONS,
 ) -> LossBreakdown:
     """Assemble the weighted PINN training loss.
 
-    Parameters
-    ----------
-    pde_residuals:
-        Residual tensors such as ``mass``, ``x_momentum``, ``y_momentum``, and
-        ``z_momentum``.
-    boundary_residuals:
-        Boundary-condition residual tensors such as no-slip wall velocity
-        residuals.
-    sensor_data_errors:
-        Prediction-minus-measurement tensors for sparse sensor data.
-    flow_field_data_errors:
-        Prediction-minus-measurement tensors for dense flowfield data.
-    conditions:
-        Condition activation, weighting, and reduction configuration.
-
-    Returns
-    -------
-    LossBreakdown
-        Total weighted loss plus unweighted and weighted component terms.
+    ``inlet_errors`` / ``simulation_errors`` / ``sensor_errors`` are the
+    prediction-minus-target tensors for each data source (per the case's source
+    tag). ``pde_residuals`` and ``boundary_residuals`` are physics/BC terms. Each
+    term is weighted by its condition.
     """
 
     zero = _zero_like_available(
-        pde_residuals,
-        boundary_residuals,
-        sensor_data_errors,
-        flow_field_data_errors,
+        pde_residuals, boundary_residuals,
+        inlet_errors, simulation_errors, sensor_errors,
     )
 
-    terms: TensorMap = {
-        "pde": _group_loss(pde_residuals, conditions.pde, zero),
-        "boundary": _group_loss(boundary_residuals, conditions.boundary, zero),
-        "sensor_data": _group_loss(sensor_data_errors, conditions.sensor_data, zero),
-        "flow_field_data": _group_loss(
-            flow_field_data_errors,
-            conditions.flow_field_data,
-            zero,
-        ),
-    }
-    weighted_terms: TensorMap = {
-        name: terms[name] * condition.weight
-        for name, condition in (
-            ("pde", conditions.pde),
-            ("boundary", conditions.boundary),
-            ("sensor_data", conditions.sensor_data),
-            ("flow_field_data", conditions.flow_field_data),
-        )
-    }
+    by_name = (
+        ("pde", pde_residuals, conditions.pde),
+        ("boundary", boundary_residuals, conditions.boundary),
+        ("inlet", inlet_errors, conditions.inlet),
+        ("simulation", simulation_errors, conditions.simulation),
+        ("sensor", sensor_errors, conditions.sensor),
+    )
+
+    terms: TensorMap = {name: _group_loss(errors, spec, zero) for name, errors, spec in by_name}
+    weighted_terms: TensorMap = {name: terms[name] * spec.weight for name, _, spec in by_name}
     total = torch.stack(tuple(weighted_terms.values())).sum()
 
-    return LossBreakdown(
-        total=total,
-        terms=terms,
-        weighted_terms=weighted_terms,
-    )
+    return LossBreakdown(total=total, terms=terms, weighted_terms=weighted_terms)

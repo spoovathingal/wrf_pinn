@@ -1,8 +1,9 @@
 """Global loss-mode configuration for WRF PINN experiments.
 
-This module controls which major training modes are active and how strongly
-each mode contributes to the total loss. It does not read data, evaluate
-residuals, or assemble losses; those responsibilities live elsewhere.
+Controls which loss modes are active and how strongly each contributes. The
+three data modes (``inlet``, ``simulation``, ``sensor``) mirror the pre-processor
+source tags, so a case's rows are weighted per source. It does not read data,
+evaluate residuals, or assemble losses.
 """
 
 from __future__ import annotations
@@ -11,13 +12,11 @@ from dataclasses import dataclass
 from typing import Literal
 
 
-ConditionName = Literal[
-    "pde",
-    "boundary",
-    "sensor_data",
-    "flow_field_data",
-]
+ConditionName = Literal["pde", "boundary", "inlet", "simulation", "sensor"]
 ReductionName = Literal["mean", "sum"]
+
+#: Data condition names, in source-tag order (map to source codes 0, 1, 2).
+DATA_CONDITIONS: tuple[ConditionName, ...] = ("inlet", "simulation", "sensor")
 
 
 @dataclass(frozen=True)
@@ -32,7 +31,6 @@ class ConditionSpec:
     def __post_init__(self) -> None:
         if self.weight < 0.0:
             raise ValueError(f"{self.name} weight must be nonnegative.")
-
         if not self.active and self.weight != 0.0:
             raise ValueError(f"{self.name} must have weight 0.0 when inactive.")
 
@@ -43,12 +41,9 @@ class ConditionsConfig:
 
     pde: ConditionSpec = ConditionSpec("pde", active=True, weight=1.0)
     boundary: ConditionSpec = ConditionSpec("boundary", active=False, weight=0.0)
-    sensor_data: ConditionSpec = ConditionSpec("sensor_data", active=False, weight=0.0)
-    flow_field_data: ConditionSpec = ConditionSpec(
-        "flow_field_data",
-        active=True,
-        weight=1.0,
-    )
+    inlet: ConditionSpec = ConditionSpec("inlet", active=True, weight=1.0)
+    simulation: ConditionSpec = ConditionSpec("simulation", active=True, weight=1.0)
+    sensor: ConditionSpec = ConditionSpec("sensor", active=True, weight=1.0)
 
     @property
     def active(self) -> tuple[ConditionSpec, ...]:
@@ -59,12 +54,7 @@ class ConditionsConfig:
     def as_tuple(self) -> tuple[ConditionSpec, ...]:
         """Return all condition specs in canonical training order."""
 
-        return (
-            self.pde,
-            self.boundary,
-            self.sensor_data,
-            self.flow_field_data,
-        )
+        return (self.pde, self.boundary, self.inlet, self.simulation, self.sensor)
 
     def weights(self) -> dict[ConditionName, float]:
         """Return condition weights keyed by condition name."""

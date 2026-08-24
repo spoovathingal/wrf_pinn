@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import numpy as np
 
-from wrf_pinn.data.flow_field import FlowFieldData
+from wrf_pinn.data.case import Case
 
 
-def predict_flow_field(model, flow_data: FlowFieldData, *, device: str = "cpu"):
+def predict_flow_field(model, case: Case, *, device: str = "cpu"):
     """Return coordinates, predictions, and targets as NumPy arrays.
 
     PyTorch is imported lazily so callers that only serialize existing arrays do
@@ -28,7 +28,7 @@ def predict_flow_field(model, flow_data: FlowFieldData, *, device: str = "cpu"):
     was_training = model.training
     model.eval()
     try:
-        coordinates, targets = flow_data.as_torch(device=torch_device)
+        coordinates, targets = case.as_torch(device=torch_device)
         with torch.no_grad():
             predictions = model(coordinates)
     finally:
