@@ -136,8 +136,13 @@ def test_multi_source_weighted_terms(multi_source_case, report):
 
 # --- pde-only uniformity -----------------------------------------------------
 @pytest.mark.parametrize("collocation_points", [64, 200, 512])
-def test_pde_only_stays_uniform(uniform_case, report, collocation_points):
-    """pde-only converges to a spatially uniform field (no data anchor)."""
+def test_pde_only_runs_and_reduces_loss(uniform_case, report, collocation_points):
+    """pde-only path runs end to end and drives the residual loss down.
+
+    (The old 'uniform flow -> uniform field' check no longer holds: the NBL
+    governing equations are stratified/hydrostatic, so a uniform field is not a
+    zero-residual solution. A proper NBL known-result check is future work.)
+    """
 
     torch.manual_seed(0)
     sampling = SamplingConfig(
@@ -151,9 +156,3 @@ def test_pde_only_stays_uniform(uniform_case, report, collocation_points):
         sampling=sampling, scaling=DEFAULT_RESIDUAL_SCALING,
         training=_training(epochs=600, log_every=200)))
     _assert_loss_decreased(history, report, f"pde-only [{collocation_points} pts]")
-
-    _, predictions, _ = predict_flow_field(model, uniform_case)
-    spatial_std = predictions.std(axis=0)
-    assert (spatial_std < UNIFORMITY_STD_TOL).all()
-    report(f"pde-only [{collocation_points} pts]: uniform",
-           per_variable_std=spatial_std)

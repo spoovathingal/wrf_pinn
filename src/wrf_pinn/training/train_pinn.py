@@ -31,7 +31,10 @@ from wrf_pinn.physics.residuals_boundary import no_slip_wall_residuals
 from wrf_pinn.physics.residuals_pde import cartesian_zero_forcing_residuals
 from wrf_pinn.sampling import sample_collocation_points
 from wrf_pinn.sampling import sample_wall_boundary_points
-from wrf_pinn.training.losses import LossBreakdown, assemble_pinn_loss
+from wrf_pinn.training.losses import (
+    DEFAULT_PDE_RESIDUAL_SCALES, LossBreakdown, PDEResidualScales,
+    assemble_pinn_loss,
+)
 
 
 #: Component loss names recorded in ``TrainingHistory`` (excludes ``total``).
@@ -88,6 +91,7 @@ class TrainingSetup:
     sampling: SamplingConfig = DEFAULT_SAMPLING
     physics: PhysicsConfig = DEFAULT_PHYSICS
     scaling: ResidualScalingConfig = DEFAULT_RESIDUAL_SCALING
+    pde_residual_scales: PDEResidualScales = DEFAULT_PDE_RESIDUAL_SCALES
     training: TrainingConfig = DEFAULT_TRAINING
 
 
@@ -181,9 +185,16 @@ def _training_step(
 
     optimizer.zero_grad()
     objectives = _evaluate_active_objectives(model, setup, prepared)
-    loss = assemble_pinn_loss(conditions=setup.conditions, **objectives)
+    loss = assemble_pinn_loss(
+        conditions=setup.conditions,
+        pde_residual_scales=setup.pde_residual_scales,
+        **objectives,
+    )
+    if not bool(torch.isfinite(loss.total)):
+        raise FloatingPointError("Non-finite total loss during training.")
 
     loss.total.backward()
+    _raise_on_nonfinite_gradients(model)
     if setup.training.gradient_clip_norm is not None:
         torch.nn.utils.clip_grad_norm_(
             model.parameters(),
@@ -191,6 +202,17 @@ def _training_step(
         )
     optimizer.step()
     return loss
+
+
+def _raise_on_nonfinite_gradients(model: nn.Module) -> None:
+    """Fail fast if any parameter gradient is non-finite (catches blowups early)."""
+
+    bad = [
+        name for name, p in model.named_parameters()
+        if p.grad is not None and not bool(torch.isfinite(p.grad).all())
+    ]
+    if bad:
+        raise FloatingPointError(f"Non-finite gradients in: {bad}.")
 
 
 def _evaluate_active_objectives(
@@ -401,4 +423,9 @@ def _print_progress(epoch: int, epochs: int, loss: LossBreakdown) -> None:
         f"{name}={float(loss.terms[name].detach().cpu()):.6e}"
         for name in COMPONENT_LOSS_NAMES
     ]
+    # Per-residual raw vs scaled MSE (the PDE residual scaling diagnostics).
+    for name, raw_mse in loss.pde_raw_mse.items():
+        scaled_mse = loss.pde_scaled_mse[name]
+        parts.append(f"{name}_raw_mse={float(raw_mse.detach().cpu()):.6e}")
+        parts.append(f"{name}_scaled_mse={float(scaled_mse.detach().cpu()):.6e}")
     print(" | ".join(parts))

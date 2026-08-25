@@ -1,16 +1,16 @@
 """Residual equations for the simplified Cartesian WRF PINN model.
 
-This module implements the reduced system described in
+This module implements the dry neutral boundary layer system described in
 ``wrf_pinn.config.physics``:
 
 - local Cartesian coordinates
-- zero forcing
-- no temperature or moisture equations
-- active state variables are u, v, w, and rho
+- zero external forcing
+- no moisture equations
+- active state variables are u, v, w, theta, p_prime, k_m
 
 The residuals are evaluated at continuous PINN collocation points. Inputs are
 expected in coordinate order (x, y, z, t), and state outputs are expected in
-physics-variable order (u, v, w, rho). Coordinates and state outputs may be
+physics-variable order (u, v, w, theta, p_prime, k_m_unconstrained). Coordinates and state outputs may be
 normalized; residual scaling maps them back to physical units before the PDE
 terms are assembled.
 """
@@ -75,12 +75,48 @@ def _physical_gradient(
     ).reshape(1, -1)
     return gradient / coordinate_scales
 
+def _hydrostatic_reference_state(
+    z: torch.Tensor,
+    physics: PhysicsConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return hydrostatic pressure and density at physical height z (m)."""
+
+    gravity = physics.constants.gravity
+    cp = physics.constants.dry_air_specific_heat_cp
+    rd = physics.constants.dry_air_gas_constant
+    p0 = physics.constants.reference_pressure
+
+    theta_h = torch.where(z <= 500.0, torch.full_like(z, 300.0),
+        torch.where(z <= 650.0, 300.0 + 0.08 * (z - 500.0),
+            312.0 + 0.003 * (z - 650.0)))
+
+    # \int^z_0 1/300 dz = z/300
+    integral_lower = z / 300.0
+    # \int^500_0 1/300 dz + \int^z_500 1/(300+0.08(z-500)) dz 
+    integral_middle = (500.0 / 300.0 + 
+                       1 / 0.08 * torch.log((300.0 + 0.08 * (z - 500.0)) / 300.0))
+    # \int^500_0 1/300 dz + \int^650_500 1/(300+0.08(z-500)) dz + \int^z_650 1/(312+0.003(z-650)) dz
+    integral_upper = (500.0 / 300.0 + 
+                      1 / 0.08 * torch.log(torch.tensor(312.0 / 300.0, 
+                        dtype=z.dtype, device=z.device)) # compatible and no CPU-GPU mismatch
+        + 1 / 0.003 * torch.log((312.0 + 0.003 * (z - 650.0)) / 312.0))
+
+    integral = torch.where(z <= 500.0, integral_lower,
+        torch.where(z <= 650.0, integral_middle, integral_upper))
+    #\Pi_H(0) = 1
+    pi_h = 1.0 - gravity * integral / cp
+
+    p_h = p0 * pi_h.pow(cp / rd)
+    t_h = theta_h * (p_h / p0).pow(rd / cp)
+    rho_h = p_h / (rd * t_h)
+
+    return p_h, rho_h
 
 def _split_state(
     state: torch.Tensor,
     physics: PhysicsConfig,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return u, v, w, and rho columns from the model state output."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return u, v, w, theta, p_prime, and unconstrained k_m columns from the model state output."""
 
     if state.ndim != 2:
         raise ValueError("state must have shape (n_points, n_variables).")
@@ -95,28 +131,41 @@ def _split_state(
     u = state[:, physics.variable_index("u") : physics.variable_index("u") + 1]
     v = state[:, physics.variable_index("v") : physics.variable_index("v") + 1]
     w = state[:, physics.variable_index("w") : physics.variable_index("w") + 1]
-    rho = state[
-        :,
-        physics.variable_index("rho") : physics.variable_index("rho") + 1,
-    ]
-    return u, v, w, rho
+    theta = state[:, physics.variable_index("theta") : physics.variable_index("theta") + 1]
+    p_prime = state[:, physics.variable_index("p_prime") : physics.variable_index("p_prime") + 1]
+    k_m_unconstrained = state[:, physics.variable_index("k_m") : physics.variable_index("k_m") + 1]
+    return u, v, w, theta, p_prime, k_m_unconstrained
 
 
 def _to_physical_state(
     u: torch.Tensor,
     v: torch.Tensor,
     w: torch.Tensor,
-    rho: torch.Tensor,
+    theta: torch.Tensor,
+    p_prime: torch.Tensor,
     scaling: ResidualScalingConfig,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Map normalized state variables to physical state variables."""
 
     u_physical = scaling.u.offset + scaling.u.scale * u
     v_physical = scaling.v.offset + scaling.v.scale * v
     w_physical = scaling.w.offset + scaling.w.scale * w
-    rho_physical = scaling.rho.offset + scaling.rho.scale * rho
-    return u_physical, v_physical, w_physical, rho_physical
+    theta_physical = scaling.theta.offset + scaling.theta.scale * theta
+    p_prime_physical = scaling.p_prime.offset + scaling.p_prime.scale * p_prime
+    return u_physical, v_physical, w_physical, theta_physical, p_prime_physical
 
+def _to_physical_eddy_viscosity(
+    k_m_unconstrained: torch.Tensor,
+    physics: PhysicsConfig,
+) -> torch.Tensor:
+    """Map the unconstrained network output to bounded physical K_m. 0< K_m <100"""
+
+    k_m_min = physics.constants.eddy_viscosity_min
+    k_m_max = physics.constants.eddy_viscosity_max
+
+    return k_m_min + (k_m_max - k_m_min) * torch.sigmoid(
+        k_m_unconstrained
+    )
 
 def _validate_physics_config(physics: PhysicsConfig) -> None:
     """Ensure this implementation is used only for the supported reduced system."""
@@ -124,28 +173,36 @@ def _validate_physics_config(physics: PhysicsConfig) -> None:
     if physics.coordinate_system != "local_cartesian":
         raise ValueError("Only local_cartesian coordinates are supported.")
 
-    if physics.active_variables != ("u", "v", "w", "rho"):
-        raise ValueError("Residuals currently require active variables (u, v, w, rho).")
+    if physics.active_variables != ("u", "v", "w", "theta", "p_prime", "k_m"):
+        raise ValueError("Residuals currently require active variables u, v, w, theta, p_prime", "k_m")
+
+    expected_residuals = ("mass", "x_momentum", "y_momentum", "z_momentum", "potential_temperature")
+    if physics.residuals != expected_residuals:
+        raise ValueError(f"Residuals require equations {expected_residuals}.")
 
     if not physics.forcing_is_zero:
         raise ValueError("Residuals currently assume zero forcing.")
 
-    unsupported_terms: Mapping[str, bool] = {
-        "include_coriolis": physics.include_coriolis,
+#These variables validate that PhysicsConfig describes the same equations that this code actually calculates.
+#  They do not calculate any physics; they are safety checks executed before residual assembly.
+    required_terms: Mapping[str, bool] = {
         "include_gravity": physics.include_gravity,
         "include_pressure_gradient": physics.include_pressure_gradient,
         "include_temperature": physics.include_temperature,
-        "include_moisture": physics.include_moisture,
         "include_turbulence": physics.include_turbulence,
+    } # all must be true
+    disabled_terms = [name for name, enabled in required_terms.items() if not enabled]
+    if disabled_terms:
+        raise ValueError(f"Required physics terms are disabled: {disabled_terms}.")
+
+    unsupported_terms: Mapping[str, bool] = {
+        "include_coriolis": physics.include_coriolis,
+        "include_moisture": physics.include_moisture,
         "include_microphysics": physics.include_microphysics,
-    }
+    } # even if turned on, not supported.
     enabled_terms = [name for name, enabled in unsupported_terms.items() if enabled]
     if enabled_terms:
-        raise ValueError(
-            "Residuals currently require disabled physics terms; "
-            f"enabled terms: {enabled_terms}."
-        )
-
+        raise ValueError(f"Unsupported physics terms are enabled: enabled terms: {enabled_terms}.")
 
 def cartesian_zero_forcing_residuals(
     coordinates: torch.Tensor,
@@ -161,8 +218,8 @@ def cartesian_zero_forcing_residuals(
         Collocation coordinates with shape ``(n_points, 4)`` and column order
         ``(x, y, z, t)``. The tensor must have ``requires_grad=True``.
     state:
-        Model outputs with shape ``(n_points, 4)`` and column order
-        ``(u, v, w, rho)``.
+        Model outputs with shape ``(n_points, 6)`` and column order
+        ``(u, v, w, theta, p', k_m_unconstrained)``.
     physics:
         Physics configuration. Only the default reduced configuration is
         supported by this implementation.
@@ -175,7 +232,7 @@ def cartesian_zero_forcing_residuals(
     -------
     dict[str, torch.Tensor]
         Residual tensors keyed by ``mass``, ``x_momentum``, ``y_momentum``,
-        and ``z_momentum``. Each tensor has shape ``(n_points, 1)``.
+        ``z_momentum``, and ''potential_temperature''. Each tensor has shape ``(n_points, 1)``.
     """
 
     _validate_physics_config(physics)
@@ -186,17 +243,22 @@ def cartesian_zero_forcing_residuals(
     if not coordinates.requires_grad:
         raise ValueError("coordinates must have requires_grad=True.")
 
-    u_normalized, v_normalized, w_normalized, rho_normalized = _split_state(
-        state,
-        physics,
-    )
-    u, v, w, rho = _to_physical_state(
-        u_normalized,
-        v_normalized,
-        w_normalized,
-        rho_normalized,
-        scaling,
-    )
+    (u_normalized, v_normalized, w_normalized, theta_normalized, p_prime_normalized,
+      k_m_unconstrained) = _split_state(state, physics)
+
+    u, v, w, theta, p_prime = _to_physical_state(
+        u_normalized, v_normalized, w_normalized,
+        theta_normalized, p_prime_normalized, scaling)
+    k_m = _to_physical_eddy_viscosity(k_m_unconstrained, physics)
+
+    z = scaling.z.offset + scaling.z.scale * coordinates[:, 2:3]
+    p_h, rho_h = _hydrostatic_reference_state(z, physics)
+
+    p = p_h + p_prime
+    temperature = theta * (p / physics.constants.reference_pressure).pow(
+        physics.constants.kappa)
+    rho = p / (physics.constants.dry_air_gas_constant * temperature)
+    rho_prime = rho - rho_h
 
     grad_u = _physical_gradient(u, coordinates, scaling)
     grad_v = _physical_gradient(v, coordinates, scaling)
@@ -210,17 +272,82 @@ def cartesian_zero_forcing_residuals(
     v_x, v_y, v_z, v_t = grad_v.split(1, dim=1)
     w_x, w_y, w_z, w_t = grad_w.split(1, dim=1)
     _, _, _, rho_t = grad_rho.split(1, dim=1)
-    rho_u_x, _, _, _ = grad_rho_u.split(1, dim=1)
-    _, rho_v_y, _, _ = grad_rho_v.split(1, dim=1)
-    _, _, rho_w_z, _ = grad_rho_w.split(1, dim=1)
+    rho_u_x, _, _, rho_u_t = grad_rho_u.split(1, dim=1)
+    _, rho_v_y, _, rho_v_t = grad_rho_v.split(1, dim=1)
+    _, _, rho_w_z, rho_w_t = grad_rho_w.split(1, dim=1)
 
-    advect_u = u * u_x + v * u_y + w * u_z
-    advect_v = u * v_x + v * v_y + w * v_z
-    advect_w = u * w_x + v * w_y + w * w_z
+    rho_uu_x = _physical_gradient(rho * u * u, coordinates, scaling)[:, 0:1]
+    grad_rho_uv = _physical_gradient(rho * u * v, coordinates, scaling)
+    grad_rho_uw = _physical_gradient(rho * u * w, coordinates, scaling)
+    rho_vv_y = _physical_gradient(rho * v * v, coordinates, scaling)[:, 1:2]
+    grad_rho_vw = _physical_gradient(rho * v * w, coordinates, scaling)
+    rho_ww_z = _physical_gradient(rho * w * w, coordinates, scaling)[:, 2:3]
+
+    rho_uv_x = grad_rho_uv[:, 0:1]
+    rho_uv_y = grad_rho_uv[:, 1:2]
+    rho_uw_x = grad_rho_uw[:, 0:1]
+    rho_uw_z = grad_rho_uw[:, 2:3]
+    rho_vw_y = grad_rho_vw[:, 1:2]
+    rho_vw_z = grad_rho_vw[:, 2:3]
+
+    grad_p_prime = _physical_gradient(p_prime, coordinates, scaling)
+    p_prime_x, p_prime_y, p_prime_z, _ = grad_p_prime.split(1, dim=1)
+
+    rho_theta_t = _physical_gradient(rho * theta, coordinates, scaling)[:, 3:4]
+    rho_u_theta_x = _physical_gradient(rho * u * theta, coordinates, scaling)[:, 0:1]
+    rho_v_theta_y = _physical_gradient(rho * v * theta, coordinates, scaling)[:, 1:2]
+    rho_w_theta_z = _physical_gradient(rho * w * theta, coordinates, scaling)[:, 2:3]
+
+    divergence = u_x + v_y + w_z
+
+    tau_xx = rho * k_m * (2.0 * u_x - (2.0 / 3.0) * divergence)
+    tau_yy = rho * k_m * (2.0 * v_y - (2.0 / 3.0) * divergence)
+    tau_zz = rho * k_m * (2.0 * w_z - (2.0 / 3.0) * divergence)
+    tau_xy = rho * k_m * (u_y + v_x)
+    tau_xz = rho * k_m * (u_z + w_x)
+    tau_yz = rho * k_m * (v_z + w_y)
+
+    tau_xx_x = _physical_gradient(tau_xx, coordinates, scaling)[:, 0:1]
+    tau_yy_y = _physical_gradient(tau_yy, coordinates, scaling)[:, 1:2]
+    tau_zz_z = _physical_gradient(tau_zz, coordinates, scaling)[:, 2:3]
+
+    grad_tau_xy = _physical_gradient(tau_xy, coordinates, scaling)
+    grad_tau_xz = _physical_gradient(tau_xz, coordinates, scaling)
+    grad_tau_yz = _physical_gradient(tau_yz, coordinates, scaling)
+
+    tau_xy_x = grad_tau_xy[:, 0:1]
+    tau_xy_y = grad_tau_xy[:, 1:2]
+    tau_xz_x = grad_tau_xz[:, 0:1]
+    tau_xz_z = grad_tau_xz[:, 2:3]
+    tau_yz_y = grad_tau_yz[:, 1:2]
+    tau_yz_z = grad_tau_yz[:, 2:3]
+
+    mass = rho_t + rho_u_x + rho_v_y + rho_w_z
+
+    x_momentum = (
+        rho_u_t + rho_uu_x + rho_uv_y + rho_uw_z + p_prime_x
+        - tau_xx_x - tau_xy_y - tau_xz_z
+    )
+
+    y_momentum = (
+        rho_v_t + rho_uv_x + rho_vv_y + rho_vw_z + p_prime_y
+        - tau_xy_x - tau_yy_y - tau_yz_z
+    )
+
+    z_momentum = (
+        rho_w_t + rho_uw_x + rho_vw_y + rho_ww_z + p_prime_z
+        + physics.constants.gravity * rho_prime
+        - tau_xz_x - tau_yz_y - tau_zz_z
+    )
+
+    potential_temperature = (
+        rho_theta_t + rho_u_theta_x + rho_v_theta_y + rho_w_theta_z
+    )
 
     return {
-        "mass": rho_t + rho_u_x + rho_v_y + rho_w_z,
-        "x_momentum": u_t + advect_u,
-        "y_momentum": v_t + advect_v,
-        "z_momentum": w_t + advect_w,
+        "mass": mass,
+        "x_momentum": x_momentum,
+        "y_momentum": y_momentum,
+        "z_momentum": z_momentum,
+        "potential_temperature": potential_temperature,
     }

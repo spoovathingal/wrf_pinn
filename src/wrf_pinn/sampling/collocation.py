@@ -56,7 +56,8 @@ def sample_collocation_points(
         dtype=dtype,
         device=device,
     )
-
+    # Bias collocation points toward lower z by inverse transforming
+    unit_points[:, 2] = unit_points[:, 2].square()
     return _scale_unit_points_to_domain(unit_points, domain)
 
 

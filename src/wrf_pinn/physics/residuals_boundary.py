@@ -102,9 +102,9 @@ def no_slip_wall_residuals(
     u, v, w = _physical_velocity_components(state, velocity_indices, scaling)
 
     return {
-        "no_slip_u": u,
-        "no_slip_v": v,
-        "no_slip_w": w,
+        "no_slip_u": u/scaling.u.scale,
+        "no_slip_v": v/scaling.v.scale,
+        "no_slip_w": w/scaling.w.scale,
     }
 
 
@@ -132,5 +132,5 @@ def no_penetration_z_wall_residuals(
     w = scaling.w.offset + scaling.w.scale * state[:, w_index]
 
     return {
-        "no_penetration_w": w,
+        "no_penetration_w": w/scaling.w.scale,
     }
