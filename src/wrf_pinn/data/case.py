@@ -1,10 +1,8 @@
-"""Reader for pre-processor ``.npy`` cases.
+"""Reader for pre-processor ``.npy`` cases (schema ``x,y,z,t,u,v,w,theta,p_prime,source``).
 
-A case is one ``.npy`` of rows in the pre-processor's schema (default
-``x,y,z,t,u,v,w,source``) plus a shared ``metadata.json`` describing the columns,
-the source-code map, and the normalization recipe. This reader replaces the old
-per-file CSV readers: one ``Case`` carries the coordinates, targets, and a
-per-row source tag so the loss can weight sources.
+Coordinates are required (never NaN); optional targets may be NaN, in which case
+the row is kept, the NaN zero-filled, and a per-entry ``target_mask`` records
+which targets are real so the masked loss supervises only those.
 """
 
 from __future__ import annotations
@@ -27,10 +25,11 @@ SRC_SENSOR = 2      # ground observations
 
 @dataclass(frozen=True)
 class Case:
-    """One normalized case: coordinates, targets, and a per-row source tag."""
+    """One normalized case: coordinates, targets, per-entry target mask, source tag."""
 
     coordinates: np.ndarray
     targets: np.ndarray
+    target_mask: np.ndarray
     source: np.ndarray
     coordinate_names: tuple[str, ...]
     target_names: tuple[str, ...]
@@ -48,14 +47,15 @@ class Case:
         return self.targets.shape[1]
 
     def as_torch(self, *, dtype: object | None = None, device: object | None = None):
-        """Return coordinates and targets as torch tensors (torch imported lazily)."""
+        """Return coordinates, targets, and target mask as torch tensors."""
 
         import torch
 
         tensor_dtype = dtype if dtype is not None else torch.float32
         coordinates = torch.as_tensor(self.coordinates, dtype=tensor_dtype, device=device)
         targets = torch.as_tensor(self.targets, dtype=tensor_dtype, device=device)
-        return coordinates, targets
+        target_mask = torch.as_tensor(self.target_mask, dtype=tensor_dtype, device=device)
+        return coordinates, targets, target_mask
 
 
 @dataclass(frozen=True)
@@ -106,12 +106,17 @@ def read_case(
     coord_array = np.ascontiguousarray(data[:, coord_cols], dtype=np.float32)
     target_array = np.ascontiguousarray(data[:, target_cols], dtype=np.float32)
     source_array = data[:, index["source"]].astype(np.int64)
-    _check_finite(path, coordinates, coord_array)
-    _check_finite(path, targets, target_array)
+
+    _check_finite(path, coordinates, coord_array)   # coordinates are required
+
+    # optional targets may be NaN: mask measured entries, zero-fill the rest
+    target_mask = np.isfinite(target_array).astype(np.float32)
+    target_array = np.where(target_mask > 0.0, target_array, 0.0).astype(np.float32)
 
     return Case(
         coordinates=coord_array,
-        targets=target_array,
+        targets=np.ascontiguousarray(target_array),
+        target_mask=np.ascontiguousarray(target_mask),
         source=source_array,
         coordinate_names=coordinates,
         target_names=targets,

@@ -153,25 +153,25 @@ _DATA_SOURCE = {"inlet": SRC_INLET, "simulation": SRC_SIM, "sensor": SRC_SENSOR}
 
 @dataclass
 class _PreparedData:
-    """The resolved device plus per-source (coordinates, targets) tensors.
-
-    Materialized once before the epoch loop by splitting the case's rows by
-    their source tag, so each data objective sees only its source's rows.
-    """
+    """Per-source (coordinates, targets, target_mask) tensors, split once by source tag."""
 
     device: torch.device
-    by_source: dict[int, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
+    by_source: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = field(
+        default_factory=dict
+    )
 
     @classmethod
     def from_setup(cls, setup: TrainingSetup, *, device: torch.device) -> "_PreparedData":
         prepared = cls(device=device)
         if setup.case is None:
             return prepared
-        coordinates, targets = setup.case.as_torch(device=device)
+        coordinates, targets, target_mask = setup.case.as_torch(device=device)
         source = torch.as_tensor(setup.case.source, device=device)
         for code in torch.unique(source).tolist():
-            mask = source == code
-            prepared.by_source[int(code)] = (coordinates[mask], targets[mask])
+            rows = source == code
+            prepared.by_source[int(code)] = (
+                coordinates[rows], targets[rows], target_mask[rows]
+            )
         return prepared
 
 
@@ -256,10 +256,13 @@ def _evaluate_active_objectives(
     for name, code in _DATA_SOURCE.items():
         spec = getattr(conditions, name)
         errors = None
+        masks = None
         if spec.active:
-            coordinates, targets = _require_source_rows(prepared, code, name)
-            errors = {name: _data_errors(model, coordinates, targets)}
+            coordinates, targets, target_mask = _require_source_rows(prepared, code, name)
+            errors = {name: _data_errors(model, coordinates, targets, target_mask)}
+            masks = {name: target_mask}
         objectives[f"{name}_errors"] = errors
+        objectives[f"{name}_masks"] = masks
     return objectives
 
 
@@ -283,12 +286,16 @@ def _boundary_residuals(
 
 
 def _data_errors(
-    model: nn.Module, coordinates: torch.Tensor, targets: torch.Tensor
+    model: nn.Module,
+    coordinates: torch.Tensor,
+    targets: torch.Tensor,
+    target_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Prediction-minus-target error for a data objective."""
+    """Masked prediction-minus-target error (unmeasured entries zeroed)."""
 
     predictions = model(coordinates)
-    return predictions[:, : targets.shape[1]] - targets
+    error = predictions[:, : targets.shape[1]] - targets
+    return error * target_mask
 
 
 def _notify_monitor(
@@ -377,8 +384,8 @@ def _sample_pde_coordinates(
 
 def _require_source_rows(
     prepared: "_PreparedData", code: int, name: str
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return the (coordinates, targets) for a source, or raise if the case has none."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return (coordinates, targets, target_mask) for a source, or raise if none."""
 
     rows = prepared.by_source.get(code)
     if rows is None:

@@ -28,7 +28,7 @@ def predict_flow_field(model, case: Case, *, device: str = "cpu"):
     was_training = model.training
     model.eval()
     try:
-        coordinates, targets = case.as_torch(device=torch_device)
+        coordinates, targets, _ = case.as_torch(device=torch_device)
         with torch.no_grad():
             predictions = model(coordinates)
     finally:

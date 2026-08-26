@@ -1,8 +1,8 @@
 """Shared fixtures and a friendly test-summary hook for the WRF-PINN tests.
 
-Data enters as ``.npy`` cases (the pre-processor's output): rows in the schema
-``x,y,z,t,u,v,w,source`` plus a shared ``metadata.json``. Fixtures write these
-under pytest's ``tmp_path``, which is removed automatically after each test.
+Data enters as ``.npy`` cases (the pre-processor's output) plus a shared
+``metadata.json``. Fixtures write these under pytest's ``tmp_path``, which is
+removed automatically after each test.
 """
 
 from __future__ import annotations
@@ -110,6 +110,36 @@ def multi_source_case(tmp_path: Path):
         "normalization": {},
     }))
     return read_case(out / "case.npy", CaseMetadata.load(out / "metadata.json"))
+
+
+#: Widened schema with theta/p' (for the masked-target tests).
+CASE_COLUMNS_THETA = ("x", "y", "z", "t", "u", "v", "w", "theta", "p_prime", "source")
+
+
+@pytest.fixture
+def nan_target_case(tmp_path: Path):
+    """A widened case where sensor rows carry NaN theta/p' (measured only on sim)."""
+
+    grid = _uniform_grid(n_per_axis=4)
+    coords = np.asarray(grid, dtype=np.float64)
+    n = coords.shape[0]
+    rows = np.empty((n, len(CASE_COLUMNS_THETA)), dtype=np.float64)
+    rows[:, 0:4] = coords
+    rows[:, 4:7] = np.asarray(UNIFORM_STATE, dtype=np.float64)
+    rows[:, 7:9] = (1.5, 20.0)                       # theta, p'
+    rows[:, 9] = np.where(np.arange(n) % 2 == 0, SRC_SIM, SRC_SENSOR)
+    rows[rows[:, 9] == SRC_SENSOR, 7:9] = np.nan     # sensors lack theta/p'
+
+    out = tmp_path / "nan_target"
+    out.mkdir()
+    np.save(out / "case.npy", rows)
+    (out / "metadata.json").write_text(json.dumps({
+        "schema": {"columns": list(CASE_COLUMNS_THETA),
+                   "source_codes": {SRC_INLET: "inlet", SRC_SIM: "simulation",
+                                    SRC_SENSOR: "sensor"}},
+        "normalization": {},
+    }))
+    return out / "case.npy", CaseMetadata.load(out / "metadata.json")
 
 
 @pytest.fixture

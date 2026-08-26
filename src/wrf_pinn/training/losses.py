@@ -73,14 +73,21 @@ def _zero_like_available(*groups: TensorMap | None) -> torch.Tensor:
     return torch.tensor(0.0)
 
 
-def _reduce_tensor(value: torch.Tensor, spec: ConditionSpec) -> torch.Tensor:
-    """Reduce one tensor according to a condition spec."""
+def _reduce_tensor(
+    value: torch.Tensor, spec: ConditionSpec, mask: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Reduce one tensor per spec; a mask makes ``mean`` divide by measured count."""
 
     squared = value.square()
-    if spec.reduction == "mean":
-        return squared.mean()
     if spec.reduction == "sum":
         return squared.sum()
+    if spec.reduction == "mean":
+        if mask is None:
+            return squared.mean()
+        measured = mask.sum()
+        if bool(measured == 0):
+            return squared.sum()
+        return squared.sum() / measured
 
     raise ValueError(f"Unsupported reduction: {spec.reduction}.")
 
@@ -89,8 +96,9 @@ def _group_loss(
     errors: TensorMap | None,
     spec: ConditionSpec,
     zero: torch.Tensor,
+    masks: TensorMap | None = None,
 ) -> torch.Tensor:
-    """Compute one condition loss from a dictionary of error tensors."""
+    """Compute one condition loss from a dict of error tensors (masks for data terms)."""
 
     if not spec.active:
         return zero
@@ -98,7 +106,10 @@ def _group_loss(
     if errors is None or not errors:
         raise ValueError(f"{spec.name} condition is active but no errors were given.")
 
-    reduced = [_reduce_tensor(error, spec) for error in errors.values()]
+    reduced = [
+        _reduce_tensor(error, spec, None if masks is None else masks.get(key))
+        for key, error in errors.items()
+    ]
     return torch.stack(reduced).mean()
 
 
@@ -109,15 +120,17 @@ def assemble_pinn_loss(
     inlet_errors: TensorMap | None = None,
     simulation_errors: TensorMap | None = None,
     sensor_errors: TensorMap | None = None,
+    inlet_masks: TensorMap | None = None,
+    simulation_masks: TensorMap | None = None,
+    sensor_masks: TensorMap | None = None,
     conditions: ConditionsConfig = DEFAULT_CONDITIONS,
     pde_residual_scales: PDEResidualScales = DEFAULT_PDE_RESIDUAL_SCALES,
 ) -> LossBreakdown:
     """Assemble the weighted PINN training loss.
 
-    ``inlet_errors`` / ``simulation_errors`` / ``sensor_errors`` are the
-    prediction-minus-target tensors for each data source (per the case's source
-    tag). ``pde_residuals`` and ``boundary_residuals`` are physics/BC terms. Each
-    term is weighted by its condition.
+    ``*_errors`` are per-source prediction-minus-target tensors (already zeroed at
+    unmeasured entries); the matching ``*_masks`` make the mean divide by the
+    measured count. ``pde_residuals`` / ``boundary_residuals`` are physics/BC terms.
     """
     scaled_pde_residuals: TensorMap | None = None
     pde_raw_mse: TensorMap = {}
@@ -140,17 +153,20 @@ def assemble_pinn_loss(
     )
 
     # PDE uses the per-residual-scaled residuals (his physics); the three data
-    # terms are split by source tag (the .npy refactor).
+    # terms are split by source tag (the .npy refactor). Data terms carry a
+    # per-entry measured mask; physics terms do not (mask is None).
     by_name = (
-        ("pde", scaled_pde_residuals, conditions.pde),
-        ("boundary", boundary_residuals, conditions.boundary),
-        ("inlet", inlet_errors, conditions.inlet),
-        ("simulation", simulation_errors, conditions.simulation),
-        ("sensor", sensor_errors, conditions.sensor),
+        ("pde", scaled_pde_residuals, conditions.pde, None),
+        ("boundary", boundary_residuals, conditions.boundary, None),
+        ("inlet", inlet_errors, conditions.inlet, inlet_masks),
+        ("simulation", simulation_errors, conditions.simulation, simulation_masks),
+        ("sensor", sensor_errors, conditions.sensor, sensor_masks),
     )
 
-    terms: TensorMap = {name: _group_loss(errors, spec, zero) for name, errors, spec in by_name}
-    weighted_terms: TensorMap = {name: terms[name] * spec.weight for name, _, spec in by_name}
+    terms: TensorMap = {
+        name: _group_loss(errors, spec, zero, masks) for name, errors, spec, masks in by_name
+    }
+    weighted_terms: TensorMap = {name: terms[name] * spec.weight for name, _, spec, _ in by_name}
     total = torch.stack(tuple(weighted_terms.values())).sum()
 
     return LossBreakdown(
