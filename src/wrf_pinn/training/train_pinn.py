@@ -25,7 +25,7 @@ from wrf_pinn.config.physics import DEFAULT_PHYSICS, PhysicsConfig
 from wrf_pinn.config.sampling import DEFAULT_SAMPLING, SamplingConfig
 from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING, ResidualScalingConfig
 from wrf_pinn.config.training import DEFAULT_TRAINING, OptimizerConfig, TrainingConfig
-from wrf_pinn.data.case import Case, SRC_INLET, SRC_SIM, SRC_SENSOR
+from wrf_pinn.data.case import Case, SRC_SIM, SRC_SENSOR
 from wrf_pinn.physics.residuals_boundary import no_penetration_z_wall_residuals
 from wrf_pinn.physics.residuals_boundary import no_slip_wall_residuals
 from wrf_pinn.physics.residuals_pde import cartesian_zero_forcing_residuals
@@ -41,7 +41,6 @@ from wrf_pinn.training.losses import (
 COMPONENT_LOSS_NAMES: tuple[str, ...] = (
     "pde",
     "boundary",
-    "inlet",
     "simulation",
     "sensor",
 )
@@ -54,7 +53,6 @@ class TrainingHistory:
     total: list[float] = field(default_factory=list)
     pde: list[float] = field(default_factory=list)
     boundary: list[float] = field(default_factory=list)
-    inlet: list[float] = field(default_factory=list)
     simulation: list[float] = field(default_factory=list)
     sensor: list[float] = field(default_factory=list)
 
@@ -148,7 +146,7 @@ def train_pinn(
 
 
 #: Condition name -> the source tag whose rows feed that data objective.
-_DATA_SOURCE = {"inlet": SRC_INLET, "simulation": SRC_SIM, "sensor": SRC_SENSOR}
+_DATA_SOURCE = {"simulation": SRC_SIM, "sensor": SRC_SENSOR}
 
 
 @dataclass
@@ -251,8 +249,8 @@ def _evaluate_active_objectives(
         "pde_residuals": pde_residuals,
         "boundary_residuals": boundary_residuals,
     }
-    # One data term per source category (inlet / simulation / sensor), each fed
-    # by that source's rows via the case's source tag.
+    # One data term per source category (simulation / sensor), each fed by that
+    # source's rows via the case's source tag.
     for name, code in _DATA_SOURCE.items():
         spec = getattr(conditions, name)
         errors = None

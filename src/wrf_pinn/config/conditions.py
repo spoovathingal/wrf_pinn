@@ -1,9 +1,9 @@
 """Global loss-mode configuration for WRF PINN experiments.
 
-Controls which loss modes are active and how strongly each contributes. The
-three data modes (``inlet``, ``simulation``, ``sensor``) mirror the pre-processor
-source tags, so a case's rows are weighted per source. It does not read data,
-evaluate residuals, or assemble losses.
+Controls which loss modes are active and how strongly each contributes. The two
+data modes (``simulation``, ``sensor``) mirror the pre-processor source tags, so
+a case's rows are weighted per source. It does not read data, evaluate residuals,
+or assemble losses.
 """
 
 from __future__ import annotations
@@ -12,11 +12,11 @@ from dataclasses import dataclass
 from typing import Literal
 
 
-ConditionName = Literal["pde", "boundary", "inlet", "simulation", "sensor"]
+ConditionName = Literal["pde", "boundary", "simulation", "sensor"]
 ReductionName = Literal["mean", "sum"]
 
-#: Data condition names, in source-tag order (map to source codes 0, 1, 2).
-DATA_CONDITIONS: tuple[ConditionName, ...] = ("inlet", "simulation", "sensor")
+#: Data condition names, in source-tag order (map to source codes 0, 1).
+DATA_CONDITIONS: tuple[ConditionName, ...] = ("simulation", "sensor")
 
 
 @dataclass(frozen=True)
@@ -41,7 +41,6 @@ class ConditionsConfig:
 
     pde: ConditionSpec = ConditionSpec("pde", active=True, weight=1.0)
     boundary: ConditionSpec = ConditionSpec("boundary", active=False, weight=0.0)
-    inlet: ConditionSpec = ConditionSpec("inlet", active=True, weight=1.0)
     simulation: ConditionSpec = ConditionSpec("simulation", active=True, weight=1.0)
     sensor: ConditionSpec = ConditionSpec("sensor", active=True, weight=1.0)
 
@@ -54,7 +53,7 @@ class ConditionsConfig:
     def as_tuple(self) -> tuple[ConditionSpec, ...]:
         """Return all condition specs in canonical training order."""
 
-        return (self.pde, self.boundary, self.inlet, self.simulation, self.sensor)
+        return (self.pde, self.boundary, self.simulation, self.sensor)
 
     def weights(self) -> dict[ConditionName, float]:
         """Return condition weights keyed by condition name."""

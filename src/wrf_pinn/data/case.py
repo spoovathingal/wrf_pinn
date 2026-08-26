@@ -18,9 +18,9 @@ DEFAULT_COORDINATES: tuple[str, ...] = ("x", "y", "z", "t")
 DEFAULT_TARGETS: tuple[str, ...] = ("u", "v", "w")
 
 #: Source category codes in the ``source`` column (from the pre-processor).
-SRC_INLET = 0       # HRRR
-SRC_SIM = 1         # LES (LASSO)
-SRC_SENSOR = 2      # ground observations
+#: HRRR is the anchor condition, not a data source, so it has no code here.
+SRC_SIM = 0         # LES (LASSO)
+SRC_SENSOR = 1      # ground observations
 
 
 @dataclass(frozen=True)

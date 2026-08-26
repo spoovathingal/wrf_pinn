@@ -17,7 +17,7 @@ from wrf_pinn.config.domain import make_cartesian_wrf_domain
 from wrf_pinn.config.sampling import CollocationSamplingConfig, SamplingConfig
 from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING
 from wrf_pinn.config.training import OptimizerConfig, TrainingConfig
-from wrf_pinn.data.case import SRC_INLET, SRC_SIM, SRC_SENSOR
+from wrf_pinn.data.case import SRC_SIM, SRC_SENSOR
 from wrf_pinn.evaluation.predict import predict_flow_field
 from wrf_pinn.models.mlp import MLP
 from wrf_pinn.training.train_pinn import train_pinn, TrainingSetup
@@ -40,7 +40,7 @@ def _off(name):
 def _data_only(active_source: str) -> ConditionsConfig:
     """Conditions with pde/boundary off and only ``active_source`` on."""
 
-    data = {n: _off(n) for n in ("inlet", "simulation", "sensor")}
+    data = {n: _off(n) for n in ("simulation", "sensor")}
     data[active_source] = ConditionSpec(active_source, active=True, weight=1.0)
     return ConditionsConfig(pde=_off("pde"), boundary=_off("boundary"), **data)
 
@@ -49,7 +49,7 @@ def _pde_only() -> ConditionsConfig:
     return ConditionsConfig(
         pde=ConditionSpec("pde", active=True, weight=1.0),
         boundary=_off("boundary"),
-        inlet=_off("inlet"), simulation=_off("simulation"), sensor=_off("sensor"),
+        simulation=_off("simulation"), sensor=_off("sensor"),
     )
 
 
@@ -102,10 +102,9 @@ def test_data_only_reproduces_uniform_field(uniform_case_factory, report,
 
 
 def test_each_source_tag_trains(uniform_case_factory, report):
-    """The pipeline runs with each of the three source tags as the data term."""
+    """The pipeline runs with each data source tag as the data term."""
 
-    for source, name in ((SRC_INLET, "inlet"), (SRC_SIM, "simulation"),
-                         (SRC_SENSOR, "sensor")):
+    for source, name in ((SRC_SIM, "simulation"), (SRC_SENSOR, "sensor")):
         torch.manual_seed(0)
         case = uniform_case_factory(source=source)
         model = MLP()
@@ -115,12 +114,11 @@ def test_each_source_tag_trains(uniform_case_factory, report):
 
 
 def test_multi_source_weighted_terms(multi_source_case, report):
-    """A case with all three tags produces three distinct, active data terms."""
+    """A case with both data tags produces two distinct, active data terms."""
 
     torch.manual_seed(0)
     conditions = ConditionsConfig(
         pde=_off("pde"), boundary=_off("boundary"),
-        inlet=ConditionSpec("inlet", active=True, weight=1.0),
         simulation=ConditionSpec("simulation", active=True, weight=1.0),
         sensor=ConditionSpec("sensor", active=True, weight=1.0),
     )
@@ -128,10 +126,10 @@ def test_multi_source_weighted_terms(multi_source_case, report):
     history = train_pinn(model, TrainingSetup(
         case=multi_source_case, conditions=conditions, training=_training(epochs=50)))
     _assert_loss_decreased(history, report, "multi-source")
-    for name in ("inlet", "simulation", "sensor"):
+    for name in ("simulation", "sensor"):
         assert getattr(history, name)[-1] >= 0.0
-    report("multi-source: three data terms",
-           final=np.array([history.inlet[-1], history.simulation[-1], history.sensor[-1]]))
+    report("multi-source: two data terms",
+           final=np.array([history.simulation[-1], history.sensor[-1]]))
 
 
 # --- pde-only uniformity -----------------------------------------------------

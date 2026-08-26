@@ -58,11 +58,11 @@ def test_condition_spec_rejects_negative_weight():
 
 
 def test_default_conditions_on_off_contract():
-    """The default enables pde and the three data terms; disables boundary."""
+    """The default enables pde and the two data terms; disables boundary."""
 
     weights = DEFAULT_CONDITIONS.weights()
     assert DEFAULT_CONDITIONS.pde.active and weights["pde"] == 1.0
-    for name in ("inlet", "simulation", "sensor"):
+    for name in ("simulation", "sensor"):
         assert getattr(DEFAULT_CONDITIONS, name).active and weights[name] == 1.0
     assert not DEFAULT_CONDITIONS.boundary.active and weights["boundary"] == 0.0
 
@@ -71,14 +71,14 @@ def test_active_returns_only_active_in_order():
     """``active`` returns active specs in canonical order."""
 
     active_names = [spec.name for spec in DEFAULT_CONDITIONS.active]
-    assert active_names == ["pde", "inlet", "simulation", "sensor"]
+    assert active_names == ["pde", "simulation", "sensor"]
 
 
 def test_as_tuple_order_is_canonical():
     """``as_tuple`` returns all specs in canonical order."""
 
     names = [spec.name for spec in DEFAULT_CONDITIONS.as_tuple()]
-    assert names == ["pde", "boundary", "inlet", "simulation", "sensor"]
+    assert names == ["pde", "boundary", "simulation", "sensor"]
 
 
 def test_toggling_a_condition_updates_active_set():
@@ -105,7 +105,6 @@ def _data_only(weight: float) -> ConditionsConfig:
     off = lambda name: ConditionSpec(name, active=False, weight=0.0)
     return ConditionsConfig(
         pde=off("pde"),
-        inlet=off("inlet"),
         sensor=off("sensor"),
         simulation=ConditionSpec("simulation", active=True, weight=weight),
     )

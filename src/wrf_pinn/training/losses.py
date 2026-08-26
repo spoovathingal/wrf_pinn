@@ -117,10 +117,8 @@ def assemble_pinn_loss(
     *,
     pde_residuals: TensorMap | None = None,
     boundary_residuals: TensorMap | None = None,
-    inlet_errors: TensorMap | None = None,
     simulation_errors: TensorMap | None = None,
     sensor_errors: TensorMap | None = None,
-    inlet_masks: TensorMap | None = None,
     simulation_masks: TensorMap | None = None,
     sensor_masks: TensorMap | None = None,
     conditions: ConditionsConfig = DEFAULT_CONDITIONS,
@@ -149,16 +147,15 @@ def assemble_pinn_loss(
 
     zero = _zero_like_available(
         scaled_pde_residuals, boundary_residuals,
-        inlet_errors, simulation_errors, sensor_errors,
+        simulation_errors, sensor_errors,
     )
 
-    # PDE uses the per-residual-scaled residuals (his physics); the three data
+    # PDE uses the per-residual-scaled residuals (his physics); the two data
     # terms are split by source tag (the .npy refactor). Data terms carry a
     # per-entry measured mask; physics terms do not (mask is None).
     by_name = (
         ("pde", scaled_pde_residuals, conditions.pde, None),
         ("boundary", boundary_residuals, conditions.boundary, None),
-        ("inlet", inlet_errors, conditions.inlet, inlet_masks),
         ("simulation", simulation_errors, conditions.simulation, simulation_masks),
         ("sensor", sensor_errors, conditions.sensor, sensor_masks),
     )

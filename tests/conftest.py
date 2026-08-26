@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 
 from wrf_pinn.data.case import (
-    read_case, CaseMetadata, SRC_INLET, SRC_SIM, SRC_SENSOR,
+    read_case, CaseMetadata, SRC_SIM, SRC_SENSOR,
 )
 
 #: Case schema (must match the pre-processor).
@@ -54,8 +54,7 @@ def write_case(
     metadata = {
         "schema": {
             "columns": list(CASE_COLUMNS),
-            "source_codes": {SRC_INLET: "inlet", SRC_SIM: "simulation",
-                             SRC_SENSOR: "sensor"},
+            "source_codes": {SRC_SIM: "simulation", SRC_SENSOR: "sensor"},
         },
         "normalization": {},
     }
@@ -90,7 +89,7 @@ def uniform_case_factory(tmp_path: Path):
 
 @pytest.fixture
 def multi_source_case(tmp_path: Path):
-    """A case whose rows carry all three source tags (inlet / sim / sensor)."""
+    """A case whose rows carry both data source tags (sim / sensor)."""
 
     grid = _uniform_grid(n_per_axis=4)
     coords = np.asarray(grid, dtype=np.float64)
@@ -98,15 +97,14 @@ def multi_source_case(tmp_path: Path):
     rows = np.empty((n, len(CASE_COLUMNS)), dtype=np.float64)
     rows[:, 0:4] = coords
     rows[:, 4:7] = np.asarray(UNIFORM_STATE, dtype=np.float64)
-    rows[:, 7] = np.array([SRC_INLET, SRC_SIM, SRC_SENSOR])[np.arange(n) % 3]
+    rows[:, 7] = np.array([SRC_SIM, SRC_SENSOR])[np.arange(n) % 2]
 
     out = tmp_path / "multi"
     out.mkdir()
     np.save(out / "case.npy", rows)
     (out / "metadata.json").write_text(json.dumps({
         "schema": {"columns": list(CASE_COLUMNS),
-                   "source_codes": {SRC_INLET: "inlet", SRC_SIM: "simulation",
-                                    SRC_SENSOR: "sensor"}},
+                   "source_codes": {SRC_SIM: "simulation", SRC_SENSOR: "sensor"}},
         "normalization": {},
     }))
     return read_case(out / "case.npy", CaseMetadata.load(out / "metadata.json"))
@@ -135,8 +133,7 @@ def nan_target_case(tmp_path: Path):
     np.save(out / "case.npy", rows)
     (out / "metadata.json").write_text(json.dumps({
         "schema": {"columns": list(CASE_COLUMNS_THETA),
-                   "source_codes": {SRC_INLET: "inlet", SRC_SIM: "simulation",
-                                    SRC_SENSOR: "sensor"}},
+                   "source_codes": {SRC_SIM: "simulation", SRC_SENSOR: "sensor"}},
         "normalization": {},
     }))
     return out / "case.npy", CaseMetadata.load(out / "metadata.json")
