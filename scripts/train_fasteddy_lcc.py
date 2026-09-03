@@ -3,38 +3,44 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import random
 import time
 from dataclasses import asdict
 from pathlib import Path
-
+import os
 import numpy as np
 import torch
 
 from wrf_pinn.config.conditions import ConditionSpec, ConditionsConfig
 from wrf_pinn.config.domain import make_cartesian_wrf_domain
-from wrf_pinn.config.flow_field_data import FlowFieldDataConfig
 from wrf_pinn.config.model import ModelConfig
 from wrf_pinn.config.physics import PhysicsConfig
+from wrf_pinn.config.boundary_data import (
+    BoundaryConfig,
+    NoSlipWallConfig,
+    WallSurfaceConfig,
+)
 from wrf_pinn.config.sampling import (
+    BoundarySamplingConfig,
     CollocationSamplingConfig,
     SamplingConfig,
 )
+from wrf_pinn.config.scaling import ResidualScalingConfig, VariableScale
 from wrf_pinn.config.training import OptimizerConfig, TrainingConfig
-from wrf_pinn.data.flow_field import read_flow_field
-from wrf_pinn.data.scaling import read_residual_scaling_txt
+from wrf_pinn.data.case import CaseMetadata, read_case
 from wrf_pinn.models.mlp import MLP
 from wrf_pinn.training.checkpoint import save_checkpoint
 from wrf_pinn.training.losses import PDEResidualScales
-from wrf_pinn.training.train_pinn import train_pinn
+from wrf_pinn.training.train_pinn import TrainingSetup, train_pinn
 
 
 EXPECTED_COLUMNS = (
     "x", "y", "z", "t",
-    "u", "v", "w", "theta", "p_prime",
+    "u", "v", "w", "theta", "p_prime", "source",
 )
+
+SUPERVISED_TARGETS = ("u", "v", "w", "theta", "p_prime")
 
 FASTEDDY_PDE_SCALES = PDEResidualScales(
     mass=3.13536843744e-3,
@@ -44,11 +50,15 @@ FASTEDDY_PDE_SCALES = PDEResidualScales(
     potential_temperature=9.61239013761e-1,
 )
 
+print("torch_threads:", torch.get_num_threads())
+print("interop_threads:", torch.get_num_interop_threads())
+print("available_affinity:", len(os.sched_getaffinity(0)))
+print("SLURM_CPUS_PER_TASK:", os.environ.get("SLURM_CPUS_PER_TASK"))
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", required=True)
-    parser.add_argument("--scaling", required=True)
+    parser.add_argument("--metadata", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--steps", type=int, default=10_000)
     parser.add_argument("--collocation-points", type=int, default=2_048)
@@ -56,8 +66,52 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--data-only", action="store_true")
+    parser.add_argument(
+        "--boundary-kind",
+        choices=("none", "no-penetration", "no-slip"),
+        default="none",
+    )
+    parser.add_argument(
+        "--boundary-surface",
+        default=None,
+        help="Normalized x,y,z wall-surface CSV.",
+    )
+    parser.add_argument(
+        "--boundary-points",
+        type=int,
+        default=512,
+        help="Number of spatial wall points sampled each epoch.",
+    )
+    parser.add_argument(
+        "--boundary-weight",
+        type=float,
+        default=1.0,
+    )
     return parser.parse_args()
 
+def residual_scaling_from_metadata(metadata: CaseMetadata) -> ResidualScalingConfig:
+    """Read the affine scaling used by the model and physics."""
+    normalization = metadata.normalization
+
+    if normalization.get("method") != "minmax_01":
+        raise ValueError("Expected minmax_01 normalization.")
+
+    columns = normalization["columns"]
+    offsets = normalization["offset"]
+    scales = normalization["scale"]
+
+    if not len(columns) == len(offsets) == len(scales):
+        raise ValueError("Normalization columns, offsets, and scales must match.")
+
+    scaling_by_name = {
+        name: VariableScale(offset=float(offset), scale=float(scale))
+        for name, offset, scale in zip(columns, offsets, scales)
+    }
+
+    return ResidualScalingConfig(**{
+        name: scaling_by_name[name]
+        for name in EXPECTED_COLUMNS[:-1]
+    })
 
 def main() -> None:
     args = parse_args()
@@ -65,39 +119,54 @@ def main() -> None:
     if args.steps < 1 or args.collocation_points < 1:
         raise ValueError("Steps and collocation points must be positive.")
 
-    if args.device == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested but is unavailable.")
+    if args.device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but is unavailable.")
+        # reset peak memory stats to measure peak memory for this run
+        torch.cuda.reset_peak_memory_stats()
+        # wait for previous line to run
+        torch.cuda.synchronize()
 
-    torch.cuda.reset_peak_memory_stats()
-    torch.cuda.synchronize()
+    if args.device == "cpu":
+        cpu_threads = int(os.environ.get("SLURM_CPUS_PER_TASK", "1"))
+        torch.set_num_threads(cpu_threads)
+        torch.set_num_interop_threads(1)
 
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
+    torch.use_deterministic_algorithms(True)
 
     data_path = Path(args.data)
-    scaling_path = Path(args.scaling)
+    metadata_path = Path(args.metadata)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    with data_path.open(newline="") as file:
-        header = tuple(next(csv.reader(file)))
-
-    if header != EXPECTED_COLUMNS:
+    # read metadata and check if it contains the expected column names
+    metadata = CaseMetadata.load(metadata_path)
+    if metadata.columns != EXPECTED_COLUMNS:
         raise ValueError(
-            f"Expected columns {EXPECTED_COLUMNS}; got {header}."
+            f"Expected columns {EXPECTED_COLUMNS}; got {metadata.columns}."
         )
 
-    flow_data = read_flow_field(
-        FlowFieldDataConfig(path=str(data_path))
+    case = read_case(
+        data_path,
+        metadata,
+        targets=SUPERVISED_TARGETS,
     )
 
+    normalization = metadata.normalization
+
+    if tuple(normalization.get("columns", ())) != EXPECTED_COLUMNS:
+        raise ValueError("Normalization column order must match the schema.")
+
+    if normalization.get("method") != "minmax_01":
+        raise ValueError("Expected minmax_01 normalization.")
+    
     for name, values in (
-        ("coordinates", flow_data.coordinates),
-        ("targets", flow_data.targets),
+        ("coordinates", case.coordinates),
+        ("targets", case.targets),
     ):
         if not np.isfinite(values).all():
             raise ValueError(f"{name} contain NaN or infinity.")
@@ -105,11 +174,39 @@ def main() -> None:
         if (values < 0.0).any() or (values > 1.0).any():
             raise ValueError(f"{name} are outside [0, 1].")
 
-    scaling = read_residual_scaling_txt(scaling_path)
+    scaling = residual_scaling_from_metadata(metadata)
 
-    model_config = ModelConfig()
+    boundary_active = args.boundary_kind != "none"
+
+    if boundary_active and not args.boundary_surface:
+        raise ValueError(
+            "--boundary-surface is required when boundary loss is enabled."
+        )
+
+    boundaries = BoundaryConfig(
+        no_slip_wall=NoSlipWallConfig(
+            surface=WallSurfaceConfig(
+                path=args.boundary_surface or "",
+                coordinate_columns=("x", "y", "z"),
+            ),
+            condition=(
+                "no_penetration_z"
+                if args.boundary_kind == "no-penetration"
+                else "no_slip"
+            ),
+        ),
+    )
+
     physics = PhysicsConfig()
-    model = MLP(model_config)
+    model_config = ModelConfig(output_dim=physics.state_dim)
+
+    expected_supervised_variables = physics.active_variables[:-1]
+    if case.target_names != expected_supervised_variables:
+        raise ValueError(
+            "Case targets must match the first five physics variables; "
+            f"expected {expected_supervised_variables}, got {case.target_names}."
+        )
+    model = MLP(model_config, physics=physics)
 
     conditions = ConditionsConfig(
         pde=ConditionSpec(
@@ -117,23 +214,40 @@ def main() -> None:
             active=not args.data_only,
             weight=0.0 if args.data_only else 1.0,
         ),
+        boundary=ConditionSpec(
+            "boundary",
+            active=boundary_active,
+            weight=args.boundary_weight if boundary_active else 0.0,
+        ),
+        simulation=ConditionSpec(
+            "simulation",
+            active=True,
+            weight=1.0,
+        ),
+        sensor=ConditionSpec(
+            "sensor",
+            active=False,
+            weight=0.0,
+        ),
     )
 
+    coordinate_min = case.coordinates.min(axis=0)
+    coordinate_max = case.coordinates.max(axis=0)
     domain = make_cartesian_wrf_domain(
-        x_min=0.0,
-        x_max=1.0,
-        y_min=0.0,
-        y_max=1.0,
-        z_min=0.0,
-        z_max=1.0,
-        t_min=0.0,
-        t_max=1.0,
+        x_min=0.0, x_max=1.0,
+        y_min=0.0, y_max=1.0,
+        z_min=0.0, z_max=1.0,
+        t_min=0.0, t_max=1.0,
     )
 
     sampling = SamplingConfig(
         collocation=CollocationSamplingConfig(
             n_points=args.collocation_points,
             method="latin_hypercube",
+        ),
+        boundary=BoundarySamplingConfig(
+            n_points=args.boundary_points,
+            method="random",
         ),
         seed=args.seed,
     )
@@ -150,10 +264,13 @@ def main() -> None:
 
     run_config = {
         "data_path": str(data_path.resolve()),
-        "data_rows": flow_data.n_points,
-        "scaling_path": str(scaling_path.resolve()),
+        "data_rows": case.n_points,
+        "metadata_path": str(metadata_path.resolve()),
+        "normalization": metadata.normalization,
         "variable_scaling": asdict(scaling),
         "data_only": args.data_only,
+        "boundaries": asdict(boundaries),
+        "boundary_kind": args.boundary_kind,
         "model": asdict(model_config),
         "physics": asdict(physics),
         "conditions": asdict(conditions),
@@ -166,17 +283,17 @@ def main() -> None:
         json.dump(run_config, file, indent=2)
 
     print(f"device={args.device}")
-    print(f"data_rows={flow_data.n_points}")
+    print(f"data_rows={case.n_points}")
 
     if args.device == "cuda":
         print(f"gpu={torch.cuda.get_device_name(0)}")
 
     start = time.perf_counter()
 
-    history = train_pinn(
-        model,
+    setup = TrainingSetup(
         domain=domain,
-        flow_field_data=flow_data,
+        case=case,
+        boundaries=boundaries,
         training=training,
         conditions=conditions,
         sampling=sampling,
@@ -184,6 +301,7 @@ def main() -> None:
         scaling=scaling,
         pde_residual_scales=FASTEDDY_PDE_SCALES,
     )
+    history = train_pinn(model, setup)
 
     if args.device == "cuda":
         torch.cuda.synchronize()
@@ -203,7 +321,7 @@ def main() -> None:
         map_location="cpu",
         weights_only=False,
     )
-    reloaded_model = MLP(model_config)
+    reloaded_model = MLP(model_config, physics=physics)
     reloaded_model.load_state_dict(payload["model_state_dict"])
     print("checkpoint_reload=ok")
 

@@ -28,7 +28,7 @@ from wrf_pinn.config.training import DEFAULT_TRAINING, OptimizerConfig, Training
 from wrf_pinn.data.case import Case, SRC_SIM, SRC_SENSOR
 from wrf_pinn.physics.residuals_boundary import no_penetration_z_wall_residuals
 from wrf_pinn.physics.residuals_boundary import no_slip_wall_residuals
-from wrf_pinn.physics.residuals_pde import cartesian_zero_forcing_residuals
+from wrf_pinn.physics.residuals_pde import _to_physical_eddy_viscosity, cartesian_zero_forcing_residuals
 from wrf_pinn.sampling import sample_collocation_points
 from wrf_pinn.sampling import sample_wall_boundary_points
 from wrf_pinn.training.losses import (
@@ -132,11 +132,22 @@ def train_pinn(
     prepared = _PreparedData.from_setup(setup, device=device)
 
     for epoch in range(1, setup.training.epochs + 1):
-        loss = _training_step(model, optimizer, setup, prepared)
+        loss, pde_state = _training_step(model, optimizer, setup, prepared)
         _record_history(history, loss)
 
         if _should_log(epoch, setup.training):
             _print_progress(epoch, setup.training.epochs, loss)
+            if setup.conditions.pde.active:
+                i = setup.physics.variable_index("k_m")
+                km = _to_physical_eddy_viscosity(
+                    pde_state[:, i : i + 1],
+                    setup.physics,
+                )
+                print(
+                    f"k_m: min={km.min().item():.6e} "
+                    f"mean={km.mean().item():.6e} "
+                    f"max={km.max().item():.6e}"
+                )
             _notify_monitor(monitor, epoch=epoch, loss=loss)
 
     if monitor is not None:
@@ -178,11 +189,11 @@ def _training_step(
     optimizer: torch.optim.Optimizer,
     setup: TrainingSetup,
     prepared: _PreparedData,
-) -> LossBreakdown:
+) -> tuple[LossBreakdown, torch.Tensor | None]:
     """Run one optimizer step and return the loss breakdown for the epoch."""
 
     optimizer.zero_grad()
-    objectives = _evaluate_active_objectives(model, setup, prepared)
+    objectives, pde_state = _evaluate_active_objectives(model, setup, prepared)
     loss = assemble_pinn_loss(
         conditions=setup.conditions,
         pde_residual_scales=setup.pde_residual_scales,
@@ -199,7 +210,7 @@ def _training_step(
             setup.training.gradient_clip_norm,
         )
     optimizer.step()
-    return loss
+    return loss, pde_state
 
 
 def _raise_on_nonfinite_gradients(model: nn.Module) -> None:
@@ -217,7 +228,7 @@ def _evaluate_active_objectives(
     model: nn.Module,
     setup: TrainingSetup,
     prepared: _PreparedData,
-) -> dict[str, dict[str, torch.Tensor] | None]:
+) -> tuple[dict[str, dict[str, torch.Tensor] | None], torch.Tensor | None]:
     """Evaluate residuals/errors for each active objective.
 
     Returns a mapping in the keyword shape ``assemble_pinn_loss`` expects, with
@@ -225,6 +236,7 @@ def _evaluate_active_objectives(
     """
 
     conditions = setup.conditions
+    pde_state: torch.Tensor | None = None
     pde_residuals: dict[str, torch.Tensor] | None = None
     boundary_residuals: dict[str, torch.Tensor] | None = None
 
@@ -261,7 +273,7 @@ def _evaluate_active_objectives(
             masks = {name: target_mask}
         objectives[f"{name}_errors"] = errors
         objectives[f"{name}_masks"] = masks
-    return objectives
+    return objectives, pde_state
 
 
 def _boundary_residuals(
