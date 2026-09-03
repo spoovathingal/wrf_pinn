@@ -276,10 +276,26 @@ def _boundary_residuals(
         seed=setup.sampling.seed,
         device=device,
     )
-    wall_state = model(wall_coordinates)
 
     if setup.boundaries.no_slip_wall.condition == "no_penetration_z":
-        return no_penetration_z_wall_residuals(wall_state, scaling=setup.scaling)
+        # Surface layer reuires coordinate autograd
+        wall_coordinates.requires_grad_(True)
+        wall_state = model(wall_coordinates)
+
+        reference_coordinates = wall_coordinates.detach().clone()
+        z1_physical = setup.physics.constants.surface_reference_height
+        z1_normalized = (z1_physical - setup.scaling.z.offset) / setup.scaling.z.scale
+
+        reference_coordinates[:, 2] = z1_normalized
+        reference_state = model(reference_coordinates)
+        return no_penetration_z_wall_residuals(coordinates = wall_coordinates,
+                                               state = wall_state,
+                                               reference_coordinates=reference_coordinates,
+                                               reference_state=reference_state,
+                                               physics=setup.physics,
+                                               scaling=setup.scaling)
+    
+    wall_state = model(wall_coordinates)
     return no_slip_wall_residuals(wall_state, scaling=setup.scaling)
 
 

@@ -34,7 +34,9 @@ class PhysicalConstants:
     eddy_viscosity_min: float = 0.0       # K_m lower bound [m^2/s]
     eddy_viscosity_max: float = 100.0     # K_m upper bound [m^2/s]
     eddy_viscosity_initial: float = 0.003853  # Initial guess only [m^2/s]
-
+    von_karman_constant: float = 0.4 # kappa
+    surface_roughness_length: float = 0.1  # z_0
+    surface_reference_height: float = 7 # z_1
     # Check k_m positivity | numeric
     def __post_init__(self) -> None:
         values = {

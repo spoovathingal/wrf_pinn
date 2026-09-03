@@ -2,8 +2,7 @@
 
 Short trainings on constant uniform-flow cases with different active loss modes.
 Each asserts the pipeline (1) runs, (2) reduces the loss, and where a data anchor
-is present (3) reproduces the known constant (u, v, w). Boundary is off (no-slip
-does not satisfy uniform flow).
+is present (3) reproduces the known constant (u, v, w). Boundary is no penetration and surface layer stress.
 """
 
 from __future__ import annotations
@@ -12,10 +11,11 @@ import numpy as np
 import pytest
 import torch
 
+from wrf_pinn.config.boundary_data import BoundaryConfig, NoSlipWallConfig, WallSurfaceConfig
 from wrf_pinn.config.conditions import ConditionSpec, ConditionsConfig
 from wrf_pinn.config.domain import make_cartesian_wrf_domain
 from wrf_pinn.config.sampling import CollocationSamplingConfig, SamplingConfig
-from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING
+from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING, ResidualScalingConfig, VariableScale
 from wrf_pinn.config.training import OptimizerConfig, TrainingConfig
 from wrf_pinn.data.case import SRC_SIM, SRC_SENSOR
 from wrf_pinn.evaluation.predict import predict_flow_field
@@ -154,3 +154,42 @@ def test_pde_only_runs_and_reduces_loss(uniform_case, report, collocation_points
         sampling=sampling, scaling=DEFAULT_RESIDUAL_SCALING,
         training=_training(epochs=600, log_every=200)))
     _assert_loss_decreased(history, report, f"pde-only [{collocation_points} pts]")
+
+def test_surface_layer_boundary_runs(uniform_case, bottom_wall_csv):
+    """The no-penetration surface-layer boundary runs and backpropagates."""
+
+    torch.manual_seed(0)
+
+    scaling = ResidualScalingConfig(
+        z=VariableScale(offset=0.0, scale=7.0),
+        theta=VariableScale(offset=300.0, scale=1.0),
+    )
+    conditions = ConditionsConfig(
+        pde=_off("pde"),
+        boundary=ConditionSpec("boundary", active=True, weight=1.0),
+        simulation=_off("simulation"),
+        sensor=_off("sensor"),
+    )
+
+    boundaries = BoundaryConfig(
+        no_slip_wall=NoSlipWallConfig(
+            surface=WallSurfaceConfig(path=str(bottom_wall_csv)),
+            condition="no_penetration_z",
+        )
+    )
+
+    model = MLP()
+    history = train_pinn(
+        model,
+        TrainingSetup(
+            case=uniform_case,
+            boundaries=boundaries,
+            conditions=conditions,
+            scaling=scaling,
+            training=_training(epochs=1, log_every=1),
+        ),
+    )
+
+    assert len(history.boundary) == 1
+    assert np.isfinite(history.boundary[0])
+    assert history.boundary[0] >= 0.0
