@@ -58,6 +58,7 @@ class LossBreakdown:
     weighted_terms: TensorMap
     pde_raw_mse: TensorMap
     pde_scaled_mse: TensorMap
+    boundary_component_losses: TensorMap
 
 
 def _zero_like_available(*groups: TensorMap | None) -> torch.Tensor:
@@ -133,6 +134,7 @@ def assemble_pinn_loss(
     scaled_pde_residuals: TensorMap | None = None
     pde_raw_mse: TensorMap = {}
     pde_scaled_mse: TensorMap = {}
+    boundary_component_losses: TensorMap = {}
 
     if pde_residuals is not None:
         scaled_pde_residuals = {}
@@ -166,10 +168,17 @@ def assemble_pinn_loss(
     weighted_terms: TensorMap = {name: terms[name] * spec.weight for name, _, spec, _ in by_name}
     total = torch.stack(tuple(weighted_terms.values())).sum()
 
+    if boundary_residuals is not None:
+        boundary_component_losses = {
+            name: _reduce_tensor(residual, conditions.boundary)
+            for name, residual in boundary_residuals.items()
+        }
+
     return LossBreakdown(
         total=total,
         terms=terms,
         weighted_terms=weighted_terms,
         pde_raw_mse=pde_raw_mse,
         pde_scaled_mse=pde_scaled_mse,
+        boundary_component_losses=boundary_component_losses,
     )

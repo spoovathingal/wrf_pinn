@@ -136,18 +136,7 @@ def train_pinn(
         _record_history(history, loss)
 
         if _should_log(epoch, setup.training):
-            _print_progress(epoch, setup.training.epochs, loss)
-            if setup.conditions.pde.active:
-                i = setup.physics.variable_index("k_m")
-                km = _to_physical_eddy_viscosity(
-                    pde_state[:, i : i + 1],
-                    setup.physics,
-                )
-                print(
-                    f"k_m: min={km.min().item():.6e} "
-                    f"mean={km.mean().item():.6e} "
-                    f"max={km.max().item():.6e}"
-                )
+            _print_progress(epoch, setup.training.epochs, loss, pde_state, setup.physics)
             _notify_monitor(monitor, epoch=epoch, loss=loss)
 
     if monitor is not None:
@@ -445,20 +434,37 @@ def _should_log(epoch: int, training: TrainingConfig) -> bool:
     return epoch == 1 or epoch == training.epochs or epoch % training.log_every == 0
 
 
-def _print_progress(epoch: int, epochs: int, loss: LossBreakdown) -> None:
+def _print_progress(epoch: int, epochs: int, loss: LossBreakdown,
+                    pde_state: torch.Tesnor | None, physics: PhysicsConfig) -> None:
     """Print one concise training progress line."""
 
     parts = [
         f"epoch={epoch}/{epochs}",
         f"total={float(loss.total.detach().cpu()):.6e}",
     ]
+    # print mean-squared, unweighted loss components
     parts += [
         f"{name}={float(loss.terms[name].detach().cpu()):.6e}"
         for name in COMPONENT_LOSS_NAMES
     ]
-    # Per-residual raw vs scaled MSE (the PDE residual scaling diagnostics).
+    # PDE raw vs scaled MSE (the PDE residual scaling diagnostics).
     for name, raw_mse in loss.pde_raw_mse.items():
         scaled_mse = loss.pde_scaled_mse[name]
         parts.append(f"{name}_raw_mse={float(raw_mse.detach().cpu()):.6e}")
         parts.append(f"{name}_scaled_mse={float(scaled_mse.detach().cpu()):.6e}")
+    # Surface layer stress term loss at bottom wall
+    for name in ("surface_stress_xz", "surface_stress_yz"):
+        if name in loss.boundary_component_losses:
+            value = loss.boundary_component_losses[name]
+            parts.append(
+                f"{name}_norm_loss= {float(value.detach().cpu()):.6e}")
     print(" | ".join(parts))
+
+    # Print K_m updates
+    i = physics.variable_index("k_m")
+    km = _to_physical_eddy_viscosity(pde_state[:, i : i + 1], physics)
+    print(
+        f"k_m: min={km.min().item():.6e} "
+        f"mean={km.mean().item():.6e} "
+        f"max={km.max().item():.6e}"
+    )
