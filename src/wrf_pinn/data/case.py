@@ -25,12 +25,15 @@ SRC_SENSOR = 1      # ground observations
 
 @dataclass(frozen=True)
 class Case:
-    """One normalized case: coordinates, targets, per-entry target mask, source tag."""
+    """One normalized case: coordinates, targets, per-entry target mask, source tag.
 
-    coordinates: np.ndarray
-    targets: np.ndarray
-    target_mask: np.ndarray
-    source: np.ndarray
+    Arrays are numpy (host read) or torch tensors (GPU read path).
+    """
+
+    coordinates: object   # np.ndarray or torch.Tensor
+    targets: object
+    target_mask: object
+    source: object
     coordinate_names: tuple[str, ...]
     target_names: tuple[str, ...]
 
@@ -84,43 +87,58 @@ def read_case(
     *,
     coordinates: tuple[str, ...] = DEFAULT_COORDINATES,
     targets: tuple[str, ...] = DEFAULT_TARGETS,
+    device: object | None = None,
 ) -> Case:
     """Read one ``.npy`` case, slicing columns by name per ``metadata``.
 
-    ``coordinates`` and ``targets`` name which schema columns are model inputs
-    vs. supervised outputs; they are not hardcoded so the split can change with
-    later decisions.
+    ``coordinates``/``targets`` name the input vs. supervised columns. ``device``
+    (a torch device) runs the build on the GPU instead of host numpy; the raw
+    array is moved once and the returned ``Case`` holds device tensors.
     """
 
     path = Path(npy_path)
     if not path.exists():
         raise FileNotFoundError(f"Case file not found: {path}.")
 
-    data = np.load(path)
     index = {name: i for i, name in enumerate(metadata.columns)}
     _require_columns(path, index, coordinates + targets + ("source",))
-
     coord_cols = [index[name] for name in coordinates]
     target_cols = [index[name] for name in targets]
 
-    coord_array = np.ascontiguousarray(data[:, coord_cols], dtype=np.float32)
-    target_array = np.ascontiguousarray(data[:, target_cols], dtype=np.float32)
-    source_array = data[:, index["source"]].astype(np.int64)
+    raw = np.load(path)
+    xp = np
+    if device is not None:
+        import torch
+        xp = torch
+        raw = torch.as_tensor(raw, device=device)   # single host->device move
 
-    _check_finite(path, coordinates, coord_array)   # coordinates are required
+    coord_array = _f32(xp, raw[:, coord_cols])
+    target_array = _f32(xp, raw[:, target_cols])
+    source_array = raw[:, index["source"]].astype(np.int64) if xp is np \
+        else raw[:, index["source"]].to(xp.int64)
+
+    _check_finite(path, coordinates, coord_array, xp)   # coordinates are required
 
     # optional targets may be NaN: mask measured entries, zero-fill the rest
-    target_mask = np.isfinite(target_array).astype(np.float32)
-    target_array = np.where(target_mask > 0.0, target_array, 0.0).astype(np.float32)
+    target_mask = _f32(xp, xp.isfinite(target_array))
+    target_array = _f32(xp, xp.where(target_mask > 0.0, target_array, 0.0))
 
     return Case(
-        coordinates=coord_array,
-        targets=np.ascontiguousarray(target_array),
-        target_mask=np.ascontiguousarray(target_mask),
+        coordinates=_contig(xp, coord_array),
+        targets=_contig(xp, target_array),
+        target_mask=_contig(xp, target_mask),
         source=source_array,
         coordinate_names=coordinates,
         target_names=targets,
     )
+
+
+def _f32(xp, array):
+    return array.astype(np.float32) if xp is np else array.to(xp.float32)
+
+
+def _contig(xp, array):
+    return np.ascontiguousarray(array) if xp is np else array.contiguous()
 
 
 def _require_columns(path: Path, index: dict[str, int], needed: tuple[str, ...]) -> None:
@@ -129,10 +147,13 @@ def _require_columns(path: Path, index: dict[str, int], needed: tuple[str, ...])
         raise ValueError(f"Case {path} is missing schema columns: {missing}.")
 
 
-def _check_finite(path: Path, names: tuple[str, ...], array: np.ndarray) -> None:
+def _check_finite(path: Path, names: tuple[str, ...], array, xp=np) -> None:
     """Reject NaN/inf, which would silently poison training."""
 
-    if np.isfinite(array).all():
+    finite = xp.isfinite(array)
+    if bool(finite.all()):
         return
-    bad = sorted({names[c] for c in np.unique(np.where(~np.isfinite(array))[1])})
+    bad_cols = xp.where(~finite.all(axis=0))[0] if xp is np \
+        else xp.where(~finite.all(dim=0))[0]
+    bad = sorted({names[int(c)] for c in bad_cols})
     raise ValueError(f"Non-finite values in {path}, columns: {bad}.")
