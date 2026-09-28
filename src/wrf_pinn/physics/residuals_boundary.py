@@ -11,7 +11,7 @@ import torch
 import math
 
 from wrf_pinn.config.physics import DEFAULT_PHYSICS, PhysicsConfig
-from wrf_pinn.physics.residuals_pde import _hydrostatic_reference_state, _physical_gradient, _to_physical_eddy_viscosity
+from wrf_pinn.physics.residuals_pde import _diagnose_moist_state, _diagnostic_sgs_coefficients, _physical_gradient
 from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING, ResidualScalingConfig
 
 
@@ -116,21 +116,20 @@ def _physical_density_from_state(coordinates: torch.Tensor, state: torch.Tensor,
 
     theta_index = physics.variable_index("theta")
     p_prime_index = physics.variable_index("p_prime")
+    q_v_index = physics.variable_index("q_v")
 
     theta_normalized = state[:, theta_index : theta_index + 1]
     p_prime_normalized = state[:, p_prime_index : p_prime_index + 1]
+    q_v_normalized = state[:, q_v_index : q_v_index + 1]
 
-    theta = (scaling.theta.offset + scaling.theta.scale * theta_normalized)
-    p_prime = (scaling.p_prime.offset + scaling.p_prime.scale * p_prime_normalized)
+    theta = scaling.theta.offset + scaling.theta.scale * theta_normalized
+    p_prime = scaling.p_prime.offset + scaling.p_prime.scale * p_prime_normalized
+    q_v = scaling.q_v.offset + scaling.q_v.scale * q_v_normalized
+    z = scaling.z.offset + scaling.z.scale * coordinates[:, 2:3]
 
-    z = (scaling.z.offset + scaling.z.scale * coordinates[:, 2:3])
+    _, _, rho_d, _, _, _ = _diagnose_moist_state(theta=theta, p_prime=p_prime, q_v=q_v, z=z, physics=physics)
 
-    p_h, _ = _hydrostatic_reference_state(z, physics)
-    p = p_h + p_prime
-
-    temperature = theta * (p / physics.constants.reference_pressure).pow(physics.constants.kappa)
-
-    return p / (physics.constants.dry_air_gas_constant * temperature)
+    return rho_d
 
 def _validate_no_penetration_z_wall_inputs(coordinates: torch.Tensor, state: torch.Tensor,
                                            reference_coordinates: torch.Tensor, reference_state: torch.Tensor, 
@@ -197,12 +196,17 @@ def no_penetration_z_wall_residuals(
     u_index = physics.variable_index("u")
     v_index = physics.variable_index("v")
     w_index = physics.variable_index("w")
-    k_m_index = physics.variable_index("k_m")
+    theta_index = physics.variable_index("theta")
+    e_sgs_index = physics.variable_index("e_sgs")
 
     # Physical wall velocities.
     u_wall = (scaling.u.offset + scaling.u.scale * state[:, u_index : u_index + 1])
     v_wall = (scaling.v.offset + scaling.v.scale * state[:, v_index : v_index + 1])
     w_wall = (scaling.w.offset + scaling.w.scale * state[:, w_index : w_index + 1])
+    theta_wall = (
+        scaling.theta.offset + scaling.theta.scale * state[:, theta_index : theta_index + 1])
+    e_sgs_wall = (
+        scaling.e_sgs.offset + scaling.e_sgs.scale * state[:, e_sgs_index : e_sgs_index + 1])
 
     # Physical first-reference-level velocities.
     u_1 = scaling.u.offset + scaling.u.scale * reference_state[:, u_index : u_index + 1]
@@ -211,21 +215,24 @@ def no_penetration_z_wall_residuals(
     rho_wall = _physical_density_from_state(coordinates, state, physics, scaling)
     rho_1 = _physical_density_from_state(reference_coordinates, reference_state, physics, scaling)
 
-    k_m_wall = _to_physical_eddy_viscosity(state[:, k_m_index : k_m_index + 1], physics)
-
     grad_u = _physical_gradient(u_wall, coordinates, scaling)
     grad_v = _physical_gradient(v_wall, coordinates, scaling)
     grad_w = _physical_gradient(w_wall, coordinates, scaling)
+    grad_theta = _physical_gradient(theta_wall, coordinates, scaling)
 
     u_z = grad_u[:, 2:3]
     v_z = grad_v[:, 2:3]
     w_x = grad_w[:, 0:1]
     w_y = grad_w[:, 1:2]
-
+    theta_z = grad_theta[:, 2:3]
+    # Diagnose wall K_m using the same closure as the interior PDE.
+    _, _, k_m_wall, _ = _diagnostic_sgs_coefficients(theta=theta_wall, theta_z=theta_z,
+                        e_sgs=e_sgs_wall, physics=physics)
+    # Existing neutral surface-layer parameterization
     von_karman = physics.constants.von_karman_constant
     z_0 = physics.constants.surface_roughness_length
     z_1 = physics.constants.surface_reference_height
-    drag_coefficient = (von_karman**2 / math.log((z_1 + z_0) / z_0) ** 2)
+    drag_coefficient = von_karman**2 / math.log((z_1 + z_0) / z_0) ** 2
     horizontal_speed_1 = torch.sqrt(u_1.square() + v_1.square() + 1.0e-12)
 
     # Ordinary SGS stress evaluated on the fluid side of the wall.

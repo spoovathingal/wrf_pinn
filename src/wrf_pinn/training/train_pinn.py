@@ -28,7 +28,7 @@ from wrf_pinn.config.training import DEFAULT_TRAINING, OptimizerConfig, Training
 from wrf_pinn.data.case import Case, SRC_SIM, SRC_SENSOR
 from wrf_pinn.physics.residuals_boundary import no_penetration_z_wall_residuals
 from wrf_pinn.physics.residuals_boundary import no_slip_wall_residuals
-from wrf_pinn.physics.residuals_pde import _to_physical_eddy_viscosity, cartesian_zero_forcing_residuals
+from wrf_pinn.physics.residuals_pde import cartesian_zero_forcing_residuals
 from wrf_pinn.sampling import sample_collocation_points
 from wrf_pinn.sampling import sample_wall_boundary_points
 from wrf_pinn.training.losses import (
@@ -105,7 +105,7 @@ def train_pinn(
     ----------
     model:
         Neural network mapping normalized ``(x, y, z, t)`` inputs to normalized
-        ``(u, v, w, rho)`` outputs.
+        ``(u, v, w, theta, p_prime, q_v, e_sgs)`` outputs.
     setup:
         The bundled run configuration and data (domain, flow/sensor data,
         boundary/conditions/sampling/physics/scaling/training configs). See
@@ -435,7 +435,7 @@ def _should_log(epoch: int, training: TrainingConfig) -> bool:
 
 
 def _print_progress(epoch: int, epochs: int, loss: LossBreakdown,
-                    pde_state: torch.Tesnor | None, physics: PhysicsConfig) -> None:
+                    pde_state: torch.Tensor | None, physics: PhysicsConfig) -> None:
     """Print one concise training progress line."""
 
     parts = [
@@ -460,11 +460,11 @@ def _print_progress(epoch: int, epochs: int, loss: LossBreakdown,
                 f"{name}_norm_loss= {float(value.detach().cpu()):.6e}")
     print(" | ".join(parts))
 
-    # Print K_m updates
-    i = physics.variable_index("k_m")
-    km = _to_physical_eddy_viscosity(pde_state[:, i : i + 1], physics)
-    print(
-        f"k_m: min={km.min().item():.6e} "
-        f"mean={km.mean().item():.6e} "
-        f"max={km.max().item():.6e}"
-    )
+    # # Print K_m updates
+    # i = physics.variable_index("k_m")
+    # km = _to_physical_eddy_viscosity(pde_state[:, i : i + 1], physics)
+    # print(
+    #     f"k_m: min={km.min().item():.6e} "
+    #     f"mean={km.mean().item():.6e} "
+    #     f"max={km.max().item():.6e}"
+    # )

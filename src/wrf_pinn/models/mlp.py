@@ -4,16 +4,18 @@ from __future__ import annotations
 import math
 import torch
 from torch import nn
+from torch.nn import functional as F
 from wrf_pinn.config.physics import DEFAULT_PHYSICS, PhysicsConfig
 from wrf_pinn.config.model import DEFAULT_MODEL, ModelConfig
 
-
+_POSITIVE_VARIABLES = frozenset(("q_v", "e_sgs"))
 class MLP(nn.Module):
     """Coordinate-to-state multilayer perceptron.
 
     The model maps continuous coordinates ``(x, y, z, t)`` to the atmospheric
-    state ``(u, v, w, theta, p_prime, k_m_unconstrained)``. First 5 outputs should've been
+    state ``(u, v, w, theta, p_prime, q_v, e_sgs)``. First 7 outputs should've been
     normalized before they reach this model.
+    The ``q_v`` and ``e_sgs`` outputs are positive by construction.
     """
 
     def __init__(
@@ -32,9 +34,15 @@ class MLP(nn.Module):
         self.config = config
         self.physics = physics
 
+        positive_output_mask = torch.tensor(
+            [name in _POSITIVE_VARIABLES for name in physics.active_variables],
+            dtype=torch.bool)
+        
+        self.register_buffer("_positive_output_mask", positive_output_mask,
+            persistent=False)
         self.network = self._build_network(config)
         self._initialize(config)
-        self._initialize_eddy_viscosity_output(physics)
+
 
     def forward(self, coordinates: torch.Tensor) -> torch.Tensor:
         """Evaluate state predictions at coordinate inputs."""
@@ -45,9 +53,10 @@ class MLP(nn.Module):
                 f"(n_points, {self.config.input_dim}); got {tuple(coordinates.shape)}."
             )
             raise ValueError(msg)
-
-        return self.network(coordinates)
-
+        
+        raw_state = self.network(coordinates)
+        # keep positive variables positive
+        return torch.where(self._positive_output_mask.unsqueeze(0), F.softplus(raw_state), raw_state) 
     @staticmethod
     def _build_network(config: ModelConfig) -> nn.Sequential:
         layers: list[nn.Module] = []
@@ -76,7 +85,7 @@ class MLP(nn.Module):
                 raise ValueError(f"Unsupported initializer: {config.initializer}.")
 
             nn.init.zeros_(module.bias)
-
+    # not used for now, to be implemented later when k_m training mode comes back
     def _initialize_eddy_viscosity_output(self, physics: PhysicsConfig) -> None:
         """Initialize K_m as a constant field at its configured initial value."""
 

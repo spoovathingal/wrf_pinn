@@ -11,8 +11,8 @@ from typing import Literal
 
 
 CoordinateSystem = Literal["local_cartesian"]
-PhysicsVariable = Literal["u", "v", "w", "theta", "p_prime", "k_m"]
-ResidualName = Literal["mass", "x_momentum", "y_momentum", "z_momentum", "potential_temperature"]
+PhysicsVariable = Literal["u", "v", "w", "theta", "p_prime", "q_v", "e_sgs"]
+ResidualName = Literal["mass", "x_momentum", "y_momentum", "z_momentum", "potential_temperature","water_vapor"]
 
 @dataclass(frozen=True)
 class PhysicalConstants:
@@ -24,13 +24,14 @@ class PhysicalConstants:
     """
 
     gravity: float = 9.81
-    dry_air_gas_constant: float = 287.0
+    dry_air_gas_constant: float = 287.04
     water_vapor_gas_constant: float = 461.6
-    dry_air_specific_heat_cp: float = 1004.0
-    dry_air_specific_heat_cv: float = 717.0
+    dry_air_specific_heat_cp: float = 1005.04
+    dry_air_specific_heat_cv: float = 718.0
     reference_pressure: float = 100000.0
     earth_rotation_rate: float = 7.2921e-5
     earth_radius: float = 6370000.0
+    # K_m training not active not but to be implemented in future
     eddy_viscosity_min: float = 0.0       # K_m lower bound [m^2/s]
     eddy_viscosity_max: float = 100.0     # K_m upper bound [m^2/s]
     eddy_viscosity_initial: float = 0.003853  # Initial guess only [m^2/s]
@@ -70,6 +71,11 @@ class PhysicalConstants:
                 "eddy_viscosity_initial must lie between "
                 "eddy_viscosity_min and eddy_viscosity_max."
             )
+    @property
+    def gamma(self) -> float:
+        """Return c_p / c_v."""
+
+        return (self.dry_air_specific_heat_cp / self.dry_air_specific_heat_cv)
 
     @property
     def kappa(self) -> float:
@@ -98,23 +104,37 @@ class PhysicsConfig:
     """
 
     coordinate_system: CoordinateSystem = "local_cartesian"
-    active_variables: tuple[PhysicsVariable, ...] = ("u", "v", "w", "theta", "p_prime", "k_m")
+    active_variables: tuple[PhysicsVariable, ...] = ("u", "v", "w", "theta",
+                                                      "p_prime", "q_v", "e_sgs")
     residuals: tuple[ResidualName, ...] = (
         "mass",
         "x_momentum",
         "y_momentum",
         "z_momentum",
         "potential_temperature",
+        "water_vapor"
     )
     include_coriolis: bool = False
     include_gravity: bool = True
     include_pressure_gradient: bool = True
     include_temperature: bool = True
-    include_moisture: bool = False
+    include_moisture: bool = True
     include_turbulence: bool = True
     include_microphysics: bool = False
     forcing_is_zero: bool = True
     constants: PhysicalConstants = PhysicalConstants()
+
+    # Fixed hydrostatic base state for the current FastEddy case.
+    hydrostatic_reference_potential_temperature: float = 300.0  # K
+
+    # Temporary uniform SGS filter width; replace with local cell-volume
+    # scale when variable dz is implemented.
+    uniform_filter_width: float = 15.0  # m
+
+    # FastEddy diagnostic SGS closure.
+    sgs_mixing_coefficient: float = 0.10          # c_k
+    stable_mixing_length_coefficient: float = 0.76
+    minimum_mixing_length: float = 0.01           # m
 
     @property
     def state_dim(self) -> int:

@@ -34,13 +34,10 @@ from wrf_pinn.training.checkpoint import save_checkpoint
 from wrf_pinn.training.losses import PDEResidualScales
 from wrf_pinn.training.train_pinn import TrainingSetup, train_pinn
 
-
-EXPECTED_COLUMNS = (
-    "x", "y", "z", "t",
-    "u", "v", "w", "theta", "p_prime", "source",
-)
-
-SUPERVISED_TARGETS = ("u", "v", "w", "theta", "p_prime")
+COORDINATE_COLUMNS = ("x", "y", "z", "t")
+SUPERVISED_TARGETS = ("u", "v", "w", "theta", "p_prime", "q_v", "e_sgs")
+NORMALIZED_COLUMNS = COORDINATE_COLUMNS + SUPERVISED_TARGETS
+EXPECTED_COLUMNS = NORMALIZED_COLUMNS + ("source",)
 
 FASTEDDY_PDE_SCALES = PDEResidualScales(
     mass=3.13536843744e-3,
@@ -48,6 +45,7 @@ FASTEDDY_PDE_SCALES = PDEResidualScales(
     y_momentum=1.99362535127e-2,
     z_momentum=5.58677880249e-1,
     potential_temperature=9.61239013761e-1,
+    water_vapor=1.0e-1,
 )
 
 print("torch_threads:", torch.get_num_threads())
@@ -109,8 +107,7 @@ def residual_scaling_from_metadata(metadata: CaseMetadata) -> ResidualScalingCon
     }
 
     return ResidualScalingConfig(**{
-        name: scaling_by_name[name]
-        for name in EXPECTED_COLUMNS[:-1]
+        name: scaling_by_name[name] for name in NORMALIZED_COLUMNS
     })
 
 def main() -> None:
@@ -128,8 +125,10 @@ def main() -> None:
         torch.cuda.synchronize()
 
     if args.device == "cpu":
+        # read given CPUs & have torch use all them 
         cpu_threads = int(os.environ.get("SLURM_CPUS_PER_TASK", "1"))
         torch.set_num_threads(cpu_threads)
+        # lets only one pytorch operation to run in parallel at a time & prevent excessive thread contention
         torch.set_num_interop_threads(1)
 
     random.seed(args.seed)
@@ -137,6 +136,7 @@ def main() -> None:
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
+    # Force pytorch to use deterministic implementations where available, improving reproducibility.
     torch.use_deterministic_algorithms(True)
 
     data_path = Path(args.data)
@@ -150,15 +150,11 @@ def main() -> None:
             f"Expected columns {EXPECTED_COLUMNS}; got {metadata.columns}."
         )
 
-    case = read_case(
-        data_path,
-        metadata,
-        targets=SUPERVISED_TARGETS,
-    )
+    case = read_case(data_path, metadata, coordinates=COORDINATE_COLUMNS,targets=SUPERVISED_TARGETS)
 
     normalization = metadata.normalization
 
-    if tuple(normalization.get("columns", ())) != EXPECTED_COLUMNS:
+    if tuple(normalization.get("columns", ())) != NORMALIZED_COLUMNS:
         raise ValueError("Normalization column order must match the schema.")
 
     if normalization.get("method") != "minmax_01":
@@ -200,10 +196,10 @@ def main() -> None:
     physics = PhysicsConfig()
     model_config = ModelConfig(output_dim=physics.state_dim)
 
-    expected_supervised_variables = physics.active_variables[:-1]
+    expected_supervised_variables = physics.active_variables
     if case.target_names != expected_supervised_variables:
         raise ValueError(
-            "Case targets must match the first five physics variables; "
+            "Case targets must match the physics variables; "
             f"expected {expected_supervised_variables}, got {case.target_names}."
         )
     model = MLP(model_config, physics=physics)
@@ -231,8 +227,6 @@ def main() -> None:
         ),
     )
 
-    coordinate_min = case.coordinates.min(axis=0)
-    coordinate_max = case.coordinates.max(axis=0)
     domain = make_cartesian_wrf_domain(
         x_min=0.0, x_max=1.0,
         y_min=0.0, y_max=1.0,
