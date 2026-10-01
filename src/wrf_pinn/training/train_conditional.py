@@ -20,6 +20,7 @@ the loss decreases, with figures to follow.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 
 import torch
@@ -125,8 +126,10 @@ def train_conditional(
 
         if epoch == 1 or epoch == config.epochs or epoch % config.log_every == 0:
             parts = " ".join(f"{n}={float(batch[n].detach()):.4e}" for n in weights)
+            # stderr + flush so progress is live in the SLURM log, never buffered
             print(f"epoch {epoch}/{config.epochs} "
-                  f"total={float(total.detach()):.4e} {parts}", flush=True)
+                  f"total={float(total.detach()):.4e} {parts}",
+                  file=sys.stderr, flush=True)
 
     return history
 
