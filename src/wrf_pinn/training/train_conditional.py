@@ -59,26 +59,28 @@ def _resolve_device(name: str) -> torch.device:
 
 
 def _case_losses(model: nn.Module, case: ConditionalCase) -> dict[str, torch.Tensor]:
-    """The three data-driven losses for one case, on the decoded output."""
-    z = model.encode(case.initial, case.boundary, case.terrain)
+    """The three data losses for one case. ALL go encode -> decode -> compare to the
+    real field, never a semantic shortcut: the model is conditioned on z and the
+    loss is taken on the decoded prediction at the field's own coordinates."""
     n_coord, n_state = len(COORD_NAMES), len(STATE_VARS)
+    z = model.encode(case.initial, case.boundary, case.terrain)
 
-    # data: interior query coordinates -> targets (masked)
+    # data: decode at interior query coords -> compare to targets (masked)
     pred = model(case.interior, z)
     err = (pred - case.targets) * case.target_mask
-    measured = case.target_mask.sum().clamp_min(1.0)
-    data = err.square().sum() / measured
+    data = err.square().sum() / case.target_mask.sum().clamp_min(1.0)
 
-    # initial: phi = coords (tau=0) then state; predict at those coords, match state
+    # initial: decode at phi's coords (tau=0) -> compare to phi's state
     ic_coords = case.initial[:, :n_coord]
     ic_state = case.initial[:, n_coord:]
     initial = (model(ic_coords, z) - ic_state).square().mean()
 
-    # flow boundary: psi (faces, times, len, state). Build face query coords is a
-    # future refinement; for the MWE we match the model's state statistics to the
-    # face history at the interior query points' times. Minimal, data-driven term.
-    flow = (model(case.interior, z).mean(0) - case.boundary.mean(dim=(0, 1, 2))
-            ).square().mean()
+    # flow boundary: decode at the REAL face coords (x,y,z,t over the window) ->
+    # compare to the real psi state there. A genuine boundary-condition loss, same
+    # encode->decode->compare pattern as the data and initial losses.
+    bc_coords = case.boundary_coords.reshape(-1, n_coord)
+    bc_state = case.boundary.reshape(-1, n_state)
+    flow = (model(bc_coords, z) - bc_state).square().mean()
 
     return {"data": data, "initial": initial, "flow_boundary": flow}
 

@@ -55,7 +55,8 @@ class ConditionalCase:
 
     name: str
     initial: object       # np.ndarray | torch.Tensor
-    boundary: object
+    boundary: object            # psi state: (n_faces, n_times, face_len, n_state)
+    boundary_coords: object     # psi coords: (n_faces, n_times, face_len, n_coord)
     terrain: object
     interior: object
     targets: object
@@ -85,6 +86,7 @@ class ConditionalCase:
             name=self.name,
             initial=t(self.initial),
             boundary=t(self.boundary),
+            boundary_coords=t(self.boundary_coords),
             terrain=t(self.terrain),
             interior=t(self.interior),
             targets=t(self.targets),
@@ -102,6 +104,7 @@ class ConditionalCase:
             path,
             initial=np.asarray(self.initial, dtype=np.float32),
             boundary=np.asarray(self.boundary, dtype=np.float32),
+            boundary_coords=np.asarray(self.boundary_coords, dtype=np.float32),
             terrain=np.asarray(self.terrain, dtype=np.float32),
             interior=np.asarray(self.interior, dtype=np.float32),
             targets=np.asarray(self.targets, dtype=np.float32),
@@ -122,8 +125,8 @@ def read_conditional_case(npz_path: str | Path) -> ConditionalCase:
         raise FileNotFoundError(f"Conditional case not found: {path}.")
 
     with np.load(path) as blob:
-        needed = ("initial", "boundary", "terrain", "interior", "targets",
-                  "target_mask", "times")
+        needed = ("initial", "boundary", "boundary_coords", "terrain", "interior",
+                  "targets", "target_mask", "times")
         missing = [k for k in needed if k not in blob.files]
         if missing:
             raise ValueError(f"Case {path} missing members: {missing}.")
@@ -142,6 +145,7 @@ def read_conditional_case(npz_path: str | Path) -> ConditionalCase:
         name=path.stem,
         initial=members["initial"],
         boundary=members["boundary"],
+        boundary_coords=members["boundary_coords"],
         terrain=members["terrain"],
         interior=interior,
         targets=targets,

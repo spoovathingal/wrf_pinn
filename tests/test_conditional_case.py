@@ -25,6 +25,7 @@ def make_fixture() -> ConditionalCase:
         name="synthetic_0",
         initial=rng.standard_normal((n_ic, nc + nv)).astype(np.float32),
         boundary=rng.standard_normal((nf, n_times, face_len, nv)).astype(np.float32),
+        boundary_coords=rng.standard_normal((nf, n_times, face_len, nc)).astype(np.float32),
         terrain=rng.standard_normal((n_terr, 3)).astype(np.float32),
         interior=rng.standard_normal((n_pts, nc)).astype(np.float32),
         targets=rng.standard_normal((n_pts, nv)).astype(np.float32),
