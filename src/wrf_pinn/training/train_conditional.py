@@ -1,22 +1,4 @@
-"""Conditional-PINN training loop (minimum working example).
-
-Trains one shared ConditionalModel across a family of cases. Each step:
-  1. draw a batch of cases,
-  2. encode each case's (initial, boundary, terrain) -> z,
-  3. predict the interior at the case's query coordinates,
-  4. accumulate the data + initial + flow-boundary losses,
-  5. average over the batch and step.
-
-Losses implemented here (the data-driven ones the MWE needs to show a result):
-  data           predicted interior vs. targets (masked)
-  initial        predicted state at tau=0 vs. the initial field phi
-  flow_boundary  predicted state on the open faces vs. the boundary history psi
-
-PDE and surface-boundary losses are physics terms that need the residual machinery
-and a fixed surface; they are deferred for the MWE and slot in via the same per-case
-accumulation. Everything is intentionally small: this proves the pipeline runs and
-the loss decreases, with figures to follow.
-"""
+"""Train one shared ConditionalModel across a batch of cases on the five losses."""
 
 from __future__ import annotations
 
@@ -56,10 +38,6 @@ class ConditionalTrainConfig:
     weight_data: float = 1.0
     weight_initial: float = 1.0
     weight_flow_boundary: float = 1.0
-    # The reduced PDE residual is in physical units on min-max-normalized data, so
-    # its raw magnitude is ~1e9, dwarfing the other terms. Until it is properly
-    # nondimensionalized, down-weight it so it contributes (~0.1 scale) without
-    # dominating the total. This is an MWE-stage knob, not the final weighting.
     weight_pde: float = 1.0
     weight_surface: float = 1.0
     n_collocation: int = 2048     # PDE collocation points per case per step
@@ -81,17 +59,8 @@ def _resolve_device(name: str) -> torch.device:
 
 def _case_losses(model: nn.Module, case: ConditionalCase,
                  cfg: "ConditionalTrainConfig") -> dict[str, torch.Tensor]:
-    """All FIVE conditional-PINN losses for one case.
-
-    data / initial / flow_boundary are supervised (decode -> compare to the field's
-    own values). pde / surface are physics-informed residuals evaluated on the
-    decoded state at collocation / wall points. Every term goes through the encoded
-    z and the decoder; none is a semantic shortcut.
-
-    The supervised fields carry the 4 observed vars (u,v,w,theta); the model outputs
-    the full physics state (6 vars), so supervised comparisons use the first 4
-    columns and the physics residuals use the full state.
-    """
+    """The five losses for one case. Supervised terms use the first 4 output
+    columns (u,v,w,theta); physics residuals use the full 6-var state."""
     n_coord = len(COORD_NAMES)
     n_obs = len(STATE_VARS)                      # 4 supervised vars
     z = model.encode(case.initial, case.boundary, case.terrain)
@@ -108,9 +77,7 @@ def _case_losses(model: nn.Module, case: ConditionalCase,
     bc_state = case.boundary.reshape(-1, n_obs)
     flow = (model(bc_coords, z)[:, :n_obs] - bc_state).square().mean()
 
-    # Affine scaling maps normalized values back to physical units so the residuals
-    # are physically meaningful; built from the pre-processor recipe (identity if
-    # not supplied). Without it the PDE residual is ~1e9 garbage.
+    # residuals need physical units; identity scaling if none supplied
     scaling = cfg.scaling if cfg.scaling is not None else DEFAULT_RESIDUAL_SCALING
 
     # --- physics: PDE residual at collocation points inside the sub-domain ---
