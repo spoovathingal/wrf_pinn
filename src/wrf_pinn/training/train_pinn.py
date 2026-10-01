@@ -460,11 +460,13 @@ def _print_progress(epoch: int, epochs: int, loss: LossBreakdown,
                 f"{name}_norm_loss= {float(value.detach().cpu()):.6e}")
     print(" | ".join(parts))
 
-    # Print K_m updates
-    i = physics.variable_index("k_m")
-    km = _to_physical_eddy_viscosity(pde_state[:, i : i + 1], physics)
-    print(
-        f"k_m: min={km.min().item():.6e} "
-        f"mean={km.mean().item():.6e} "
-        f"max={km.max().item():.6e}"
-    )
+    # Print K_m updates (only when the PDE ran this step; data-only steps have no
+    # pde_state, so skip the diagnostic rather than crash on a None index).
+    if pde_state is not None:
+        i = physics.variable_index("k_m")
+        km = _to_physical_eddy_viscosity(pde_state[:, i : i + 1], physics)
+        print(
+            f"k_m: min={km.min().item():.6e} "
+            f"mean={km.mean().item():.6e} "
+            f"max={km.max().item():.6e}"
+        )
