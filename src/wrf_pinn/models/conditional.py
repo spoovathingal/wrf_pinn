@@ -68,10 +68,16 @@ class FlattenMLPEncoder(nn.Module):
         return self.net(torch.cat(parts)).unsqueeze(0)   # (1, latent_dim)
 
 
+from wrf_pinn.config.physics import DEFAULT_PHYSICS
+
+
 @dataclass(frozen=True)
 class ConditionalModelConfig:
     coord_dim: int = 4
-    state_dim: int = 4
+    # Full physics state (u,v,w,theta,p_prime,k_m) so the PDE and surface residuals
+    # work unchanged. The 4 supervised vars (u,v,w,theta) are the first columns;
+    # pressure and eddy-viscosity are unsupervised by data but constrained by physics.
+    state_dim: int = DEFAULT_PHYSICS.state_dim
     hidden_width: int = 128
     hidden_layers: int = 4
     activation: str = "tanh"

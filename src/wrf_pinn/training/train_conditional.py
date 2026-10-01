@@ -27,16 +27,25 @@ import torch
 from torch import nn
 
 from wrf_pinn.data.conditional_case import ConditionalCase, COORD_NAMES, STATE_VARS
+from wrf_pinn.config.physics import DEFAULT_PHYSICS
+from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING
+from wrf_pinn.physics.residuals_pde import cartesian_zero_forcing_residuals
+from wrf_pinn.physics.residuals_boundary import no_slip_wall_residuals
+
+#: the five losses of the conditional PINN, in order.
+LOSS_NAMES: tuple[str, ...] = ("data", "initial", "flow_boundary", "pde", "surface")
 
 
 @dataclass
 class ConditionalHistory:
-    """Per-epoch loss history."""
+    """Per-epoch loss history (one list per loss name)."""
 
     total: list[float] = field(default_factory=list)
     data: list[float] = field(default_factory=list)
     initial: list[float] = field(default_factory=list)
     flow_boundary: list[float] = field(default_factory=list)
+    pde: list[float] = field(default_factory=list)
+    surface: list[float] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -47,6 +56,10 @@ class ConditionalTrainConfig:
     weight_data: float = 1.0
     weight_initial: float = 1.0
     weight_flow_boundary: float = 1.0
+    weight_pde: float = 1.0
+    weight_surface: float = 1.0
+    n_collocation: int = 2048     # PDE collocation points per case per step
+    n_wall: int = 512             # surface/wall points per case per step
     log_every: int = 100
     device: str = "auto"
     seed: int = 0
@@ -58,31 +71,61 @@ def _resolve_device(name: str) -> torch.device:
     return torch.device(name)
 
 
-def _case_losses(model: nn.Module, case: ConditionalCase) -> dict[str, torch.Tensor]:
-    """The three data losses for one case. ALL go encode -> decode -> compare to the
-    real field, never a semantic shortcut: the model is conditioned on z and the
-    loss is taken on the decoded prediction at the field's own coordinates."""
-    n_coord, n_state = len(COORD_NAMES), len(STATE_VARS)
+def _case_losses(model: nn.Module, case: ConditionalCase,
+                 cfg: "ConditionalTrainConfig") -> dict[str, torch.Tensor]:
+    """All FIVE conditional-PINN losses for one case.
+
+    data / initial / flow_boundary are supervised (decode -> compare to the field's
+    own values). pde / surface are physics-informed residuals evaluated on the
+    decoded state at collocation / wall points. Every term goes through the encoded
+    z and the decoder; none is a semantic shortcut.
+
+    The supervised fields carry the 4 observed vars (u,v,w,theta); the model outputs
+    the full physics state (6 vars), so supervised comparisons use the first 4
+    columns and the physics residuals use the full state.
+    """
+    n_coord = len(COORD_NAMES)
+    n_obs = len(STATE_VARS)                      # 4 supervised vars
     z = model.encode(case.initial, case.boundary, case.terrain)
 
-    # data: decode at interior query coords -> compare to targets (masked)
-    pred = model(case.interior, z)
+    # --- supervised: data, initial, flow boundary (first 4 output columns) ---
+    pred = model(case.interior, z)[:, :n_obs]
     err = (pred - case.targets) * case.target_mask
     data = err.square().sum() / case.target_mask.sum().clamp_min(1.0)
 
-    # initial: decode at phi's coords (tau=0) -> compare to phi's state
-    ic_coords = case.initial[:, :n_coord]
-    ic_state = case.initial[:, n_coord:]
-    initial = (model(ic_coords, z) - ic_state).square().mean()
+    ic_coords, ic_state = case.initial[:, :n_coord], case.initial[:, n_coord:]
+    initial = (model(ic_coords, z)[:, :n_obs] - ic_state).square().mean()
 
-    # flow boundary: decode at the REAL face coords (x,y,z,t over the window) ->
-    # compare to the real psi state there. A genuine boundary-condition loss, same
-    # encode->decode->compare pattern as the data and initial losses.
     bc_coords = case.boundary_coords.reshape(-1, n_coord)
-    bc_state = case.boundary.reshape(-1, n_state)
-    flow = (model(bc_coords, z) - bc_state).square().mean()
+    bc_state = case.boundary.reshape(-1, n_obs)
+    flow = (model(bc_coords, z)[:, :n_obs] - bc_state).square().mean()
 
-    return {"data": data, "initial": initial, "flow_boundary": flow}
+    # --- physics: PDE residual at collocation points inside the sub-domain ---
+    coll = _sample_box(case.interior, cfg.n_collocation).requires_grad_(True)
+    coll_state = model(coll, z)
+    pde_res = cartesian_zero_forcing_residuals(
+        coll, coll_state, physics=DEFAULT_PHYSICS, scaling=DEFAULT_RESIDUAL_SCALING)
+    pde = torch.stack([r.square().mean() for r in pde_res.values()]).mean()
+
+    # --- physics: surface (no-slip wall) at the sub-domain's bottom face ---
+    wall = _sample_box(case.interior, cfg.n_wall)
+    wall = wall.clone(); wall[:, 2] = case.interior[:, 2].min()   # z -> domain floor
+    wall_state = model(wall, z)
+    wall_res = no_slip_wall_residuals(wall_state, scaling=DEFAULT_RESIDUAL_SCALING)
+    surface = torch.stack([r.square().mean() for r in wall_res.values()]).mean()
+
+    return {"data": data, "initial": initial, "flow_boundary": flow,
+            "pde": pde, "surface": surface}
+
+
+def _sample_box(interior: torch.Tensor, n: int) -> torch.Tensor:
+    """Sample n random coordinates uniformly in the bounding box of the interior
+    query points (same normalized coordinate ranges as the case)."""
+    lo = interior.min(dim=0).values
+    hi = interior.max(dim=0).values
+    u = torch.rand((n, interior.shape[1]), device=interior.device,
+                   dtype=interior.dtype)
+    return lo + u * (hi - lo)
 
 
 def train_conditional(
@@ -102,7 +145,8 @@ def train_conditional(
     rng = torch.Generator().manual_seed(config.seed)
     history = ConditionalHistory()
     weights = {"data": config.weight_data, "initial": config.weight_initial,
-               "flow_boundary": config.weight_flow_boundary}
+               "flow_boundary": config.weight_flow_boundary,
+               "pde": config.weight_pde, "surface": config.weight_surface}
 
     for epoch in range(1, config.epochs + 1):
         k = min(config.batch_cases, len(cases))
@@ -111,7 +155,7 @@ def train_conditional(
         optimizer.zero_grad()
         batch = {name: torch.zeros((), device=device) for name in weights}
         for i in idx:
-            for name, value in _case_losses(model, cases[i]).items():
+            for name, value in _case_losses(model, cases[i], config).items():
                 batch[name] = batch[name] + value
         for name in batch:
             batch[name] = batch[name] / k
