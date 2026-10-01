@@ -28,7 +28,7 @@ from torch import nn
 
 from wrf_pinn.data.conditional_case import ConditionalCase, COORD_NAMES, STATE_VARS
 from wrf_pinn.config.physics import DEFAULT_PHYSICS
-from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING
+from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING, ResidualScalingConfig
 from wrf_pinn.physics.residuals_pde import cartesian_zero_forcing_residuals
 from wrf_pinn.physics.residuals_boundary import no_slip_wall_residuals
 
@@ -56,10 +56,18 @@ class ConditionalTrainConfig:
     weight_data: float = 1.0
     weight_initial: float = 1.0
     weight_flow_boundary: float = 1.0
+    # The reduced PDE residual is in physical units on min-max-normalized data, so
+    # its raw magnitude is ~1e9, dwarfing the other terms. Until it is properly
+    # nondimensionalized, down-weight it so it contributes (~0.1 scale) without
+    # dominating the total. This is an MWE-stage knob, not the final weighting.
     weight_pde: float = 1.0
     weight_surface: float = 1.0
     n_collocation: int = 2048     # PDE collocation points per case per step
     n_wall: int = 512             # surface/wall points per case per step
+    grad_clip_norm: float = 1.0   # clip grads (PINN PDE gradients can spike)
+    #: affine scaling (physical = offset + scale*normalized) for the residuals,
+    #: built from the pre-processor's normalization recipe. Identity if None.
+    scaling: "ResidualScalingConfig | None" = None
     log_every: int = 100
     device: str = "auto"
     seed: int = 0
@@ -100,18 +108,23 @@ def _case_losses(model: nn.Module, case: ConditionalCase,
     bc_state = case.boundary.reshape(-1, n_obs)
     flow = (model(bc_coords, z)[:, :n_obs] - bc_state).square().mean()
 
+    # Affine scaling maps normalized values back to physical units so the residuals
+    # are physically meaningful; built from the pre-processor recipe (identity if
+    # not supplied). Without it the PDE residual is ~1e9 garbage.
+    scaling = cfg.scaling if cfg.scaling is not None else DEFAULT_RESIDUAL_SCALING
+
     # --- physics: PDE residual at collocation points inside the sub-domain ---
     coll = _sample_box(case.interior, cfg.n_collocation).requires_grad_(True)
     coll_state = model(coll, z)
     pde_res = cartesian_zero_forcing_residuals(
-        coll, coll_state, physics=DEFAULT_PHYSICS, scaling=DEFAULT_RESIDUAL_SCALING)
+        coll, coll_state, physics=DEFAULT_PHYSICS, scaling=scaling)
     pde = torch.stack([r.square().mean() for r in pde_res.values()]).mean()
 
     # --- physics: surface (no-slip wall) at the sub-domain's bottom face ---
     wall = _sample_box(case.interior, cfg.n_wall)
     wall = wall.clone(); wall[:, 2] = case.interior[:, 2].min()   # z -> domain floor
     wall_state = model(wall, z)
-    wall_res = no_slip_wall_residuals(wall_state, scaling=DEFAULT_RESIDUAL_SCALING)
+    wall_res = no_slip_wall_residuals(wall_state, scaling=scaling)
     surface = torch.stack([r.square().mean() for r in wall_res.values()]).mean()
 
     return {"data": data, "initial": initial, "flow_boundary": flow,
@@ -164,6 +177,9 @@ def train_conditional(
         if not torch.isfinite(total):
             raise FloatingPointError(f"Non-finite loss at epoch {epoch}.")
         total.backward()
+        # Clip gradients: PDE residual gradients (2nd derivatives via autograd) can
+        # spike and freeze training. Standard PINN safeguard.
+        torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
         optimizer.step()
 
         history.total.append(float(total.detach().cpu()))
