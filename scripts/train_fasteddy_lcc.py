@@ -16,16 +16,11 @@ from wrf_pinn.config.conditions import ConditionSpec, ConditionsConfig
 from wrf_pinn.config.domain import make_cartesian_wrf_domain
 from wrf_pinn.config.model import ModelConfig
 from wrf_pinn.config.physics import PhysicsConfig
-from wrf_pinn.config.boundary_data import (
-    BoundaryConfig,
-    NoSlipWallConfig,
-    WallSurfaceConfig,
-)
-from wrf_pinn.config.sampling import (
-    BoundarySamplingConfig,
-    CollocationSamplingConfig,
-    SamplingConfig,
-)
+from wrf_pinn.config.boundary_data import (BoundaryConfig, NoSlipWallConfig,
+                                    SurfaceFluxConfig, WallSurfaceConfig)
+
+from wrf_pinn.config.sampling import (BoundarySamplingConfig, CollocationSamplingConfig,
+    SamplingConfig)
 from wrf_pinn.config.scaling import ResidualScalingConfig, VariableScale
 from wrf_pinn.config.training import OptimizerConfig, TrainingConfig
 from wrf_pinn.data.case import CaseMetadata, read_case
@@ -78,13 +73,17 @@ def parse_args() -> argparse.Namespace:
         "--boundary-points",
         type=int,
         default=512,
-        help="Number of spatial wall points sampled each epoch.",
+        help="Number of spatial wall points sampled once per run",
     )
     parser.add_argument(
         "--boundary-weight",
         type=float,
         default=1.0,
     )
+    parser.add_argument("--surface-fluxes", default=None,
+                        help="Surface-flux .npy: normalized x,y,t; physical fricVel,htFlux.")
+    parser.add_argument("--surface-stress-scale", type=float, default=3.8273)
+    parser.add_argument("--surface-heat-flux-scale", type=float, default=1.0)
     return parser.parse_args()
 
 def residual_scaling_from_metadata(metadata: CaseMetadata) -> ResidualScalingConfig:
@@ -175,23 +174,19 @@ def main() -> None:
     boundary_active = args.boundary_kind != "none"
 
     if boundary_active and not args.boundary_surface:
-        raise ValueError(
-            "--boundary-surface is required when boundary loss is enabled."
-        )
+        raise ValueError("--boundary-surface is required when boundary loss is enabled.")
+
+    if args.boundary_kind == "no-penetration" and not args.surface_fluxes:
+        raise ValueError("--surface-fluxes is required for --boundary-kind no-penetration.")
 
     boundaries = BoundaryConfig(
         no_slip_wall=NoSlipWallConfig(
-            surface=WallSurfaceConfig(
-                path=args.boundary_surface or "",
-                coordinate_columns=("x", "y", "z"),
-            ),
-            condition=(
-                "no_penetration_z"
-                if args.boundary_kind == "no-penetration"
-                else "no_slip"
-            ),
-        ),
-    )
+            surface=WallSurfaceConfig(path=args.boundary_surface or "", coordinate_columns=("x", "y", "z")),
+            condition="no_penetration_z" if args.boundary_kind == "no-penetration" else "no_slip",
+            fluxes=SurfaceFluxConfig(path=args.surface_fluxes or ""),
+            surface_stress_scale=args.surface_stress_scale,
+            surface_heat_flux_scale=args.surface_heat_flux_scale)
+            )
 
     physics = PhysicsConfig()
     model_config = ModelConfig(output_dim=physics.state_dim)

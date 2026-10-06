@@ -8,13 +8,12 @@ to ``config.sampling``, extracts training times from available data, and returns
 """
 
 from __future__ import annotations
-
+from dataclasses import dataclass
+import numpy as np
 import torch
-
 from wrf_pinn.config.boundary_data import NoSlipWallConfig
 from wrf_pinn.config.sampling import BoundarySamplingConfig
-from wrf_pinn.data.boundary import read_wall_surface_geometry
-from wrf_pinn.data.boundary import WallSurfaceGeometry
+from wrf_pinn.data.boundary import SurfaceFluxData, WallSurfaceGeometry, read_wall_surface_geometry
 
 
 def sample_wall_boundary_points(
@@ -275,3 +274,51 @@ def _make_generator(
     generator = torch.Generator(device=generator_device)
     generator.manual_seed(seed)
     return generator
+
+def _surface_flux_keys(coordinates: np.ndarray) -> np.ndarray:
+    """Represent x,y,t as float32 triples for exact lookup."""
+    values = np.ascontiguousarray(coordinates, dtype=np.float32)
+    return values.view([("x", np.float32), ("y", np.float32), ("t", np.float32)]).reshape(-1)
+
+
+@dataclass(frozen=True)
+class SurfaceFluxLookup:
+    """CPU lookup built once; source flux values remain memory-mapped.
+    Coordinates must match exactly after float32 conversion,
+    using shared global normalization—not separate crop normalization.
+    Each source (x,y,t) must be unique. Repeated sampled queries are allowed.
+    Use a flux file covering the active crop and times.
+    Although the flux values remain memory-mapped, the lookup index needs CPU memory.
+    """
+
+    data: SurfaceFluxData
+    keys: np.ndarray
+    row_order: np.ndarray
+
+    @classmethod
+    def from_data(cls, data: SurfaceFluxData) -> "SurfaceFluxLookup":
+        keys = _surface_flux_keys(data.coordinates)
+        if keys.size == 0:
+            raise ValueError("Surface-flux data must contain at least one row.")
+
+        row_order = np.argsort(keys)
+        keys = keys[row_order]
+        if np.any(keys[1:] == keys[:-1]):
+            raise ValueError("Surface-flux (x,y,t) rows must be unique after float32 conversion.")
+
+        return cls(data=data, keys=keys, row_order=row_order)
+
+    def match(self, coordinates: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return physical (N,1) flux tensors for supplied bottom-boundary rows."""
+        if coordinates.ndim != 2 or coordinates.shape[1] != 4:
+            raise ValueError("Boundary coordinates must have shape (N, 4).")
+
+        query = _surface_flux_keys(coordinates.detach().cpu().numpy()[:, (0, 1, 3)])
+        positions = np.searchsorted(self.keys, query)
+        if np.any(positions == self.keys.size) or np.any(self.keys[positions] != query):
+            raise ValueError("No exact surface-flux (x,y,t) match; check coverage and shared normalization.")
+
+        rows = self.row_order[positions]
+        fric_vel = torch.as_tensor(self.data.fric_vel[rows], dtype=coordinates.dtype, device=coordinates.device)
+        ht_flux = torch.as_tensor(self.data.ht_flux[rows], dtype=coordinates.dtype, device=coordinates.device)
+        return fric_vel, ht_flux

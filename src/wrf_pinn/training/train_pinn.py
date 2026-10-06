@@ -25,12 +25,12 @@ from wrf_pinn.config.physics import DEFAULT_PHYSICS, PhysicsConfig
 from wrf_pinn.config.sampling import DEFAULT_SAMPLING, SamplingConfig
 from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING, ResidualScalingConfig
 from wrf_pinn.config.training import DEFAULT_TRAINING, OptimizerConfig, TrainingConfig
+from wrf_pinn.data.boundary import read_surface_fluxes
 from wrf_pinn.data.case import Case, SRC_SIM, SRC_SENSOR
-from wrf_pinn.physics.residuals_boundary import no_penetration_z_wall_residuals
-from wrf_pinn.physics.residuals_boundary import no_slip_wall_residuals
+from wrf_pinn.physics.residuals_boundary import no_penetration_z_wall_residuals, no_slip_wall_residuals
 from wrf_pinn.physics.residuals_pde import cartesian_zero_forcing_residuals
-from wrf_pinn.sampling import sample_collocation_points
-from wrf_pinn.sampling import sample_wall_boundary_points
+from wrf_pinn.sampling import sample_collocation_points, sample_wall_boundary_points
+from wrf_pinn.sampling.boundary import SurfaceFluxLookup
 from wrf_pinn.training.losses import (
     DEFAULT_PDE_RESIDUAL_SCALES, LossBreakdown, PDEResidualScales,
     assemble_pinn_loss,
@@ -155,8 +155,10 @@ class _PreparedData:
 
     device: torch.device
     by_source: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = field(
-        default_factory=dict
-    )
+        default_factory=dict)
+    wall_coordinates: torch.Tensor | None = None
+    fric_vel: torch.Tensor | None = None
+    ht_flux: torch.Tensor | None = None
 
     @classmethod
     def from_setup(cls, setup: TrainingSetup, *, device: torch.device) -> "_PreparedData":
@@ -167,9 +169,33 @@ class _PreparedData:
         source = torch.as_tensor(setup.case.source, device=device)
         for code in torch.unique(source).tolist():
             rows = source == code
-            prepared.by_source[int(code)] = (
-                coordinates[rows], targets[rows], target_mask[rows]
+            prepared.by_source[int(code)] = (coordinates[rows], targets[rows], target_mask[rows])
+        # Prepare boundary points once and match ground-point fluxes by (x,y,t).
+        # Cache aligned fricVel/htFlux; non-ground zeros are unused by surface losses.
+        if setup.conditions.boundary.active:
+            wall = setup.boundaries.no_slip_wall
+            wall_coordinates = sample_wall_boundary_points(
+                boundary=wall, sampling=setup.sampling.boundary, case=setup.case,
+                seed=setup.sampling.seed, device=device,
             )
+            prepared.wall_coordinates = wall_coordinates
+
+            if wall.condition == "no_penetration_z":
+                z_physical = setup.scaling.z.offset + setup.scaling.z.scale * wall_coordinates[:, 2:3]
+                bottom_mask = torch.isclose(z_physical, torch.zeros_like(z_physical),
+                                            rtol=0.0, atol=1.0e-5).squeeze(1)
+                if not torch.any(bottom_mask):
+                    raise ValueError("No z=0 bottom-boundary points were supplied.")
+
+                lookup = SurfaceFluxLookup.from_data(read_surface_fluxes(wall.fluxes))
+                fric_vel, ht_flux = lookup.match(wall_coordinates[bottom_mask])
+
+                # Nonbottom zeros are placeholders; surface losses exclude them.
+                prepared.fric_vel = torch.zeros_like(wall_coordinates[:, :1])
+                prepared.ht_flux = torch.zeros_like(prepared.fric_vel)
+                prepared.fric_vel[bottom_mask] = fric_vel
+                prepared.ht_flux[bottom_mask] = ht_flux
+
         return prepared
 
 
@@ -244,7 +270,7 @@ def _evaluate_active_objectives(
         )
 
     if conditions.boundary.active:
-        boundary_residuals = _boundary_residuals(model, setup, prepared.device)
+        boundary_residuals = _boundary_residuals(model, setup, prepared)
 
     objectives: dict[str, dict[str, torch.Tensor] | None] = {
         "pde_residuals": pde_residuals,
@@ -266,19 +292,13 @@ def _evaluate_active_objectives(
 
 
 def _boundary_residuals(
-    model: nn.Module, setup: TrainingSetup, device: torch.device
-) -> dict[str, torch.Tensor]:
-    """Wall residuals for the configured wall condition."""
+    model: nn.Module, setup: TrainingSetup, prepared: _PreparedData) -> dict[str, torch.Tensor]:
+    """Evaluate wall residuals using the prepared coordinates and fluxes."""
+    
+    wall = setup.boundaries.no_slip_wall
+    wall_coordinates = prepared.wall_coordinates.detach().clone()
 
-    wall_coordinates = sample_wall_boundary_points(
-        boundary=setup.boundaries.no_slip_wall,
-        sampling=setup.sampling.boundary,
-        case=setup.case,
-        seed=setup.sampling.seed,
-        device=device,
-    )
-
-    if setup.boundaries.no_slip_wall.condition == "no_penetration_z":
+    if wall.condition == "no_penetration_z":
         # Surface layer reuires coordinate autograd
         wall_coordinates.requires_grad_(True)
         wall_state = model(wall_coordinates)
@@ -289,12 +309,13 @@ def _boundary_residuals(
 
         reference_coordinates[:, 2] = z1_normalized
         reference_state = model(reference_coordinates)
-        return no_penetration_z_wall_residuals(coordinates = wall_coordinates,
-                                               state = wall_state,
-                                               reference_coordinates=reference_coordinates,
-                                               reference_state=reference_state,
-                                               physics=setup.physics,
-                                               scaling=setup.scaling)
+        return no_penetration_z_wall_residuals(coordinates = wall_coordinates, state = wall_state,
+                                               reference_coordinates=reference_coordinates, reference_state=reference_state,
+                                               physics=setup.physics, scaling=setup.scaling,
+                                               fric_vel=prepared.fric_vel, ht_flux=prepared.ht_flux,
+                                               surface_stress_scale=wall.surface_stress_scale,
+                                               surface_heat_flux_scale=wall.surface_heat_flux_scale,
+                                               )
     
     wall_state = model(wall_coordinates)
     return no_slip_wall_residuals(wall_state, scaling=setup.scaling)
@@ -374,7 +395,10 @@ def _validate_active_inputs(setup: TrainingSetup) -> None:
             raise ValueError(
                 "conditions.boundary is active, but no case was provided to "
                 "supply boundary times."
-            )
+        )
+    wall = setup.boundaries.no_slip_wall
+    if wall.condition == "no_penetration_z" and not wall.fluxes.path:
+        raise ValueError("Active no_penetration_z requires a surface-flux .npy path.")
 
 
 def _sample_pde_coordinates(
@@ -453,7 +477,7 @@ def _print_progress(epoch: int, epochs: int, loss: LossBreakdown,
         parts.append(f"{name}_raw_mse={float(raw_mse.detach().cpu()):.6e}")
         parts.append(f"{name}_scaled_mse={float(scaled_mse.detach().cpu()):.6e}")
     # Surface layer stress term loss at bottom wall
-    for name in ("surface_stress_xz", "surface_stress_yz"):
+    for name in ("surface_stress_xz", "surface_stress_yz", "surface_heat_flux"):
         if name in loss.boundary_component_losses:
             value = loss.boundary_component_losses[name]
             parts.append(
