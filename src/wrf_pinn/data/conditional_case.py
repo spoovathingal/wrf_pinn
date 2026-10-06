@@ -25,8 +25,9 @@ class ConditionalCase:
     torch arrays."""
 
     name: str
-    initial: object             # phi: (n_ic, n_coord + n_state), coords then state
-    boundary: object            # psi: (n_faces, n_times, face_len, n_state)
+    initial_coords: object      # (n_ic, n_coord): where to enforce the initial field
+    z_initial: object           # (k_i,): POD coeffs of the initial state
+    z_boundary: object          # (k_b,): POD coeffs of the boundary state
     boundary_coords: object     # psi coords: (n_faces, n_times, face_len, n_coord)
     terrain: object             # (n_terr, 3): x, y, elevation (static)
     interior: object            # (n_pts, n_coord): query coords, tau > 0
@@ -52,8 +53,9 @@ class ConditionalCase:
 
         return ConditionalCase(
             name=self.name,
-            initial=t(self.initial),
-            boundary=t(self.boundary),
+            initial_coords=t(self.initial_coords),
+            z_initial=t(self.z_initial),
+            z_boundary=t(self.z_boundary),
             boundary_coords=t(self.boundary_coords),
             terrain=t(self.terrain),
             interior=t(self.interior),
@@ -65,57 +67,83 @@ class ConditionalCase:
             face_names=self.face_names,
         )
 
-    def save(self, path: str | Path) -> Path:
-        """Write this case to one ``.npz`` (members by name). Returns the path."""
-        path = Path(path)
-        np.savez(
-            path,
-            initial=np.asarray(self.initial, dtype=np.float32),
-            boundary=np.asarray(self.boundary, dtype=np.float32),
-            boundary_coords=np.asarray(self.boundary_coords, dtype=np.float32),
-            terrain=np.asarray(self.terrain, dtype=np.float32),
-            interior=np.asarray(self.interior, dtype=np.float32),
-            targets=np.asarray(self.targets, dtype=np.float32),
-            target_mask=np.asarray(self.target_mask, dtype=np.float32),
-            times=np.asarray(self.times, dtype=np.float32),
-        )
-        return path if path.suffix else path.with_suffix(".npz")
+
+#: Case members written by the generator and read back here.
+_CASE_MEMBERS: tuple[str, ...] = (
+    "initial_coords", "z_initial", "z_boundary", "boundary_coords", "terrain",
+    "interior", "targets", "target_mask", "times",
+)
 
 
 def read_conditional_case(npz_path: str | Path) -> ConditionalCase:
-    """Load one .npz case; validate members and coords, mask NaN targets."""
+    """Load one POD-encoded .npz case; validate members, mask NaN targets."""
     path = Path(npz_path)
     if not path.exists():
         raise FileNotFoundError(f"Conditional case not found: {path}.")
 
     with np.load(path) as blob:
-        needed = ("initial", "boundary", "boundary_coords", "terrain", "interior",
-                  "targets", "target_mask", "times")
-        missing = [k for k in needed if k not in blob.files]
+        missing = [k for k in _CASE_MEMBERS if k not in blob.files]
         if missing:
             raise ValueError(f"Case {path} missing members: {missing}.")
-        members = {k: blob[k].astype(np.float32) for k in needed}
+        members = {k: blob[k].astype(np.float32) for k in _CASE_MEMBERS}
 
-    interior = members["interior"]
-    if not np.isfinite(interior).all():
+    if not np.isfinite(members["interior"]).all():
         raise ValueError(f"Non-finite interior coordinates in {path}.")
 
-    # optional targets may be NaN: mask the measured entries, zero-fill the rest
-    targets = members["targets"]
-    mask = np.isfinite(targets).astype(np.float32)
-    targets = np.where(mask > 0.0, targets, 0.0).astype(np.float32)
+    mask = np.isfinite(members["targets"]).astype(np.float32)
+    members["targets"] = np.where(mask > 0.0, members["targets"], 0.0).astype(np.float32)
+    members["target_mask"] = mask
 
-    return ConditionalCase(
-        name=path.stem,
-        initial=members["initial"],
-        boundary=members["boundary"],
-        boundary_coords=members["boundary_coords"],
-        terrain=members["terrain"],
-        interior=interior,
-        targets=targets,
-        target_mask=mask,
-        times=members["times"],
-    )
+    return ConditionalCase(name=path.stem, **members)
+
+
+@dataclass
+class PODBasis:
+    """Per-variable POD modes for decoding z back to physical state fields.
+
+    means/modes are dicts keyed by state variable; each field (initial, boundary)
+    has its own set. z for a field is the per-variable coeffs concatenated in
+    STATE_VARS order.
+    """
+
+    initial: dict               # {"means": {var: (n,)}, "modes": {var: (n, k)}}
+    boundary: dict
+
+    @classmethod
+    def load(cls, path: str | Path) -> "PODBasis":
+        with np.load(Path(path)) as b:
+            fields = {}
+            for field in ("initial", "boundary"):
+                fields[field] = {
+                    "means": {v: b[f"{field}_mean_{v}"] for v in STATE_VARS},
+                    "modes": {v: b[f"{field}_modes_{v}"] for v in STATE_VARS},
+                }
+        return cls(initial=fields["initial"], boundary=fields["boundary"])
+
+    def as_torch(self, *, device=None):
+        import torch
+        t = lambda a: torch.as_tensor(a, dtype=torch.float32, device=device)
+        conv = lambda f: {"means": {v: t(f["means"][v]) for v in STATE_VARS},
+                          "modes": {v: t(f["modes"][v]) for v in STATE_VARS}}
+        return PODBasis(initial=conv(self.initial), boundary=conv(self.boundary))
+
+    @staticmethod
+    def _decode(z, basis):
+        """Split z per variable, decode each column, stack to (n_points, n_state)."""
+        import torch
+        cols, i = [], 0
+        for var in STATE_VARS:
+            V = basis["modes"][var]
+            k = V.shape[1]
+            cols.append(basis["means"][var] + V @ z[i:i + k])
+            i += k
+        return torch.stack(cols, dim=1)
+
+    def decode_initial(self, z):
+        return self._decode(z, self.initial)
+
+    def decode_boundary(self, z):
+        return self._decode(z, self.boundary)
 
 
 @dataclass(frozen=True)

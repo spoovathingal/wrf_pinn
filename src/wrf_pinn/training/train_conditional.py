@@ -8,7 +8,9 @@ from dataclasses import dataclass, field
 import torch
 from torch import nn
 
-from wrf_pinn.data.conditional_case import ConditionalCase, COORD_NAMES, STATE_VARS
+from wrf_pinn.data.conditional_case import (
+    ConditionalCase, PODBasis, COORD_NAMES, STATE_VARS,
+)
 from wrf_pinn.config.physics import DEFAULT_PHYSICS
 from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING, ResidualScalingConfig
 from wrf_pinn.physics.residuals_pde import cartesian_zero_forcing_residuals
@@ -57,24 +59,26 @@ def _resolve_device(name: str) -> torch.device:
     return torch.device(name)
 
 
-def _case_losses(model: nn.Module, case: ConditionalCase,
+def _case_losses(model: nn.Module, case: ConditionalCase, pod: PODBasis,
                  cfg: "ConditionalTrainConfig") -> dict[str, torch.Tensor]:
     """The five losses for one case. Supervised terms use the first 4 output
-    columns (u,v,w,theta); physics residuals use the full 6-var state."""
+    columns (u,v,w,theta); physics residuals use the full 6-var state. The
+    initial/boundary targets are DECODED from the case's POD coeffs."""
     n_coord = len(COORD_NAMES)
     n_obs = len(STATE_VARS)                      # 4 supervised vars
-    z = model.encode(case.initial, case.boundary, case.terrain)
+    z = torch.cat([case.z_initial, case.z_boundary]).unsqueeze(0)   # (1, k_i+k_b)
 
     # --- supervised: data, initial, flow boundary (first 4 output columns) ---
     pred = model(case.interior, z)[:, :n_obs]
     err = (pred - case.targets) * case.target_mask
     data = err.square().sum() / case.target_mask.sum().clamp_min(1.0)
 
-    ic_coords, ic_state = case.initial[:, :n_coord], case.initial[:, n_coord:]
-    initial = (model(ic_coords, z)[:, :n_obs] - ic_state).square().mean()
+    # initial/boundary targets are the POD reconstruction, not a stored raw field
+    ic_state = pod.decode_initial(case.z_initial)
+    initial = (model(case.initial_coords, z)[:, :n_obs] - ic_state).square().mean()
 
     bc_coords = case.boundary_coords.reshape(-1, n_coord)
-    bc_state = case.boundary.reshape(-1, n_obs)
+    bc_state = pod.decode_boundary(case.z_boundary)
     flow = (model(bc_coords, z)[:, :n_obs] - bc_state).square().mean()
 
     # residuals need physical units; identity scaling if none supplied
@@ -111,15 +115,18 @@ def _sample_box(interior: torch.Tensor, n: int) -> torch.Tensor:
 def train_conditional(
     model: nn.Module,
     cases: list[ConditionalCase],
+    pod: PODBasis,
     config: ConditionalTrainConfig = ConditionalTrainConfig(),
 ) -> ConditionalHistory:
-    """Train the shared model across ``cases``; return the loss history."""
+    """Train the shared model across ``cases`` using ``pod`` to decode the
+    initial/boundary targets; return the loss history."""
     if not cases:
         raise ValueError("train_conditional needs at least one case.")
 
     device = _resolve_device(config.device)
     model.to(device)
     cases = [c.as_torch(device=device) for c in cases]
+    pod = pod.as_torch(device=device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     rng = torch.Generator().manual_seed(config.seed)
@@ -135,7 +142,7 @@ def train_conditional(
         optimizer.zero_grad()
         batch = {name: torch.zeros((), device=device) for name in weights}
         for i in idx:
-            for name, value in _case_losses(model, cases[i], config).items():
+            for name, value in _case_losses(model, cases[i], pod, config).items():
                 batch[name] = batch[name] + value
         for name in batch:
             batch[name] = batch[name] / k
