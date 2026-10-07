@@ -283,7 +283,7 @@ def _surface_flux_keys(coordinates: np.ndarray) -> np.ndarray:
 
 @dataclass(frozen=True)
 class SurfaceFluxLookup:
-    """CPU lookup built once; source flux values remain memory-mapped.
+    """CPU lookup built once from selected surface-flux rows.
     Coordinates must match exactly after float32 conversion,
     using shared global normalization—not separate crop normalization.
     Each source (x,y,t) must be unique. Repeated sampled queries are allowed.

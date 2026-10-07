@@ -39,7 +39,7 @@ class SurfaceFluxData:
     fric_vel: np.ndarray
     ht_flux: np.ndarray
 
-def read_surface_fluxes(config: SurfaceFluxConfig) -> SurfaceFluxData:
+def read_surface_fluxes(config: SurfaceFluxConfig, *, coordinates: np.ndarray | None = None) -> SurfaceFluxData:
     """Read .npy rows ordered x,y,t,fricVel,htFlux without normalizing them."""
 
     if not config.path:
@@ -59,9 +59,25 @@ def read_surface_fluxes(config: SurfaceFluxConfig) -> SurfaceFluxData:
     if data.dtype.kind != "f" or data.dtype.itemsize not in (4, 8):
         raise ValueError("Surface-flux data must use float32 or float64.")
 
-    # Validate in chunks to avoid a large temporary array.
+    def keys(values):
+        values = np.ascontiguousarray(values, dtype=np.float32)
+        return values.view([("x", np.float32), ("y", np.float32), ("t", np.float32)]).reshape(-1)
+
+    requested = None
+    selected = []
+    if coordinates is not None:
+        coordinates = np.asarray(coordinates)
+        if coordinates.ndim != 2 or coordinates.shape[1] != 3 or len(coordinates) == 0:
+            raise ValueError("Requested coordinates must have shape (N, 3), N > 0.")
+        if not np.isfinite(coordinates).all():
+            raise ValueError("Requested coordinates must be finite.")
+        requested = np.unique(keys(coordinates))
+        found = np.zeros(len(requested), dtype=bool)
+
     for start in range(0, data.shape[0], 100_000):
         block = data[start:start + 100_000]
+
+        # Preserve existing source-data validation.
         if not np.isfinite(block).all():
             raise ValueError("Surface-flux data contain NaN or infinity.")
         if np.any((block[:, :3] < -1.0e-6) | (block[:, :3] > 1.0 + 1.0e-6)):
@@ -69,6 +85,20 @@ def read_surface_fluxes(config: SurfaceFluxConfig) -> SurfaceFluxData:
         if np.any(block[:, 3] < 0.0):
             raise ValueError("Surface friction velocity must be nonnegative.")
 
+        if requested is not None:
+            block_keys = keys(block[:, :3])
+            positions = np.searchsorted(requested, block_keys)
+            matches = positions < len(requested)
+            matches[matches] = (requested[positions[matches]] == block_keys[matches])
+            if matches.any():
+                selected.append(block[matches])  # Copies matching rows only.
+                found[positions[matches]] = True
+
+    if requested is not None:
+        if not found.all():
+            raise ValueError("No exact surface-flux (x,y,t) match; "
+                "check coverage and shared normalization.")
+        data = np.concatenate(selected)
     return SurfaceFluxData(coordinates=data[:, :3], fric_vel=data[:, 3:4], ht_flux=data[:, 4:5])
 
 def read_wall_surface_geometry(config: WallSurfaceConfig) -> WallSurfaceGeometry:

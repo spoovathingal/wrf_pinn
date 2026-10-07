@@ -187,8 +187,10 @@ class _PreparedData:
                 if not torch.any(bottom_mask):
                     raise ValueError("No z=0 bottom-boundary points were supplied.")
 
-                lookup = SurfaceFluxLookup.from_data(read_surface_fluxes(wall.fluxes))
-                fric_vel, ht_flux = lookup.match(wall_coordinates[bottom_mask])
+                bottom_coordinates = wall_coordinates[bottom_mask]
+                flux_data = read_surface_fluxes(wall.fluxes, coordinates=bottom_coordinates.detach().cpu().numpy()[:, (0, 1, 3)])
+                lookup = SurfaceFluxLookup.from_data(flux_data)
+                fric_vel, ht_flux = lookup.match(bottom_coordinates)
 
                 # Nonbottom zeros are placeholders; surface losses exclude them.
                 prepared.fric_vel = torch.zeros_like(wall_coordinates[:, :1])
