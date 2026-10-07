@@ -97,53 +97,36 @@ def read_conditional_case(npz_path: str | Path) -> ConditionalCase:
     return ConditionalCase(name=path.stem, **members)
 
 
-@dataclass
-class PODBasis:
-    """Per-variable POD modes for decoding z back to physical state fields.
+def decode_boundary(blob) -> dict:
+    """Reconstruct the boundary state from a case's per-face POD pieces.
 
-    means/modes are dicts keyed by state variable; each field (initial, boundary)
-    has its own set. z for a field is the per-variable coeffs concatenated in
-    STATE_VARS order.
-    """
+    Returns {var: (n_faces, n_times, face_len)} in normalized units. blob is an
+    np.load handle (or dict) of a case .npz written by the preprocessor."""
+    out = {}
+    face = 0
+    nf = sum(1 for k in blob.files if k.startswith(f"bnd_modes_{STATE_VARS[0]}_"))
+    for var in STATE_VARS:
+        faces = []
+        for f in range(nf):
+            mean = blob[f"bnd_mean_{var}_{f}"]       # (face_len,)
+            modes = blob[f"bnd_modes_{var}_{f}"]     # (face_len, k)
+            coeffs = blob[f"bnd_coeffs_{var}_{f}"]   # (n_times, k)
+            faces.append(mean + coeffs @ modes.T)    # (n_times, face_len)
+        out[var] = np.stack(faces, axis=0)           # (n_faces, n_times, face_len)
+    return out
 
-    initial: dict               # {"means": {var: (n,)}, "modes": {var: (n, k)}}
-    boundary: dict
 
-    @classmethod
-    def load(cls, path: str | Path) -> "PODBasis":
-        with np.load(Path(path)) as b:
-            fields = {}
-            for field in ("initial", "boundary"):
-                fields[field] = {
-                    "means": {v: b[f"{field}_mean_{v}"] for v in STATE_VARS},
-                    "modes": {v: b[f"{field}_modes_{v}"] for v in STATE_VARS},
-                }
-        return cls(initial=fields["initial"], boundary=fields["boundary"])
+def decode_initial(blob) -> dict:
+    """Reconstruct the initial state from a case's spatial POD pieces.
 
-    def as_torch(self, *, device=None):
-        import torch
-        t = lambda a: torch.as_tensor(a, dtype=torch.float32, device=device)
-        conv = lambda f: {"means": {v: t(f["means"][v]) for v in STATE_VARS},
-                          "modes": {v: t(f["modes"][v]) for v in STATE_VARS}}
-        return PODBasis(initial=conv(self.initial), boundary=conv(self.boundary))
-
-    @staticmethod
-    def _decode(z, basis):
-        """Split z per variable, decode each column, stack to (n_points, n_state)."""
-        import torch
-        cols, i = [], 0
-        for var in STATE_VARS:
-            V = basis["modes"][var]
-            k = V.shape[1]
-            cols.append(basis["means"][var] + V @ z[i:i + k])
-            i += k
-        return torch.stack(cols, dim=1)
-
-    def decode_initial(self, z):
-        return self._decode(z, self.initial)
-
-    def decode_boundary(self, z):
-        return self._decode(z, self.boundary)
+    Returns {var: (nz, nx*ny)} in normalized units (z-levels x horizontal)."""
+    out = {}
+    for var in STATE_VARS:
+        mean = blob[f"ini_mean_{var}"]               # (nx*ny,)
+        modes = blob[f"ini_modes_{var}"]             # (nx*ny, k)
+        coeffs = blob[f"ini_coeffs_{var}"]           # (nz, k)
+        out[var] = mean + coeffs @ modes.T           # (nz, nx*ny)
+    return out
 
 
 @dataclass(frozen=True)
