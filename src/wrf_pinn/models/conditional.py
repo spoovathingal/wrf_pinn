@@ -16,7 +16,6 @@ from wrf_pinn.config.physics import DEFAULT_PHYSICS
 @dataclass(frozen=True)
 class ConditionalModelConfig:
     coord_dim: int = 4
-    # full physics state (6 vars); first 4 are supervised, rest physics-only
     state_dim: int = DEFAULT_PHYSICS.state_dim
     hidden_width: int = 128
     hidden_layers: int = 4

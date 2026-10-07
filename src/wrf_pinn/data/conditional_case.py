@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 
 #: Variables carried in the conditioning fields and predicted by the model.
-STATE_VARS: tuple[str, ...] = ("u", "v", "w", "theta")
+STATE_VARS: tuple[str, ...] = ("u", "v", "w", "theta", "p_prime", "q_v", "e_sgs")
 #: Interior sample coordinate columns.
 COORD_NAMES: tuple[str, ...] = ("x", "y", "z", "t")
 #: The four open side faces of a sub-domain, in a fixed order.
@@ -25,10 +25,12 @@ class ConditionalCase:
     torch arrays."""
 
     name: str
+    z: object                   # (k,): concatenated POD coeffs; the conditioning latent
     initial_coords: object      # (n_ic, n_coord): where to enforce the initial field
-    z_initial: object           # (k_i,): POD coeffs of the initial state
-    z_boundary: object          # (k_b,): POD coeffs of the boundary state
+    initial: object             # (n_state, nz, nx*ny): decoded initial field
+    boundary: object            # (n_state, n_faces, n_times, face_len): decoded boundary
     boundary_coords: object     # psi coords: (n_faces, n_times, face_len, n_coord)
+    surface: object             # (n_times, n_face_pts, 5): x,y,t,fricVel,htFlux (bottom)
     terrain: object             # (n_terr, 3): x, y, elevation (static)
     interior: object            # (n_pts, n_coord): query coords, tau > 0
     targets: object             # (n_pts, n_state): matched interior state
@@ -53,10 +55,12 @@ class ConditionalCase:
 
         return ConditionalCase(
             name=self.name,
+            z=t(self.z),
             initial_coords=t(self.initial_coords),
-            z_initial=t(self.z_initial),
-            z_boundary=t(self.z_boundary),
+            initial=t(self.initial),
+            boundary=t(self.boundary),
             boundary_coords=t(self.boundary_coords),
+            surface=t(self.surface),
             terrain=t(self.terrain),
             interior=t(self.interior),
             targets=t(self.targets),
@@ -68,15 +72,16 @@ class ConditionalCase:
         )
 
 
-#: Case members written by the generator and read back here.
+#: Non-POD members written by the generator and read back directly. The initial
+#: and boundary fields are reconstructed from their per-subdomain POD pieces.
 _CASE_MEMBERS: tuple[str, ...] = (
-    "initial_coords", "z_initial", "z_boundary", "boundary_coords", "terrain",
-    "interior", "targets", "target_mask", "times",
+    "initial_coords", "boundary_coords", "surface", "terrain", "interior",
+    "targets", "times",
 )
 
 
 def read_conditional_case(npz_path: str | Path) -> ConditionalCase:
-    """Load one POD-encoded .npz case; validate members, mask NaN targets."""
+    """Load one POD-encoded .npz case; decode initial/boundary, mask NaN targets."""
     path = Path(npz_path)
     if not path.exists():
         raise FileNotFoundError(f"Conditional case not found: {path}.")
@@ -86,6 +91,12 @@ def read_conditional_case(npz_path: str | Path) -> ConditionalCase:
         if missing:
             raise ValueError(f"Case {path} missing members: {missing}.")
         members = {k: blob[k].astype(np.float32) for k in _CASE_MEMBERS}
+        bnd = decode_boundary(blob)
+        ini = decode_initial(blob)
+        members["z"] = latent_vector(blob)
+
+    members["boundary"] = np.stack([bnd[v] for v in STATE_VARS], axis=0).astype(np.float32)
+    members["initial"] = np.stack([ini[v] for v in STATE_VARS], axis=0).astype(np.float32)
 
     if not np.isfinite(members["interior"]).all():
         raise ValueError(f"Non-finite interior coordinates in {path}.")
@@ -127,6 +138,19 @@ def decode_initial(blob) -> dict:
         coeffs = blob[f"ini_coeffs_{var}"]           # (nz, k)
         out[var] = mean + coeffs @ modes.T           # (nz, nx*ny)
     return out
+
+
+def latent_vector(blob) -> np.ndarray:
+    """Concatenate the case's POD coeffs into the conditioning latent z. Order is
+    fixed (boundary faces then initial, by STATE_VARS) so z is consistent across cases."""
+    nf = sum(1 for k in blob.files if k.startswith(f"bnd_modes_{STATE_VARS[0]}_"))
+    parts = []
+    for var in STATE_VARS:
+        for f in range(nf):
+            parts.append(blob[f"bnd_coeffs_{var}_{f}"].reshape(-1))
+    for var in STATE_VARS:
+        parts.append(blob[f"ini_coeffs_{var}"].reshape(-1))
+    return np.concatenate(parts).astype(np.float32)
 
 
 @dataclass(frozen=True)

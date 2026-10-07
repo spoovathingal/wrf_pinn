@@ -9,7 +9,7 @@ import torch
 from torch import nn
 
 from wrf_pinn.data.conditional_case import (
-    ConditionalCase, PODBasis, COORD_NAMES, STATE_VARS,
+    ConditionalCase, COORD_NAMES, STATE_VARS,
 )
 from wrf_pinn.config.physics import DEFAULT_PHYSICS
 from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING, ResidualScalingConfig
@@ -59,44 +59,54 @@ def _resolve_device(name: str) -> torch.device:
     return torch.device(name)
 
 
-def _case_losses(model: nn.Module, case: ConditionalCase, pod: PODBasis,
-                 cfg: "ConditionalTrainConfig") -> dict[str, torch.Tensor]:
-    """The five losses for one case. Supervised terms use the first 4 output
-    columns (u,v,w,theta); physics residuals use the full 6-var state. The
-    initial/boundary targets are DECODED from the case's POD coeffs."""
-    n_coord = len(COORD_NAMES)
-    n_obs = len(STATE_VARS)                      # 4 supervised vars
-    z = torch.cat([case.z_initial, case.z_boundary]).unsqueeze(0)   # (1, k_i+k_b)
+def _initial_targets(case: ConditionalCase) -> torch.Tensor:
+    """Flatten the decoded initial field to (n_ic, n_state), matching initial_coords."""
+    fields = [case.initial[v].transpose(0, 1).reshape(-1) for v in range(case.initial.shape[0])]
+    return torch.stack(fields, dim=1)
 
-    # --- supervised: data, initial, flow boundary (first 4 output columns) ---
+
+def _boundary_targets(case: ConditionalCase) -> torch.Tensor:
+    """Flatten the decoded boundary field to (n_points, n_state), matching boundary_coords."""
+    ns = case.boundary.shape[0]
+    return torch.stack([case.boundary[v].reshape(-1) for v in range(ns)], dim=1)
+
+
+def _case_losses(model: nn.Module, case: ConditionalCase,
+                 cfg: "ConditionalTrainConfig") -> dict[str, torch.Tensor]:
+    """The five losses for one case; the model conditions on the case's latent z."""
+    n_coord = len(COORD_NAMES)
+    n_obs = len(STATE_VARS)
+    z = case.z.unsqueeze(0)
+
     pred = model(case.interior, z)[:, :n_obs]
     err = (pred - case.targets) * case.target_mask
     data = err.square().sum() / case.target_mask.sum().clamp_min(1.0)
 
-    # initial/boundary targets are the POD reconstruction, not a stored raw field
-    ic_state = pod.decode_initial(case.z_initial)
-    initial = (model(case.initial_coords, z)[:, :n_obs] - ic_state).square().mean()
+    initial = (model(case.initial_coords, z)[:, :n_obs] - _initial_targets(case)).square().mean()
 
     bc_coords = case.boundary_coords.reshape(-1, n_coord)
-    bc_state = pod.decode_boundary(case.z_boundary)
-    flow = (model(bc_coords, z)[:, :n_obs] - bc_state).square().mean()
+    flow = (model(bc_coords, z)[:, :n_obs] - _boundary_targets(case)).square().mean()
 
-    # residuals need physical units; identity scaling if none supplied
     scaling = cfg.scaling if cfg.scaling is not None else DEFAULT_RESIDUAL_SCALING
+    zero = torch.zeros((), device=case.interior.device, dtype=case.interior.dtype)
 
-    # --- physics: PDE residual at collocation points inside the sub-domain ---
-    coll = _sample_box(case.interior, cfg.n_collocation).requires_grad_(True)
-    coll_state = model(coll, z)
-    pde_res = cartesian_zero_forcing_residuals(
-        coll, coll_state, physics=DEFAULT_PHYSICS, scaling=scaling)
-    pde = torch.stack([r.square().mean() for r in pde_res.values()]).mean()
+    if cfg.weight_pde != 0.0:
+        coll = _sample_box(case.interior, cfg.n_collocation).requires_grad_(True)
+        coll_state = model(coll, z)
+        pde_res = cartesian_zero_forcing_residuals(
+            coll, coll_state, physics=DEFAULT_PHYSICS, scaling=scaling)
+        pde = torch.stack([r.square().mean() for r in pde_res.values()]).mean()
+    else:
+        pde = zero
 
-    # --- physics: surface (no-slip wall) at the sub-domain's bottom face ---
-    wall = _sample_box(case.interior, cfg.n_wall)
-    wall = wall.clone(); wall[:, 2] = case.interior[:, 2].min()   # z -> domain floor
-    wall_state = model(wall, z)
-    wall_res = no_slip_wall_residuals(wall_state, scaling=scaling)
-    surface = torch.stack([r.square().mean() for r in wall_res.values()]).mean()
+    if cfg.weight_surface != 0.0:
+        wall = _sample_box(case.interior, cfg.n_wall)
+        wall = wall.clone(); wall[:, 2] = case.interior[:, 2].min()   # z -> domain floor
+        wall_state = model(wall, z)
+        wall_res = no_slip_wall_residuals(wall_state, scaling=scaling)
+        surface = torch.stack([r.square().mean() for r in wall_res.values()]).mean()
+    else:
+        surface = zero
 
     return {"data": data, "initial": initial, "flow_boundary": flow,
             "pde": pde, "surface": surface}
@@ -115,18 +125,15 @@ def _sample_box(interior: torch.Tensor, n: int) -> torch.Tensor:
 def train_conditional(
     model: nn.Module,
     cases: list[ConditionalCase],
-    pod: PODBasis,
     config: ConditionalTrainConfig = ConditionalTrainConfig(),
 ) -> ConditionalHistory:
-    """Train the shared model across ``cases`` using ``pod`` to decode the
-    initial/boundary targets; return the loss history."""
+    """Train the shared model across ``cases``; return the loss history."""
     if not cases:
         raise ValueError("train_conditional needs at least one case.")
 
     device = _resolve_device(config.device)
     model.to(device)
     cases = [c.as_torch(device=device) for c in cases]
-    pod = pod.as_torch(device=device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     rng = torch.Generator().manual_seed(config.seed)
@@ -142,7 +149,7 @@ def train_conditional(
         optimizer.zero_grad()
         batch = {name: torch.zeros((), device=device) for name in weights}
         for i in idx:
-            for name, value in _case_losses(model, cases[i], pod, config).items():
+            for name, value in _case_losses(model, cases[i], config).items():
                 batch[name] = batch[name] + value
         for name in batch:
             batch[name] = batch[name] / k
