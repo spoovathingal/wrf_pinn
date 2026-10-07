@@ -7,7 +7,7 @@ later by combining this surface geometry with a training-time sampler.
 """
 
 from __future__ import annotations
-
+import math
 from dataclasses import dataclass
 from typing import Literal
 
@@ -35,6 +35,11 @@ class WallSurfaceConfig:
                 f"columns; got {self.coordinate_columns}."
             )
 
+@dataclass(frozen=True)
+class SurfaceFluxConfig:
+    """Surface-flux .npy columns: normalized x,y,t; physical fricVel,htFlux."""
+
+    path: str = ""
 
 @dataclass(frozen=True)
 class NoSlipWallConfig:
@@ -48,10 +53,18 @@ class NoSlipWallConfig:
     surface: WallSurfaceConfig = WallSurfaceConfig()
     velocity_components: tuple[str, ...] = ("u", "v", "w")
     condition: WallCondition = "no_slip"
+    fluxes: SurfaceFluxConfig = SurfaceFluxConfig()
+    surface_stress_scale: float = 3.8273
+    surface_heat_flux_scale: float = 1.0
 
     def __post_init__(self) -> None:
         if not self.velocity_components:
             raise ValueError("No-slip wall requires at least one velocity component.")
+        
+        for name in ("surface_stress_scale", "surface_heat_flux_scale"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive.")
 
 
 @dataclass(frozen=True)

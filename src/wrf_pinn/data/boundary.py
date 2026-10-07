@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from wrf_pinn.config.boundary_data import WallSurfaceConfig
+from wrf_pinn.config.boundary_data import SurfaceFluxConfig, WallSurfaceConfig
 
 
 @dataclass(frozen=True)
@@ -32,6 +32,44 @@ class WallSurfaceGeometry:
         tensor_dtype = dtype if dtype is not None else torch.float32
         return torch.as_tensor(self.coordinates, dtype=tensor_dtype, device=device)
 
+@dataclass(frozen=True)
+class SurfaceFluxData:
+    """Normalized x,y,t coordinates and physical surface-flux values."""
+    coordinates: np.ndarray
+    fric_vel: np.ndarray
+    ht_flux: np.ndarray
+
+def read_surface_fluxes(config: SurfaceFluxConfig) -> SurfaceFluxData:
+    """Read .npy rows ordered x,y,t,fricVel,htFlux without normalizing them."""
+
+    if not config.path:
+        raise ValueError("No surface-flux path is configured.")
+
+    path = Path(config.path)
+    if path.suffix.lower() != ".npy":
+        raise ValueError("Surface-flux data must be a .npy file.")
+    if not path.is_file():
+        raise FileNotFoundError(f"Surface-flux file not found: {path}.")
+
+    data = np.load(path, mmap_mode="r", allow_pickle=False)
+    if not isinstance(data, np.ndarray) or data.ndim != 2 or data.shape[1] != 5:
+        raise ValueError("Surface-flux data must have shape (N, 5).")
+    if data.shape[0] == 0:
+        raise ValueError("Surface-flux data must contain at least one row.")
+    if data.dtype.kind != "f" or data.dtype.itemsize not in (4, 8):
+        raise ValueError("Surface-flux data must use float32 or float64.")
+
+    # Validate in chunks to avoid a large temporary array.
+    for start in range(0, data.shape[0], 100_000):
+        block = data[start:start + 100_000]
+        if not np.isfinite(block).all():
+            raise ValueError("Surface-flux data contain NaN or infinity.")
+        if np.any((block[:, :3] < -1.0e-6) | (block[:, :3] > 1.0 + 1.0e-6)):
+            raise ValueError("Surface-flux x,y,t must use global [0, 1] normalization.")
+        if np.any(block[:, 3] < 0.0):
+            raise ValueError("Surface friction velocity must be nonnegative.")
+
+    return SurfaceFluxData(coordinates=data[:, :3], fric_vel=data[:, 3:4], ht_flux=data[:, 4:5])
 
 def read_wall_surface_geometry(config: WallSurfaceConfig) -> WallSurfaceGeometry:
     """Read no-slip wall surface geometry from the configured source."""
