@@ -14,7 +14,7 @@ from wrf_pinn.data.conditional_case import (
 from wrf_pinn.config.physics import DEFAULT_PHYSICS
 from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING, ResidualScalingConfig
 from wrf_pinn.physics.residuals_pde import cartesian_zero_forcing_residuals
-from wrf_pinn.physics.residuals_boundary import no_slip_wall_residuals
+from wrf_pinn.physics.residuals_boundary import no_penetration_z_wall_residuals
 
 #: the five losses of the conditional PINN, in order.
 LOSS_NAMES: tuple[str, ...] = ("data", "initial", "flow_boundary", "pde", "surface")
@@ -48,6 +48,12 @@ class ConditionalTrainConfig:
     #: affine scaling (physical = offset + scale*normalized) for the residuals,
     #: built from the pre-processor's normalization recipe. Identity if None.
     scaling: "ResidualScalingConfig | None" = None
+    #: flux (fricVel, htFlux) offset/scale from the recipe, to un-normalize
+    #: case.surface back to physical for the surface-layer residual.
+    flux_offset: tuple[float, float] = (0.0, 0.0)
+    flux_scale: tuple[float, float] = (1.0, 1.0)
+    surface_stress_scale: float = 3.8273
+    surface_heat_flux_scale: float = 1.0
     log_every: int = 100
     device: str = "auto"
     seed: int = 0
@@ -69,6 +75,40 @@ def _boundary_targets(case: ConditionalCase) -> torch.Tensor:
     """Flatten the decoded boundary field to (n_points, n_state), matching boundary_coords."""
     ns = case.boundary.shape[0]
     return torch.stack([case.boundary[v].reshape(-1) for v in range(ns)], dim=1)
+
+
+def _surface_loss(model, case, z, cfg, scaling) -> torch.Tensor:
+    """Surface-layer residual on the case's bottom face, using its stored fluxes.
+
+    Wall coords come from case.surface (x,y,t normalized; z at the floor); fluxes
+    are un-normalized to physical and fed to the no-penetration-z residual, which
+    builds its own z1 reference pair."""
+    surf = case.surface.reshape(-1, case.surface.shape[-1])          # (N, 5)
+    dev, dt = surf.device, surf.dtype
+    z_floor = (0.0 - scaling.z.offset) / scaling.z.scale
+    wall = torch.stack([surf[:, 0], surf[:, 1],
+                        torch.full((surf.shape[0],), z_floor, device=dev, dtype=dt),
+                        surf[:, 2]], dim=1).requires_grad_(True)
+    wall_state = model(wall, z)
+
+    reference = wall.detach().clone()
+    z1 = (DEFAULT_PHYSICS.constants.surface_reference_height - scaling.z.offset) / scaling.z.scale
+    reference[:, 2] = z1
+    reference_state = model(reference, z)
+
+    f_off = torch.tensor(cfg.flux_offset, device=dev, dtype=dt)
+    f_scale = torch.tensor(cfg.flux_scale, device=dev, dtype=dt)
+    phys = surf[:, 3:] * f_scale + f_off                             # un-normalize fluxes
+    fric_vel, ht_flux = phys[:, 0:1], phys[:, 1:2]
+
+    res = no_penetration_z_wall_residuals(
+        coordinates=wall, state=wall_state,
+        reference_coordinates=reference, reference_state=reference_state,
+        physics=DEFAULT_PHYSICS, scaling=scaling,
+        fric_vel=fric_vel, ht_flux=ht_flux,
+        surface_stress_scale=cfg.surface_stress_scale,
+        surface_heat_flux_scale=cfg.surface_heat_flux_scale)
+    return torch.stack([r.square().mean() for r in res.values()]).mean()
 
 
 def _case_losses(model: nn.Module, case: ConditionalCase,
@@ -100,11 +140,7 @@ def _case_losses(model: nn.Module, case: ConditionalCase,
         pde = zero
 
     if cfg.weight_surface != 0.0:
-        wall = _sample_box(case.interior, cfg.n_wall)
-        wall = wall.clone(); wall[:, 2] = case.interior[:, 2].min()   # z -> domain floor
-        wall_state = model(wall, z)
-        wall_res = no_slip_wall_residuals(wall_state, scaling=scaling)
-        surface = torch.stack([r.square().mean() for r in wall_res.values()]).mean()
+        surface = _surface_loss(model, case, z, cfg, scaling)
     else:
         surface = zero
 
