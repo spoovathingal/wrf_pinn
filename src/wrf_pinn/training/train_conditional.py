@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import sys
+import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -57,6 +59,12 @@ class ConditionalTrainConfig:
     log_every: int = 100
     device: str = "auto"
     seed: int = 0
+    #: write a resumable checkpoint here every ``checkpoint_every`` epochs; resume
+    #: from it on start if it exists. None disables checkpointing.
+    checkpoint_path: "str | None" = None
+    checkpoint_every: int = 100
+    #: when True, time forward/backward/step per epoch (CUDA-synced) for profiling.
+    profile: bool = False
 
 
 def _resolve_device(name: str) -> torch.device:
@@ -178,10 +186,18 @@ def train_conditional(
                "flow_boundary": config.weight_flow_boundary,
                "pde": config.weight_pde, "surface": config.weight_surface}
 
-    for epoch in range(1, config.epochs + 1):
+    start_epoch = _maybe_resume(model, optimizer, history, config, device)
+
+    prof = {"fwd": 0.0, "bwd": 0.0, "step": 0.0} if config.profile else None
+    cuda = device.type == "cuda"
+
+    for epoch in range(start_epoch, config.epochs + 1):
         k = min(config.batch_cases, len(cases))
         idx = torch.randperm(len(cases), generator=rng)[:k].tolist()
 
+        if prof is not None and cuda:
+            torch.cuda.synchronize()
+        t = time.perf_counter()
         optimizer.zero_grad()
         batch = {name: torch.zeros((), device=device) for name in weights}
         for i in idx:
@@ -193,11 +209,23 @@ def train_conditional(
 
         if not torch.isfinite(total):
             raise FloatingPointError(f"Non-finite loss at epoch {epoch}.")
+        if prof is not None:
+            if cuda:
+                torch.cuda.synchronize()
+            prof["fwd"] += time.perf_counter() - t; t = time.perf_counter()
         total.backward()
         # Clip gradients: PDE residual gradients (2nd derivatives via autograd) can
         # spike and freeze training. Standard PINN safeguard.
         torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
+        if prof is not None:
+            if cuda:
+                torch.cuda.synchronize()
+            prof["bwd"] += time.perf_counter() - t; t = time.perf_counter()
         optimizer.step()
+        if prof is not None:
+            if cuda:
+                torch.cuda.synchronize()
+            prof["step"] += time.perf_counter() - t
 
         history.total.append(float(total.detach().cpu()))
         for name in weights:
@@ -209,6 +237,44 @@ def train_conditional(
             print(f"epoch {epoch}/{config.epochs} "
                   f"total={float(total.detach()):.4e} {parts}",
                   file=sys.stderr, flush=True)
+            if prof is not None:
+                tot = sum(prof.values()) or 1.0
+                print(f"  profile/epoch(avg over {epoch}): "
+                      f"fwd={prof['fwd']/epoch*1e3:.1f}ms ({prof['fwd']/tot*100:.0f}%) "
+                      f"bwd={prof['bwd']/epoch*1e3:.1f}ms ({prof['bwd']/tot*100:.0f}%) "
+                      f"step={prof['step']/epoch*1e3:.1f}ms ({prof['step']/tot*100:.0f}%)",
+                      file=sys.stderr, flush=True)
+
+        if config.checkpoint_path and (epoch % config.checkpoint_every == 0
+                                       or epoch == config.epochs):
+            _save_checkpoint(model, optimizer, history, epoch, config)
+
+    return history
+
+
+def _save_checkpoint(model, optimizer, history, epoch, config) -> None:
+    """Atomically write a resumable checkpoint (model, optimizer, epoch, history)."""
+    path = Path(config.checkpoint_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save({"epoch": epoch, "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(), "history": vars(history)}, tmp)
+    tmp.replace(path)
+    print(f"checkpoint @ epoch {epoch} -> {path}", file=sys.stderr, flush=True)
+
+
+def _maybe_resume(model, optimizer, history, config, device) -> int:
+    """Load a checkpoint if present; return the epoch to start from (1 if none)."""
+    if not config.checkpoint_path or not Path(config.checkpoint_path).is_file():
+        return 1
+    ckpt = torch.load(config.checkpoint_path, map_location=device)
+    model.load_state_dict(ckpt["model"])
+    optimizer.load_state_dict(ckpt["optimizer"])
+    for name, vals in ckpt["history"].items():
+        getattr(history, name).extend(vals)
+    print(f"resumed from {config.checkpoint_path} at epoch {ckpt['epoch']}",
+          file=sys.stderr, flush=True)
+    return ckpt["epoch"] + 1
 
     return history
 

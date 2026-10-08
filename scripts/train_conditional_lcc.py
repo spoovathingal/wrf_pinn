@@ -46,6 +46,8 @@ def main() -> int:
     ap.add_argument("--batch-cases", type=int, default=4)
     ap.add_argument("--device", default="auto")
     ap.add_argument("--log-every", type=int, default=50)
+    ap.add_argument("--profile", action="store_true",
+                    help="time fwd/bwd/step per epoch (CUDA-synced)")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
@@ -69,7 +71,7 @@ def main() -> int:
     cfg = ConditionalTrainConfig(
         epochs=args.epochs, batch_cases=args.batch_cases, device=args.device,
         log_every=args.log_every, scaling=scaling,
-        flux_offset=f_off, flux_scale=f_scale,
+        flux_offset=f_off, flux_scale=f_scale, profile=args.profile,
     )
     log.info("training: epochs=%d batch_cases=%d device=%s", cfg.epochs, cfg.batch_cases, cfg.device)
     hist = train_conditional(model, cases, cfg)
