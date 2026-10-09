@@ -11,7 +11,7 @@ import torch
 from torch import nn
 
 from wrf_pinn.data.conditional_case import (
-    ConditionalCase, COORD_NAMES, STATE_VARS,
+    ConditionalCase, COORD_NAMES, STATE_VARS, read_conditional_case,
 )
 from wrf_pinn.config.physics import DEFAULT_PHYSICS
 from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING, ResidualScalingConfig
@@ -168,16 +168,30 @@ def _sample_box(interior: torch.Tensor, n: int) -> torch.Tensor:
 
 def train_conditional(
     model: nn.Module,
-    cases: list[ConditionalCase],
+    cases: "list[ConditionalCase] | None" = None,
     config: ConditionalTrainConfig = ConditionalTrainConfig(),
+    *,
+    case_paths: "list[str | Path] | None" = None,
 ) -> ConditionalHistory:
-    """Train the shared model across ``cases``; return the loss history."""
-    if not cases:
-        raise ValueError("train_conditional needs at least one case.")
+    """Train the shared model and return the loss history.
+
+    Pass resident ``cases`` (small sets), or ``case_paths`` to lazily load each
+    batch's cases from disk per step so the full set need not fit in RAM."""
+    if not cases and not case_paths:
+        raise ValueError("train_conditional needs cases or case_paths.")
 
     device = _resolve_device(config.device)
     model.to(device)
-    cases = [c.as_torch(device=device) for c in cases]
+    # Resident cases live in HOST memory; only the per-step batch is moved to the
+    # GPU (below), so the full set fits in RAM without exhausting GPU memory.
+    if cases is not None:
+        cases = [c.as_torch(device="cpu") for c in cases]
+    n_cases = len(case_paths) if case_paths else len(cases)
+
+    def get_case(i: int) -> ConditionalCase:
+        if case_paths is not None:
+            return read_conditional_case(case_paths[i]).as_torch(device=device)
+        return cases[i].as_torch(device=device)   # host -> GPU for this step only
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     rng = torch.Generator().manual_seed(config.seed)
@@ -192,8 +206,8 @@ def train_conditional(
     cuda = device.type == "cuda"
 
     for epoch in range(start_epoch, config.epochs + 1):
-        k = min(config.batch_cases, len(cases))
-        idx = torch.randperm(len(cases), generator=rng)[:k].tolist()
+        k = min(config.batch_cases, n_cases)
+        idx = torch.randperm(n_cases, generator=rng)[:k].tolist()
 
         if prof is not None and cuda:
             torch.cuda.synchronize()
@@ -201,7 +215,7 @@ def train_conditional(
         optimizer.zero_grad()
         batch = {name: torch.zeros((), device=device) for name in weights}
         for i in idx:
-            for name, value in _case_losses(model, cases[i], config).items():
+            for name, value in _case_losses(model, get_case(i), config).items():
                 batch[name] = batch[name] + value
         for name in batch:
             batch[name] = batch[name] / k

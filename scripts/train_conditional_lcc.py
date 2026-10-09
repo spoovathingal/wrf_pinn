@@ -46,6 +46,10 @@ def main() -> int:
     ap.add_argument("--batch-cases", type=int, default=4)
     ap.add_argument("--device", default="auto")
     ap.add_argument("--log-every", type=int, default=50)
+    ap.add_argument("--lazy", action="store_true",
+                    help="load each batch's cases from disk per step (low RAM, full 39k)")
+    ap.add_argument("--checkpoint", default=None, help="resumable checkpoint path")
+    ap.add_argument("--checkpoint-every", type=int, default=100)
     ap.add_argument("--profile", action="store_true",
                     help="time fwd/bwd/step per epoch (CUDA-synced)")
     args = ap.parse_args()
@@ -61,20 +65,26 @@ def main() -> int:
     paths = sorted(glob.glob(str(args.cases_dir / "train" / "*.npz")))
     if args.n_cases:
         paths = paths[:args.n_cases]
-    log.info("loading %d cases from %s", len(paths), args.cases_dir / "train")
-    t0 = time.time()
-    cases = [read_conditional_case(p) for p in paths]
-    log.info("loaded %d cases in %.0fs; latent z dim=%d",
-             len(cases), time.time() - t0, cases[0].z.shape[0])
+    z_dim = read_conditional_case(paths[0]).z.shape[0]
+    log.info("%d train cases in %s; latent z dim=%d; mode=%s",
+             len(paths), args.cases_dir / "train", z_dim,
+             "lazy" if args.lazy else "resident")
 
-    model = ConditionalModel(cases[0].z.shape[0], ConditionalModelConfig())
+    model = ConditionalModel(z_dim, ConditionalModelConfig())
     cfg = ConditionalTrainConfig(
         epochs=args.epochs, batch_cases=args.batch_cases, device=args.device,
         log_every=args.log_every, scaling=scaling,
         flux_offset=f_off, flux_scale=f_scale, profile=args.profile,
+        checkpoint_path=args.checkpoint, checkpoint_every=args.checkpoint_every,
     )
     log.info("training: epochs=%d batch_cases=%d device=%s", cfg.epochs, cfg.batch_cases, cfg.device)
-    hist = train_conditional(model, cases, cfg)
+    if args.lazy:
+        hist = train_conditional(model, config=cfg, case_paths=paths)
+    else:
+        t0 = time.time()
+        cases = [read_conditional_case(p) for p in paths]
+        log.info("loaded %d cases resident in %.0fs", len(cases), time.time() - t0)
+        hist = train_conditional(model, cases, cfg)
     log.info("done. total loss: first=%.4e last=%.4e", hist.total[0], hist.total[-1])
     return 0
 
