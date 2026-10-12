@@ -67,6 +67,36 @@ def test_loss_decreases():
     assert hist.total[-1] < hist.total[0], "loss did not decrease"
 
 
+def test_checkpoint_save_and_resume(tmp_path):
+    """Checkpointing writes a file (creating its dir) and resume continues from it."""
+    cases = [_make_case(f"c{i}", i) for i in range(6)]
+    # nested path that does not exist yet: exercises _save_checkpoint's mkdir.
+    ckpt = tmp_path / "checkpoints" / "run.pt"
+
+    model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=16))
+    cfg = ConditionalTrainConfig(epochs=20, batch_cases=3, device="cpu", log_every=20,
+                                 checkpoint_path=str(ckpt), checkpoint_every=10, **_DATA_ONLY)
+    hist = train_conditional(model, cases, cfg)
+    assert ckpt.is_file(), "checkpoint file was not written"
+    assert len(hist.total) == 20
+
+    # the saved epoch must be the last multiple of checkpoint_every (or final epoch)
+    ck = torch.load(str(ckpt), map_location="cpu")
+    assert ck["epoch"] == 20
+
+    # resume into a FRESH model: weights load from the checkpoint, start epoch advances.
+    fresh = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=16))
+    before = [p.clone() for p in fresh.parameters()]
+    cfg2 = ConditionalTrainConfig(epochs=25, batch_cases=3, device="cpu", log_every=25,
+                                  checkpoint_path=str(ckpt), checkpoint_every=10, **_DATA_ONLY)
+    hist2 = train_conditional(fresh, cases, cfg2)
+    # resumed at epoch 21 and continued the saved history: 20 restored + 5 new = 25.
+    assert len(hist2.total) == 25, f"expected continuous history of 25, got {len(hist2.total)}"
+    # the fresh model's weights changed on load (they were restored from the checkpoint)
+    after = list(fresh.parameters())
+    assert any(not torch.equal(b, a) for b, a in zip(before, after)), "weights not restored on resume"
+
+
 def test_latent_conditions_output():
     """Changing z must change the prediction at fixed coordinates."""
     case = _make_case("c", 0).as_torch()
