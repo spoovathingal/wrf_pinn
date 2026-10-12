@@ -127,6 +127,10 @@ class PhysicsConfig:
     # Fixed hydrostatic base state for the current FastEddy case.
     hydrostatic_reference_potential_temperature: float = 300.0  # K
 
+    # Multiplier taking the data's q_v to kg/kg for the thermodynamics
+    # (1e-3 when the data is g/kg, as FastEddy writes it).
+    q_v_to_kg_per_kg: float = 1.0
+
     # Temporary uniform SGS filter width; replace with local cell-volume
     # scale when variable dz is implemented.
     uniform_filter_width: float = 15.0  # m

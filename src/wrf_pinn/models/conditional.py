@@ -45,8 +45,9 @@ class ConditionalModel(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, coordinates: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        """Predict state at coordinates; z (1, latent_dim) broadcasts to every point."""
+        """Predict state at coordinates. z is (1, latent_dim), broadcast to every
+        point, or (n_points, latent_dim) for a batch mixing several cases."""
         if z.shape[1] == 0:
             return self.net(coordinates)
-        z_rows = z.expand(coordinates.shape[0], -1)
+        z_rows = z if z.shape[0] == coordinates.shape[0] else z.expand(coordinates.shape[0], -1)
         return self.net(torch.cat([coordinates, z_rows], dim=1))

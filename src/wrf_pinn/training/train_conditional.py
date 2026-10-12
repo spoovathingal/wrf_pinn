@@ -4,16 +4,18 @@ from __future__ import annotations
 
 import sys
 import time
-from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from torch import nn
 
 from wrf_pinn.data.conditional_case import (
     ConditionalCase, COORD_NAMES, STATE_VARS, read_conditional_case,
 )
-from wrf_pinn.config.physics import DEFAULT_PHYSICS
+from wrf_pinn.config.physics import DEFAULT_PHYSICS, PhysicsConfig
 from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING, ResidualScalingConfig
 from wrf_pinn.physics.residuals_pde import cartesian_zero_forcing_residuals
 from wrf_pinn.physics.residuals_boundary import no_penetration_z_wall_residuals
@@ -37,7 +39,7 @@ class ConditionalHistory:
 @dataclass(frozen=True)
 class ConditionalTrainConfig:
     epochs: int = 2000
-    batch_cases: int = 4          # cases drawn per step
+    batch_cases: int = 4          # cases drawn per step (per process when distributed)
     learning_rate: float = 1e-3
     weight_data: float = 1.0
     weight_initial: float = 1.0
@@ -50,6 +52,8 @@ class ConditionalTrainConfig:
     #: affine scaling (physical = offset + scale*normalized) for the residuals,
     #: built from the pre-processor's normalization recipe. Identity if None.
     scaling: "ResidualScalingConfig | None" = None
+    #: physics for the residuals; carries the q_v unit conversion.
+    physics: PhysicsConfig = DEFAULT_PHYSICS
     #: flux (fricVel, htFlux) offset/scale from the recipe, to un-normalize
     #: case.surface back to physical for the surface-layer residual.
     flux_offset: tuple[float, float] = (0.0, 0.0)
@@ -59,8 +63,8 @@ class ConditionalTrainConfig:
     log_every: int = 100
     device: str = "auto"
     seed: int = 0
-    #: write a resumable checkpoint here every ``checkpoint_every`` epochs; resume
-    #: from it on start if it exists. None disables checkpointing.
+    #: write a resumable checkpoint here every ``checkpoint_every`` epochs (plus a
+    #: step-tagged copy); resume from it on start if it exists. None disables.
     checkpoint_path: "str | None" = None
     checkpoint_every: int = 100
     #: when True, time forward/backward/step per epoch (CUDA-synced) for profiling.
@@ -75,8 +79,8 @@ def _resolve_device(name: str) -> torch.device:
 
 def _initial_targets(case: ConditionalCase) -> torch.Tensor:
     """Flatten the decoded initial field to (n_ic, n_state), matching initial_coords."""
-    fields = [case.initial[v].transpose(0, 1).reshape(-1) for v in range(case.initial.shape[0])]
-    return torch.stack(fields, dim=1)
+    fields_ = [case.initial[v].transpose(0, 1).reshape(-1) for v in range(case.initial.shape[0])]
+    return torch.stack(fields_, dim=1)
 
 
 def _boundary_targets(case: ConditionalCase) -> torch.Tensor:
@@ -85,85 +89,164 @@ def _boundary_targets(case: ConditionalCase) -> torch.Tensor:
     return torch.stack([case.boundary[v].reshape(-1) for v in range(ns)], dim=1)
 
 
-def _surface_loss(model, case, z, cfg, scaling) -> torch.Tensor:
-    """Surface-layer residual on the case's bottom face, using its stored fluxes.
+@dataclass
+class CaseBatch:
+    """Several cases' points concatenated, so each loss is one forward pass. The
+    ``*_sizes`` give each case's point count, in case order."""
 
-    Wall coords come from case.surface (x,y,t normalized; z at the floor); fluxes
-    are un-normalized to physical and fed to the no-penetration-z residual, which
-    builds its own z1 reference pair."""
-    surf = case.surface.reshape(-1, case.surface.shape[-1])          # (N, 5)
+    z: torch.Tensor
+    interior: torch.Tensor
+    targets: torch.Tensor
+    target_mask: torch.Tensor
+    initial_coords: torch.Tensor
+    initial_targets: torch.Tensor
+    boundary_coords: torch.Tensor
+    boundary_targets: torch.Tensor
+    surface: torch.Tensor
+    box_lo: torch.Tensor          # (k, n_coord) interior bounding box, for collocation
+    box_hi: torch.Tensor
+    interior_sizes: torch.Tensor
+    initial_sizes: torch.Tensor
+    boundary_sizes: torch.Tensor
+    surface_sizes: torch.Tensor
+
+    @property
+    def k(self) -> int:
+        return self.z.shape[0]
+
+    def to(self, device: torch.device) -> "CaseBatch":
+        return CaseBatch(**{f.name: getattr(self, f.name).to(device, non_blocking=True)
+                            for f in fields(self)})
+
+    def pin(self) -> "CaseBatch":
+        return CaseBatch(**{f.name: getattr(self, f.name).pin_memory() for f in fields(self)})
+
+
+def stack_cases(cases: list[ConditionalCase]) -> CaseBatch:
+    """Concatenate torch cases (on one device) into a CaseBatch."""
+    n_coord = len(COORD_NAMES)
+    cat = lambda xs: torch.cat(xs, dim=0)
+    sizes = lambda xs: torch.tensor([x.shape[0] for x in xs], dtype=torch.long)
+    bc = [c.boundary_coords.reshape(-1, n_coord) for c in cases]
+    surf = [c.surface.reshape(-1, c.surface.shape[-1]) for c in cases]
+    return CaseBatch(
+        z=torch.stack([c.z for c in cases]),
+        interior=cat([c.interior for c in cases]),
+        targets=cat([c.targets for c in cases]),
+        target_mask=cat([c.target_mask for c in cases]),
+        initial_coords=cat([c.initial_coords for c in cases]),
+        initial_targets=cat([_initial_targets(c) for c in cases]),
+        boundary_coords=cat(bc),
+        boundary_targets=cat([_boundary_targets(c) for c in cases]),
+        surface=cat(surf),
+        box_lo=torch.stack([c.interior.min(dim=0).values for c in cases]),
+        box_hi=torch.stack([c.interior.max(dim=0).values for c in cases]),
+        interior_sizes=sizes([c.interior for c in cases]),
+        initial_sizes=sizes([c.initial_coords for c in cases]),
+        boundary_sizes=sizes(bc),
+        surface_sizes=sizes(surf),
+    )
+
+
+def _per_case_mean(values: torch.Tensor, sizes: torch.Tensor, k: int) -> torch.Tensor:
+    """Mean of per-point values within each case -> (k,)."""
+    seg = torch.repeat_interleave(torch.arange(k, device=values.device), sizes)
+    sums = torch.zeros(k, device=values.device, dtype=values.dtype).index_add_(0, seg, values)
+    return sums / sizes.to(values.dtype)
+
+
+def _surface_loss(model, b: CaseBatch, cfg, scaling) -> torch.Tensor:
+    """Surface-layer residual on each case's bottom face, using its stored fluxes.
+
+    Wall coords come from the surface rows (x,y,t normalized; z at the floor);
+    fluxes are un-normalized to physical for the no-penetration-z residual."""
+    surf = b.surface
     dev, dt = surf.device, surf.dtype
+    z_rows = torch.repeat_interleave(b.z, b.surface_sizes, dim=0)
     z_floor = (0.0 - scaling.z.offset) / scaling.z.scale
     wall = torch.stack([surf[:, 0], surf[:, 1],
                         torch.full((surf.shape[0],), z_floor, device=dev, dtype=dt),
                         surf[:, 2]], dim=1).requires_grad_(True)
-    wall_state = model(wall, z)
+    wall_state = model(wall, z_rows)
 
     reference = wall.detach().clone()
-    z1 = (DEFAULT_PHYSICS.constants.surface_reference_height - scaling.z.offset) / scaling.z.scale
+    z1 = (cfg.physics.constants.surface_reference_height - scaling.z.offset) / scaling.z.scale
     reference[:, 2] = z1
-    reference_state = model(reference, z)
+    reference_state = model(reference, z_rows)
 
     f_off = torch.tensor(cfg.flux_offset, device=dev, dtype=dt)
     f_scale = torch.tensor(cfg.flux_scale, device=dev, dtype=dt)
     phys = surf[:, 3:] * f_scale + f_off                             # un-normalize fluxes
-    fric_vel, ht_flux = phys[:, 0:1], phys[:, 1:2]
-
     res = no_penetration_z_wall_residuals(
         coordinates=wall, state=wall_state,
         reference_coordinates=reference, reference_state=reference_state,
-        physics=DEFAULT_PHYSICS, scaling=scaling,
-        fric_vel=fric_vel, ht_flux=ht_flux,
+        physics=cfg.physics, scaling=scaling,
+        fric_vel=phys[:, 0:1], ht_flux=phys[:, 1:2],
         surface_stress_scale=cfg.surface_stress_scale,
         surface_heat_flux_scale=cfg.surface_heat_flux_scale)
+    per_eq = torch.stack([_per_case_mean(r.square().reshape(-1), b.surface_sizes, b.k)
+                          for r in res.values()])                    # (n_eq, k)
+    return per_eq.mean(dim=0).mean()
+
+
+def _pde_loss(model, coll: torch.Tensor, z_rows: torch.Tensor, cfg, scaling) -> torch.Tensor:
+    """Mean squared PDE residual over equal-sized per-case collocation sets."""
+    coll = coll.requires_grad_(True)
+    res = cartesian_zero_forcing_residuals(coll, model(coll, z_rows),
+                                           physics=cfg.physics, scaling=scaling)
     return torch.stack([r.square().mean() for r in res.values()]).mean()
 
 
-def _case_losses(model: nn.Module, case: ConditionalCase,
-                 cfg: "ConditionalTrainConfig") -> dict[str, torch.Tensor]:
-    """The five losses for one case; the model conditions on the case's latent z."""
-    n_coord = len(COORD_NAMES)
+def _batch_losses(model: nn.Module, b: CaseBatch,
+                  cfg: "ConditionalTrainConfig") -> dict[str, torch.Tensor]:
+    """The five losses, each averaged over the batch's cases (one forward per loss)."""
     n_obs = len(STATE_VARS)
-    z = case.z.unsqueeze(0)
+    k = b.k
+    rows = lambda sizes: torch.repeat_interleave(b.z, sizes, dim=0)
 
-    pred = model(case.interior, z)[:, :n_obs]
-    err = (pred - case.targets) * case.target_mask
-    data = err.square().sum() / case.target_mask.sum().clamp_min(1.0)
+    pred = model(b.interior, rows(b.interior_sizes))[:, :n_obs]
+    err2 = (((pred - b.targets) * b.target_mask) ** 2).sum(dim=1)
+    seg = torch.repeat_interleave(torch.arange(k, device=pred.device), b.interior_sizes)
+    sse = torch.zeros(k, device=pred.device).index_add_(0, seg, err2)
+    n_meas = torch.zeros(k, device=pred.device).index_add_(0, seg, b.target_mask.sum(dim=1))
+    data = (sse / n_meas.clamp_min(1.0)).mean()
 
-    initial = (model(case.initial_coords, z)[:, :n_obs] - _initial_targets(case)).square().mean()
+    ic = model(b.initial_coords, rows(b.initial_sizes))[:, :n_obs]
+    initial = (_per_case_mean(((ic - b.initial_targets) ** 2).sum(dim=1), b.initial_sizes, k)
+               / n_obs).mean()
 
-    bc_coords = case.boundary_coords.reshape(-1, n_coord)
-    flow = (model(bc_coords, z)[:, :n_obs] - _boundary_targets(case)).square().mean()
+    bc = model(b.boundary_coords, rows(b.boundary_sizes))[:, :n_obs]
+    flow = (_per_case_mean(((bc - b.boundary_targets) ** 2).sum(dim=1), b.boundary_sizes, k)
+            / n_obs).mean()
 
     scaling = cfg.scaling if cfg.scaling is not None else DEFAULT_RESIDUAL_SCALING
-    zero = torch.zeros((), device=case.interior.device, dtype=case.interior.dtype)
+    zero = torch.zeros((), device=pred.device, dtype=pred.dtype)
 
     if cfg.weight_pde != 0.0:
-        coll = _sample_box(case.interior, cfg.n_collocation).requires_grad_(True)
-        coll_state = model(coll, z)
-        pde_res = cartesian_zero_forcing_residuals(
-            coll, coll_state, physics=DEFAULT_PHYSICS, scaling=scaling)
-        pde = torch.stack([r.square().mean() for r in pde_res.values()]).mean()
+        u = torch.rand((k, cfg.n_collocation, b.box_lo.shape[1]), device=pred.device,
+                       dtype=pred.dtype)
+        coll = (b.box_lo[:, None] + u * (b.box_hi - b.box_lo)[:, None]).reshape(-1, b.box_lo.shape[1])
+        pde = _pde_loss(model, coll, b.z.repeat_interleave(cfg.n_collocation, dim=0), cfg, scaling)
     else:
         pde = zero
 
-    if cfg.weight_surface != 0.0:
-        surface = _surface_loss(model, case, z, cfg, scaling)
-    else:
-        surface = zero
+    surface = _surface_loss(model, b, cfg, scaling) if cfg.weight_surface != 0.0 else zero
 
     return {"data": data, "initial": initial, "flow_boundary": flow,
             "pde": pde, "surface": surface}
 
 
-def _sample_box(interior: torch.Tensor, n: int) -> torch.Tensor:
-    """Sample n random coordinates uniformly in the bounding box of the interior
-    query points (same normalized coordinate ranges as the case)."""
-    lo = interior.min(dim=0).values
-    hi = interior.max(dim=0).values
-    u = torch.rand((n, interior.shape[1]), device=interior.device,
-                   dtype=interior.dtype)
-    return lo + u * (hi - lo)
+def _case_losses(model: nn.Module, case: ConditionalCase,
+                 cfg: "ConditionalTrainConfig") -> dict[str, torch.Tensor]:
+    """The five losses for one case."""
+    return _batch_losses(model, stack_cases([case]), cfg)
+
+
+def _world() -> tuple[int, int]:
+    """(rank, world_size); (0, 1) when not running distributed."""
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size()
+    return 0, 1
 
 
 def train_conditional(
@@ -175,59 +258,77 @@ def train_conditional(
 ) -> ConditionalHistory:
     """Train the shared model and return the loss history.
 
-    Pass resident ``cases`` (small sets), or ``case_paths`` to lazily load each
-    batch's cases from disk per step so the full set need not fit in RAM."""
+    Pass resident ``cases``, or ``case_paths`` to load each batch from disk per
+    step. When torch.distributed is initialized, each process trains on the cases
+    it was given and gradients are averaged across processes every step."""
     if not cases and not case_paths:
         raise ValueError("train_conditional needs cases or case_paths.")
 
+    rank, world = _world()
     device = _resolve_device(config.device)
+    cuda = device.type == "cuda"
     model.to(device)
-    # Resident cases live in HOST memory; only the per-step batch is moved to the
-    # GPU (below), so the full set fits in RAM without exhausting GPU memory.
+    if world > 1:  # every process starts from rank 0's weights
+        for p in model.parameters():
+            dist.broadcast(p.data, src=0)
+    # Resident cases live in HOST memory; only the per-step batch is moved to the GPU.
     if cases is not None:
         cases = [c.as_torch(device="cpu") for c in cases]
     n_cases = len(case_paths) if case_paths else len(cases)
 
-    def get_case(i: int) -> ConditionalCase:
-        if case_paths is not None:
-            return read_conditional_case(case_paths[i]).as_torch(device=device)
-        return cases[i].as_torch(device=device)   # host -> GPU for this step only
+    def host_batch(idx: list[int]) -> CaseBatch:
+        """Build a step's batch on the host (runs on the prefetch thread)."""
+        picked = ([read_conditional_case(case_paths[i]).as_torch(device="cpu") for i in idx]
+                  if case_paths is not None else [cases[i] for i in idx])
+        b = stack_cases(picked)
+        return b.pin() if cuda else b
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
-    rng = torch.Generator().manual_seed(config.seed)
+    rng = torch.Generator().manual_seed(config.seed + rank)
     history = ConditionalHistory()
     weights = {"data": config.weight_data, "initial": config.weight_initial,
                "flow_boundary": config.weight_flow_boundary,
                "pde": config.weight_pde, "surface": config.weight_surface}
 
     start_epoch = _maybe_resume(model, optimizer, history, config, device)
+    k = min(config.batch_cases, n_cases)
+    draw = lambda: torch.randperm(n_cases, generator=rng)[:k].tolist()
 
     prof = {"fwd": 0.0, "bwd": 0.0, "step": 0.0} if config.profile else None
-    cuda = device.type == "cuda"
+    t_start = t_window = time.perf_counter()
+    wait_window, steps_window = 0.0, 0
 
+    # Prefetch: the next step's batch is stacked + pinned on a thread while the GPU works.
+    pool = ThreadPoolExecutor(max_workers=1)
+    pending = pool.submit(host_batch, draw())
     for epoch in range(start_epoch, config.epochs + 1):
-        k = min(config.batch_cases, n_cases)
-        idx = torch.randperm(n_cases, generator=rng)[:k].tolist()
+        t_wait = time.perf_counter()
+        b = pending.result().to(device)
+        wait_window += time.perf_counter() - t_wait
+        if epoch < config.epochs:
+            pending = pool.submit(host_batch, draw())
 
         if prof is not None and cuda:
             torch.cuda.synchronize()
         t = time.perf_counter()
         optimizer.zero_grad()
-        batch = {name: torch.zeros((), device=device) for name in weights}
-        for i in idx:
-            for name, value in _case_losses(model, get_case(i), config).items():
-                batch[name] = batch[name] + value
-        for name in batch:
-            batch[name] = batch[name] / k
+        batch = _batch_losses(model, b, config)
         total = sum(weights[name] * batch[name] for name in weights)
-
-        if not torch.isfinite(total):
-            raise FloatingPointError(f"Non-finite loss at epoch {epoch}.")
         if prof is not None:
             if cuda:
                 torch.cuda.synchronize()
             prof["fwd"] += time.perf_counter() - t; t = time.perf_counter()
         total.backward()
+        losses = torch.stack([total.detach()] + [batch[n].detach() for n in weights])
+        if world > 1:  # average gradients and logged losses across processes
+            for p in model.parameters():
+                dist.all_reduce(p.grad)
+                p.grad.div_(world)
+            dist.all_reduce(losses)
+            losses.div_(world)
+        losses = losses.cpu().tolist()
+        if not all(map(lambda x: x == x and abs(x) != float("inf"), losses)):
+            raise FloatingPointError(f"Non-finite loss at epoch {epoch}.")
         # Clip gradients: PDE residual gradients (2nd derivatives via autograd) can
         # spike and freeze training. Standard PINN safeguard.
         torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
@@ -240,16 +341,22 @@ def train_conditional(
             if cuda:
                 torch.cuda.synchronize()
             prof["step"] += time.perf_counter() - t
+        steps_window += 1
 
-        history.total.append(float(total.detach().cpu()))
-        for name in weights:
-            getattr(history, name).append(float(batch[name].detach().cpu()))
+        history.total.append(losses[0])
+        for name, value in zip(weights, losses[1:]):
+            getattr(history, name).append(value)
 
-        if epoch == 1 or epoch == config.epochs or epoch % config.log_every == 0:
-            parts = " ".join(f"{n}={float(batch[n].detach()):.4e}" for n in weights)
+        if rank == 0 and (epoch == 1 or epoch == config.epochs or epoch % config.log_every == 0):
+            now = time.perf_counter()
+            s_step = (now - t_window) / steps_window
+            eta_h = s_step * (config.epochs - epoch) / 3600
+            mem = f" gpu_mem={torch.cuda.max_memory_allocated(device) / 1e9:.1f}GB" if cuda else ""
+            parts = " ".join(f"{n}={v:.4e}" for n, v in zip(weights, losses[1:]))
             # stderr + flush so progress is live in the SLURM log, never buffered
-            print(f"epoch {epoch}/{config.epochs} "
-                  f"total={float(total.detach()):.4e} {parts}",
+            print(f"epoch {epoch}/{config.epochs} total={losses[0]:.4e} {parts} | "
+                  f"{s_step:.2f}s/step wait={wait_window / steps_window * 1e3:.0f}ms/step "
+                  f"elapsed={(now - t_start) / 3600:.2f}h eta={eta_h:.2f}h{mem}",
                   file=sys.stderr, flush=True)
             if prof is not None:
                 tot = sum(prof.values()) or 1.0
@@ -258,23 +365,27 @@ def train_conditional(
                       f"bwd={prof['bwd']/epoch*1e3:.1f}ms ({prof['bwd']/tot*100:.0f}%) "
                       f"step={prof['step']/epoch*1e3:.1f}ms ({prof['step']/tot*100:.0f}%)",
                       file=sys.stderr, flush=True)
+            t_window, wait_window, steps_window = now, 0.0, 0
 
-        if config.checkpoint_path and (epoch % config.checkpoint_every == 0
-                                       or epoch == config.epochs):
+        if rank == 0 and config.checkpoint_path and (epoch % config.checkpoint_every == 0
+                                                     or epoch == config.epochs):
             _save_checkpoint(model, optimizer, history, epoch, config)
 
+    pool.shutdown()
     return history
 
 
 def _save_checkpoint(model, optimizer, history, epoch, config) -> None:
-    """Atomically write a resumable checkpoint (model, optimizer, epoch, history)."""
+    """Atomically write a resumable checkpoint, plus a step-tagged copy kept for good."""
     path = Path(config.checkpoint_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save({"epoch": epoch, "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(), "history": vars(history)}, tmp)
+    tagged = path.with_name(f"{path.stem}_step{epoch:06d}{path.suffix}")
+    tagged.write_bytes(tmp.read_bytes())
     tmp.replace(path)
-    print(f"checkpoint @ epoch {epoch} -> {path}", file=sys.stderr, flush=True)
+    print(f"checkpoint @ epoch {epoch} -> {path} (+ {tagged.name})", file=sys.stderr, flush=True)
 
 
 def _maybe_resume(model, optimizer, history, config, device) -> int:
@@ -289,8 +400,6 @@ def _maybe_resume(model, optimizer, history, config, device) -> int:
     print(f"resumed from {config.checkpoint_path} at epoch {ckpt['epoch']}",
           file=sys.stderr, flush=True)
     return ckpt["epoch"] + 1
-
-    return history
 
 
 def split_cases(cases: list[ConditionalCase], chi: float, seed: int = 0

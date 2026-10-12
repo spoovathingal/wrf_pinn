@@ -216,8 +216,8 @@ def _diagnose_moist_state(theta: torch.Tensor, p_prime: torch.Tensor, q_v: torch
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Diagnose pressure, temperature, and moist-density quantities.
 
-    ``q_v`` must be the water-vapor mixing ratio in kg/kg relative to
-    dry-air mass.
+    ``q_v`` is the water-vapor mixing ratio in the data's units; it is taken
+    to kg/kg with ``physics.q_v_to_kg_per_kg``.
     """
 
     rd = physics.constants.dry_air_gas_constant
@@ -227,6 +227,7 @@ def _diagnose_moist_state(theta: torch.Tensor, p_prime: torch.Tensor, q_v: torch
     gamma = physics.constants.gamma
 
     p_d_h, rho_d_h = _hydrostatic_reference_state(z, physics)
+    q_v = q_v * physics.q_v_to_kg_per_kg
 
     # Total pressure and moist potential temperature.
     pressure = p_d_h + p_prime
