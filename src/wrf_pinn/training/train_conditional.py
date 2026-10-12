@@ -40,6 +40,10 @@ class ConditionalHistory:
 class ConditionalTrainConfig:
     epochs: int = 2000
     batch_cases: int = 4          # cases drawn per step (per process when distributed)
+    #: cases per forward/backward pass; gradients accumulate over the step's
+    #: passes, so the math matches one pass over batch_cases. 0 = whole batch.
+    cases_per_pass: int = 0
+    readers: int = 8              # threads reading cases in lazy mode
     learning_rate: float = 1e-3
     weight_data: float = 1.0
     weight_initial: float = 1.0
@@ -276,12 +280,18 @@ def train_conditional(
         cases = [c.as_torch(device="cpu") for c in cases]
     n_cases = len(case_paths) if case_paths else len(cases)
 
-    def host_batch(idx: list[int]) -> CaseBatch:
-        """Build a step's batch on the host (runs on the prefetch thread)."""
-        picked = ([read_conditional_case(case_paths[i]).as_torch(device="cpu") for i in idx]
-                  if case_paths is not None else [cases[i] for i in idx])
-        b = stack_cases(picked)
-        return b.pin() if cuda else b
+    readers = ThreadPoolExecutor(max_workers=max(1, config.readers)) if case_paths else None
+    per_pass = config.cases_per_pass or config.batch_cases
+
+    def host_batch(idx: list[int]) -> list[CaseBatch]:
+        """Build a step's passes on the host (runs on the prefetch thread)."""
+        if case_paths is not None:
+            load = lambda i: read_conditional_case(case_paths[i]).as_torch(device="cpu")
+            picked = list(readers.map(load, idx))
+        else:
+            picked = [cases[i] for i in idx]
+        passes = [stack_cases(picked[s:s + per_pass]) for s in range(0, len(picked), per_pass)]
+        return [b.pin() for b in passes] if cuda else passes
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     rng = torch.Generator().manual_seed(config.seed + rank)
@@ -303,7 +313,7 @@ def train_conditional(
     pending = pool.submit(host_batch, draw())
     for epoch in range(start_epoch, config.epochs + 1):
         t_wait = time.perf_counter()
-        b = pending.result().to(device)
+        passes = [b.to(device) for b in pending.result()]
         wait_window += time.perf_counter() - t_wait
         if epoch < config.epochs:
             pending = pool.submit(host_batch, draw())
@@ -312,14 +322,20 @@ def train_conditional(
             torch.cuda.synchronize()
         t = time.perf_counter()
         optimizer.zero_grad()
-        batch = _batch_losses(model, b, config)
-        total = sum(weights[name] * batch[name] for name in weights)
+        # Gradient accumulation: each pass's loss is weighted by its share of the
+        # batch, so the summed gradients equal one pass over all k cases.
+        losses = torch.zeros(1 + len(weights), device=device)
+        for b in passes:
+            share = b.k / k
+            batch = _batch_losses(model, b, config)
+            total = sum(weights[name] * batch[name] for name in weights)
+            (share * total).backward()
+            losses += share * torch.stack([total.detach()] + [batch[n].detach() for n in weights])
+            del batch, total, b  # free this pass's graph before the next
         if prof is not None:
             if cuda:
                 torch.cuda.synchronize()
             prof["fwd"] += time.perf_counter() - t; t = time.perf_counter()
-        total.backward()
-        losses = torch.stack([total.detach()] + [batch[n].detach() for n in weights])
         if world > 1:  # average gradients and logged losses across processes
             for p in model.parameters():
                 dist.all_reduce(p.grad)
@@ -361,8 +377,8 @@ def train_conditional(
             if prof is not None:
                 tot = sum(prof.values()) or 1.0
                 print(f"  profile/epoch(avg over {epoch}): "
-                      f"fwd={prof['fwd']/epoch*1e3:.1f}ms ({prof['fwd']/tot*100:.0f}%) "
-                      f"bwd={prof['bwd']/epoch*1e3:.1f}ms ({prof['bwd']/tot*100:.0f}%) "
+                      f"fwd+bwd={prof['fwd']/epoch*1e3:.1f}ms ({prof['fwd']/tot*100:.0f}%) "
+                      f"sync+clip={prof['bwd']/epoch*1e3:.1f}ms ({prof['bwd']/tot*100:.0f}%) "
                       f"step={prof['step']/epoch*1e3:.1f}ms ({prof['step']/tot*100:.0f}%)",
                       file=sys.stderr, flush=True)
             t_window, wait_window, steps_window = now, 0.0, 0
@@ -372,6 +388,8 @@ def train_conditional(
             _save_checkpoint(model, optimizer, history, epoch, config)
 
     pool.shutdown()
+    if readers is not None:
+        readers.shutdown()
     return history
 
 
