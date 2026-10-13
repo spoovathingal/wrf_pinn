@@ -155,28 +155,29 @@ def _per_case_mean(values: torch.Tensor, sizes: torch.Tensor, k: int) -> torch.T
     return sums / sizes.to(values.dtype)
 
 
-def _surface_loss(model, b: CaseBatch, cfg, scaling) -> torch.Tensor:
+def _surface_loss(model, b: CaseBatch, cfg, scaling, condition) -> torch.Tensor:
     """Surface-layer residual on each case's bottom face, using its stored fluxes.
 
     Wall coords come from the surface rows (x,y,t normalized; z at the floor);
     fluxes are un-normalized to physical for the no-penetration-z residual."""
     surf = b.surface
     dev, dt = surf.device, surf.dtype
-    z_rows = torch.repeat_interleave(b.z, b.surface_sizes, dim=0)
+
     z_floor = (0.0 - scaling.z.offset) / scaling.z.scale
     wall = torch.stack([surf[:, 0], surf[:, 1],
                         torch.full((surf.shape[0],), z_floor, device=dev, dtype=dt),
                         surf[:, 2]], dim=1).requires_grad_(True)
-    wall_state = model(wall, z_rows)
+    wall_state = model.forward_projected(wall, condition, case_sizes=b.surface_sizes)
 
     reference = wall.detach().clone()
     z1 = (cfg.physics.constants.surface_reference_height - scaling.z.offset) / scaling.z.scale
     reference[:, 2] = z1
-    reference_state = model(reference, z_rows)
+    reference_state = model.forward_projected(reference, condition, case_sizes=b.surface_sizes)
 
     f_off = torch.tensor(cfg.flux_offset, device=dev, dtype=dt)
     f_scale = torch.tensor(cfg.flux_scale, device=dev, dtype=dt)
     phys = surf[:, 3:] * f_scale + f_off                             # un-normalize fluxes
+
     res = no_penetration_z_wall_residuals(
         coordinates=wall, state=wall_state,
         reference_coordinates=reference, reference_state=reference_state,
@@ -189,10 +190,11 @@ def _surface_loss(model, b: CaseBatch, cfg, scaling) -> torch.Tensor:
     return per_eq.mean(dim=0).mean()
 
 
-def _pde_loss(model, coll: torch.Tensor, z_rows: torch.Tensor, cfg, scaling) -> torch.Tensor:
+def _pde_loss(model, coll: torch.Tensor, condition, case_sizes, cfg, scaling) -> torch.Tensor:
     """Mean squared PDE residual over equal-sized per-case collocation sets."""
     coll = coll.requires_grad_(True)
-    res = cartesian_zero_forcing_residuals(coll, model(coll, z_rows),
+    state = model.forward_projected(coll, condition, case_sizes=case_sizes)
+    res = cartesian_zero_forcing_residuals(coll, state,
                                            physics=cfg.physics, scaling=scaling)
     return torch.stack([r.square().mean() for r in res.values()]).mean()
 
@@ -202,20 +204,24 @@ def _batch_losses(model: nn.Module, b: CaseBatch,
     """The five losses, each averaged over the batch's cases (one forward per loss)."""
     n_obs = len(STATE_VARS)
     k = b.k
-    rows = lambda sizes: torch.repeat_interleave(b.z, sizes, dim=0)
 
-    pred = model(b.interior, rows(b.interior_sizes))[:, :n_obs]
+    # Compute once per training step. Keep attached to autograd.
+    condition = model.project_condition(b.z)
+
+    pred = model.forward_projected(b.interior, condition,
+                                    case_sizes = b.interior_sizes)[:, :n_obs]
     err2 = (((pred - b.targets) * b.target_mask) ** 2).sum(dim=1)
-    seg = torch.repeat_interleave(torch.arange(k, device=pred.device), b.interior_sizes)
+    seg = torch.repeat_interleave(torch.arange(k, device=pred.device),
+                                  b.interior_sizes, output_size = b.interior.shape[0])
     sse = torch.zeros(k, device=pred.device).index_add_(0, seg, err2)
     n_meas = torch.zeros(k, device=pred.device).index_add_(0, seg, b.target_mask.sum(dim=1))
     data = (sse / n_meas.clamp_min(1.0)).mean()
 
-    ic = model(b.initial_coords, rows(b.initial_sizes))[:, :n_obs]
+    ic = model.forward_projected(b.initial_coords, condition, case_sizes = b.initial_sizes)[:, :n_obs]
     initial = (_per_case_mean(((ic - b.initial_targets) ** 2).sum(dim=1), b.initial_sizes, k)
                / n_obs).mean()
 
-    bc = model(b.boundary_coords, rows(b.boundary_sizes))[:, :n_obs]
+    bc = model.forward_projected(b.boundary_coords, condition, case_sizes=b.boundary_sizes)[:, :n_obs]
     flow = (_per_case_mean(((bc - b.boundary_targets) ** 2).sum(dim=1), b.boundary_sizes, k)
             / n_obs).mean()
 
@@ -226,11 +232,12 @@ def _batch_losses(model: nn.Module, b: CaseBatch,
         u = torch.rand((k, cfg.n_collocation, b.box_lo.shape[1]), device=pred.device,
                        dtype=pred.dtype)
         coll = (b.box_lo[:, None] + u * (b.box_hi - b.box_lo)[:, None]).reshape(-1, b.box_lo.shape[1])
-        pde = _pde_loss(model, coll, b.z.repeat_interleave(cfg.n_collocation, dim=0), cfg, scaling)
+        coll_sizes = torch.full((k,), cfg.n_collocation, device=pred.device, dtype=torch.long)
+        pde = _pde_loss(model, coll, condition, coll_sizes, cfg, scaling)
     else:
         pde = zero
 
-    surface = _surface_loss(model, b, cfg, scaling) if cfg.weight_surface != 0.0 else zero
+    surface = _surface_loss(model, b, cfg, scaling, condition) if cfg.weight_surface != 0.0 else zero
 
     return {"data": data, "initial": initial, "flow_boundary": flow,
             "pde": pde, "surface": surface}
@@ -301,6 +308,8 @@ def train_conditional(
     # Prefetch: the next step's batch is stacked + pinned on a thread while the GPU works.
     pool = ThreadPoolExecutor(max_workers=1)
     pending = pool.submit(host_batch, draw())
+    if cuda:
+        torch.cuda.reset_peak_memory_stats(device)
     for epoch in range(start_epoch, config.epochs + 1):
         t_wait = time.perf_counter()
         b = pending.result().to(device)
@@ -337,6 +346,15 @@ def train_conditional(
                 torch.cuda.synchronize()
             prof["bwd"] += time.perf_counter() - t; t = time.perf_counter()
         optimizer.step()
+        if cuda and epoch == start_epoch:
+            torch.cuda.synchronize(device)
+            print(f"rank={rank}: peak GPU allocated="
+                f"{torch.cuda.max_memory_allocated(device) / 2**30:.2f} GiB; "
+                f"peak GPU reserved="
+                f"{torch.cuda.max_memory_reserved(device) / 2**30:.2f} GiB",
+                file=sys.stderr,
+                flush=True,
+            )
         if prof is not None:
             if cuda:
                 torch.cuda.synchronize()

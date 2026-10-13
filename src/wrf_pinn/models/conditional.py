@@ -9,7 +9,7 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
-
+from torch.nn import functional as F
 from wrf_pinn.config.physics import DEFAULT_PHYSICS
 
 
@@ -44,10 +44,48 @@ class ConditionalModel(nn.Module):
         layers.append(nn.Linear(width, config.state_dim))
         return nn.Sequential(*layers)
 
+    def project_condition(self, z: torch.Tensor) -> torch.Tensor:
+        """Project each case's POD vector into the first layer's output space."""
+        first = self.net[0]
+        latent_dim = first.in_features - self.config.coord_dim
+
+        if z.ndim != 2 or z.shape[1] != latent_dim:
+            raise ValueError(f"z must have shape (n, {latent_dim}).")
+
+        return F.linear(z, first.weight[:, self.config.coord_dim:], bias=None)
+
+    def forward_projected(self, coordinates: torch.Tensor, condition: torch.Tensor,
+        *,
+        case_sizes: torch.Tensor | None = None) -> torch.Tensor:
+        """Predict using projected conditioning, optionally grouped by case."""
+        first = self.net[0]
+
+        if (coordinates.ndim != 2 or coordinates.shape[1] != self.config.coord_dim):
+            raise ValueError("Invalid coordinate shape.")
+
+        if (condition.ndim != 2 or condition.shape[1] != first.out_features):
+            raise ValueError("Invalid projected conditioning shape.")
+
+        if case_sizes is not None:
+            if (case_sizes.ndim != 1 or case_sizes.shape[0] != condition.shape[0]):
+                raise ValueError("case_sizes must contain one count per case.")
+
+            # Repeat only the projected values: typically tilesize, not 15,235.
+            condition = torch.repeat_interleave(condition, case_sizes,
+                dim=0, output_size=coordinates.shape[0])
+        elif condition.shape[0] not in (1, coordinates.shape[0]):
+            raise ValueError("Supply one condition row, one per point, or case_sizes.")
+
+        # Include the original first-layer bias exactly once.
+        hidden = F.linear(coordinates, first.weight[:, :self.config.coord_dim], first.bias,
+        ) + condition
+
+        # Includes the original first activation and all remaining layers.
+        for layer in self.net[1:]:
+            hidden = layer(hidden)
+
+        return hidden
+
     def forward(self, coordinates: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        """Predict state at coordinates. z is (1, latent_dim), broadcast to every
-        point, or (n_points, latent_dim) for a batch mixing several cases."""
-        if z.shape[1] == 0:
-            return self.net(coordinates)
-        z_rows = z if z.shape[0] == coordinates.shape[0] else z.expand(coordinates.shape[0], -1)
-        return self.net(torch.cat([coordinates, z_rows], dim=1))
+        """Existing API: one POD vector or one vector per coordinate row."""
+        return self.forward_projected(coordinates, self.project_condition(z))
