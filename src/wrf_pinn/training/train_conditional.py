@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
 import torch
@@ -13,7 +13,8 @@ import torch.distributed as dist
 from torch import nn
 
 from wrf_pinn.data.conditional_case import (
-    ConditionalCase, COORD_NAMES, STATE_VARS, read_conditional_case,
+    ConditionalCase, COORD_NAMES, STATE_VARS, localize_coords, localized_scaling,
+    read_conditional_case,
 )
 from wrf_pinn.config.physics import DEFAULT_PHYSICS, PhysicsConfig
 from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING, ResidualScalingConfig
@@ -64,6 +65,9 @@ class ConditionalTrainConfig:
     flux_scale: tuple[float, float] = (1.0, 1.0)
     surface_stress_scale: float = 3.8273
     surface_heat_flux_scale: float = 1.0
+    #: per-case (x, y, t) span; when set, each case's x, y, t are shifted to its own
+    #: origin and divided by it (local coords), and the residual scales follow.
+    coord_span: "tuple[float, float, float] | None" = None
     log_every: int = 100
     device: str = "auto"
     seed: int = 0
@@ -275,9 +279,14 @@ def train_conditional(
     if world > 1:  # every process starts from rank 0's weights
         for p in model.parameters():
             dist.broadcast(p.data, src=0)
+    span = config.coord_span
+    if span is not None:
+        config = replace(config, scaling=localized_scaling(
+            config.scaling if config.scaling is not None else DEFAULT_RESIDUAL_SCALING, span))
+    prep = (lambda c: localize_coords(c, span)) if span is not None else (lambda c: c)
     # Resident cases live in HOST memory; only the per-step batch is moved to the GPU.
     if cases is not None:
-        cases = [c.as_torch(device="cpu") for c in cases]
+        cases = [prep(c).as_torch(device="cpu") for c in cases]
     n_cases = len(case_paths) if case_paths else len(cases)
 
     readers = ThreadPoolExecutor(max_workers=max(1, config.readers)) if case_paths else None
@@ -286,7 +295,7 @@ def train_conditional(
     def host_batch(idx: list[int]) -> list[CaseBatch]:
         """Build a step's passes on the host (runs on the prefetch thread)."""
         if case_paths is not None:
-            load = lambda i: read_conditional_case(case_paths[i]).as_torch(device="cpu")
+            load = lambda i: prep(read_conditional_case(case_paths[i])).as_torch(device="cpu")
             picked = list(readers.map(load, idx))
         else:
             picked = [cases[i] for i in idx]

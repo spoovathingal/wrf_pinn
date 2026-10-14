@@ -5,6 +5,7 @@ per case plus a shared metadata.json sidecar.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -106,6 +107,39 @@ def read_conditional_case(npz_path: str | Path) -> ConditionalCase:
     members["target_mask"] = mask
 
     return ConditionalCase(name=path.stem, **members)
+
+
+def coord_span(case: ConditionalCase) -> tuple[float, float, float]:
+    """Normalized extent of a case in x, y and t (tile width, window length)."""
+    ic = np.asarray(case.initial_coords)
+    t0 = float(ic[:, 3].min())
+    return (float(np.ptp(ic[:, 0])), float(np.ptp(ic[:, 1])),
+            float(np.asarray(case.interior)[:, 3].max()) - t0)
+
+
+def localize_coords(case: ConditionalCase, span: tuple[float, float, float]) -> ConditionalCase:
+    """Shift x, y, t to the case's own origin and divide by ``span``, so they run 0..1
+    inside the case the way z does. z stays global (the physics needs its height).
+    Residual derivatives must then use scales multiplied by ``span``
+    (see ``localized_scaling``). Numpy case in, numpy case out."""
+    ic = np.asarray(case.initial_coords)
+    origin = np.array([ic[:, 0].min(), ic[:, 1].min(), 0.0, ic[:, 3].min()], np.float32)
+    span4 = np.array([span[0], span[1], 1.0, span[2]], np.float32)
+    local = lambda c: ((c - origin) / span4).astype(np.float32)
+    surface = np.array(case.surface, dtype=np.float32, copy=True)   # x, y, t, fluxes
+    surface[..., :3] = (surface[..., :3] - origin[[0, 1, 3]]) / span4[[0, 1, 3]]
+    return dataclasses.replace(
+        case, initial_coords=local(ic), interior=local(np.asarray(case.interior)),
+        boundary_coords=local(np.asarray(case.boundary_coords)), surface=surface)
+
+
+def localized_scaling(scaling, span: tuple[float, float, float]):
+    """Residual scaling for localized coords: x, y, t scales times their case span."""
+    return dataclasses.replace(
+        scaling,
+        x=dataclasses.replace(scaling.x, scale=scaling.x.scale * span[0]),
+        y=dataclasses.replace(scaling.y, scale=scaling.y.scale * span[1]),
+        t=dataclasses.replace(scaling.t, scale=scaling.t.scale * span[2]))
 
 
 def decode_boundary(blob) -> dict:
