@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -259,12 +260,15 @@ def train_conditional(
     config: ConditionalTrainConfig = ConditionalTrainConfig(),
     *,
     case_paths: "list[str | Path] | None" = None,
+    on_step: "Callable[[int], None] | None" = None,
 ) -> ConditionalHistory:
     """Train the shared model and return the loss history.
 
     Pass resident ``cases``, or ``case_paths`` to load each batch from disk per
     step. When torch.distributed is initialized, each process trains on the cases
-    it was given and gradients are averaged across processes every step."""
+    it was given and gradients are averaged across processes every step.
+    ``on_step(epoch)`` runs after each optimizer step, for benchmark timing and
+    profiler hooks; it must not touch the model."""
     if not cases and not case_paths:
         raise ValueError("train_conditional needs cases or case_paths.")
 
@@ -362,6 +366,8 @@ def train_conditional(
         history.total.append(losses[0])
         for name, value in zip(weights, losses[1:]):
             getattr(history, name).append(value)
+        if on_step is not None:
+            on_step(epoch)
 
         if rank == 0 and (epoch == 1 or epoch == config.epochs or epoch % config.log_every == 0):
             now = time.perf_counter()
