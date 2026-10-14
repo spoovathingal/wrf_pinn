@@ -18,6 +18,7 @@ terms are assembled.
 from __future__ import annotations
 import math
 from collections.abc import Mapping
+from functools import lru_cache
 
 import torch
 
@@ -68,12 +69,19 @@ def _physical_gradient(
     """
 
     gradient = _gradient(field, coordinates)
-    coordinate_scales = torch.tensor(
-        scaling.coordinate_scales(),
-        dtype=gradient.dtype,
-        device=gradient.device,
-    ).reshape(1, -1)
+    coordinate_scales = _coordinate_scale_tensor(
+        scaling.coordinate_scales(), gradient.device, gradient.dtype)
     return gradient / coordinate_scales
+
+
+@lru_cache(maxsize=32)
+def _coordinate_scale_tensor(scales: tuple[float, ...], device: torch.device,
+                             dtype: torch.dtype) -> torch.Tensor:
+    """(1, n_coord) coordinate scales on ``device``, built once per (scales, device,
+    dtype). Building it per call copied it host-to-device each time, and every such
+    copy made the CPU wait for the GPU. Callers must not modify it in place."""
+    return torch.tensor(scales, dtype=dtype, device=device).reshape(1, -1)
+
 
 def _hydrostatic_reference_state(
     z: torch.Tensor,

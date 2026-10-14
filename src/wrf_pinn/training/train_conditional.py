@@ -7,6 +7,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, fields
+from functools import lru_cache
 from pathlib import Path
 
 import torch
@@ -155,9 +156,18 @@ def stack_cases(cases: list[ConditionalCase]) -> CaseBatch:
 
 def _per_case_mean(values: torch.Tensor, sizes: torch.Tensor, k: int) -> torch.Tensor:
     """Mean of per-point values within each case -> (k,)."""
-    seg = torch.repeat_interleave(torch.arange(k, device=values.device), sizes)
+    seg = torch.repeat_interleave(torch.arange(k, device=values.device), sizes,
+                                  output_size=values.shape[0])
     sums = torch.zeros(k, device=values.device, dtype=values.dtype).index_add_(0, seg, values)
     return sums / sizes.to(values.dtype)
+
+
+@lru_cache(maxsize=32)
+def _device_constant(values: tuple[float, ...], device: torch.device,
+                     dtype: torch.dtype) -> torch.Tensor:
+    """A small constant tensor on ``device``, built once: a per-pass host-to-device
+    copy made the CPU wait for the GPU. Callers must not modify it in place."""
+    return torch.tensor(values, device=device, dtype=dtype)
 
 
 def _surface_loss(model, b: CaseBatch, cfg, scaling) -> torch.Tensor:
@@ -167,7 +177,7 @@ def _surface_loss(model, b: CaseBatch, cfg, scaling) -> torch.Tensor:
     fluxes are un-normalized to physical for the no-penetration-z residual."""
     surf = b.surface
     dev, dt = surf.device, surf.dtype
-    z_rows = torch.repeat_interleave(b.z, b.surface_sizes, dim=0)
+    z_rows = torch.repeat_interleave(b.z, b.surface_sizes, dim=0, output_size=surf.shape[0])
     z_floor = (0.0 - scaling.z.offset) / scaling.z.scale
     wall = torch.stack([surf[:, 0], surf[:, 1],
                         torch.full((surf.shape[0],), z_floor, device=dev, dtype=dt),
@@ -179,8 +189,8 @@ def _surface_loss(model, b: CaseBatch, cfg, scaling) -> torch.Tensor:
     reference[:, 2] = z1
     reference_state = model(reference, z_rows)
 
-    f_off = torch.tensor(cfg.flux_offset, device=dev, dtype=dt)
-    f_scale = torch.tensor(cfg.flux_scale, device=dev, dtype=dt)
+    f_off = _device_constant(tuple(cfg.flux_offset), dev, dt)
+    f_scale = _device_constant(tuple(cfg.flux_scale), dev, dt)
     phys = surf[:, 3:] * f_scale + f_off                             # un-normalize fluxes
     res = no_penetration_z_wall_residuals(
         coordinates=wall, state=wall_state,
@@ -210,20 +220,23 @@ def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
     case's PDE points in its box; drawn here when None."""
     n_obs = len(STATE_VARS)
     k = b.k
-    rows = lambda sizes: torch.repeat_interleave(b.z, sizes, dim=0)
+    # output_size is each point set's row count: passing it keeps repeat_interleave
+    # from reading the GPU-resident sizes back to the host (a sync per call).
+    rows = lambda sizes, n: torch.repeat_interleave(b.z, sizes, dim=0, output_size=n)
 
-    pred = model(b.interior, rows(b.interior_sizes))[:, :n_obs]
+    pred = model(b.interior, rows(b.interior_sizes, b.interior.shape[0]))[:, :n_obs]
     err2 = (((pred - b.targets) * b.target_mask) ** 2).sum(dim=1)
-    seg = torch.repeat_interleave(torch.arange(k, device=pred.device), b.interior_sizes)
+    seg = torch.repeat_interleave(torch.arange(k, device=pred.device), b.interior_sizes,
+                                  output_size=b.interior.shape[0])
     sse = torch.zeros(k, device=pred.device).index_add_(0, seg, err2)
     n_meas = torch.zeros(k, device=pred.device).index_add_(0, seg, b.target_mask.sum(dim=1))
     data = (sse / n_meas.clamp_min(1.0)).mean()
 
-    ic = model(b.initial_coords, rows(b.initial_sizes))[:, :n_obs]
+    ic = model(b.initial_coords, rows(b.initial_sizes, b.initial_coords.shape[0]))[:, :n_obs]
     initial = (_per_case_mean(((ic - b.initial_targets) ** 2).sum(dim=1), b.initial_sizes, k)
                / n_obs).mean()
 
-    bc = model(b.boundary_coords, rows(b.boundary_sizes))[:, :n_obs]
+    bc = model(b.boundary_coords, rows(b.boundary_sizes, b.boundary_coords.shape[0]))[:, :n_obs]
     flow = (_per_case_mean(((bc - b.boundary_targets) ** 2).sum(dim=1), b.boundary_sizes, k)
             / n_obs).mean()
 
@@ -233,7 +246,7 @@ def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
     if cfg.weight_pde != 0.0:
         u = unit_coll if unit_coll is not None else torch.rand(
             (k, cfg.n_collocation, b.box_lo.shape[1]), device=pred.device, dtype=pred.dtype)
-        coll =(b.box_lo[:, None] + u * (b.box_hi - b.box_lo)[:, None]).reshape(-1, b.box_lo.shape[1])
+        coll = (b.box_lo[:, None] + u * (b.box_hi - b.box_lo)[:, None]).reshape(-1, b.box_lo.shape[1])
         pde = _pde_loss(model, coll, b.z.repeat_interleave(cfg.n_collocation, dim=0), cfg, scaling)
     else:
         pde = zero
