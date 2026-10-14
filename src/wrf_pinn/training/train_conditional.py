@@ -202,9 +202,12 @@ def _pde_loss(model, coll: torch.Tensor, z_rows: torch.Tensor, cfg, scaling) -> 
     return torch.stack([r.square().mean() for r in res.values()]).mean()
 
 
-def _batch_losses(model: nn.Module, b: CaseBatch,
-                  cfg: "ConditionalTrainConfig") -> dict[str, torch.Tensor]:
-    """The five losses, each averaged over the batch's cases (one forward per loss)."""
+def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
+                  unit_coll: "torch.Tensor | None" = None) -> dict[str, torch.Tensor]:
+    """The five losses, each averaged over the batch's cases (one forward per loss).
+
+    ``unit_coll`` is (k, n_collocation, n_coord) uniform [0, 1) draws placing each
+    case's PDE points in its box; drawn here when None."""
     n_obs = len(STATE_VARS)
     k = b.k
     rows = lambda sizes: torch.repeat_interleave(b.z, sizes, dim=0)
@@ -228,9 +231,9 @@ def _batch_losses(model: nn.Module, b: CaseBatch,
     zero = torch.zeros((), device=pred.device, dtype=pred.dtype)
 
     if cfg.weight_pde != 0.0:
-        u = torch.rand((k, cfg.n_collocation, b.box_lo.shape[1]), device=pred.device,
-                       dtype=pred.dtype)
-        coll = (b.box_lo[:, None] + u * (b.box_hi - b.box_lo)[:, None]).reshape(-1, b.box_lo.shape[1])
+        u = unit_coll if unit_coll is not None else torch.rand(
+            (k, cfg.n_collocation, b.box_lo.shape[1]), device=pred.device, dtype=pred.dtype)
+        coll =(b.box_lo[:, None] + u * (b.box_hi - b.box_lo)[:, None]).reshape(-1, b.box_lo.shape[1])
         pde = _pde_loss(model, coll, b.z.repeat_interleave(cfg.n_collocation, dim=0), cfg, scaling)
     else:
         pde = zero
@@ -329,9 +332,16 @@ def train_conditional(
         # Gradient accumulation: each pass's loss is weighted by its share of the
         # batch, so the summed gradients equal one pass over all k cases.
         losses = torch.zeros(1 + len(weights), device=device)
+        # One collocation draw per step, sliced per pass, so the PDE points do not
+        # depend on cases_per_pass.
+        unit_coll = (torch.rand((k, config.n_collocation, passes[0].box_lo.shape[1]),
+                                device=device) if config.weight_pde != 0.0 else None)
+        first = 0
         for b in passes:
             share = b.k / k
-            batch = _batch_losses(model, b, config)
+            u = unit_coll[first:first + b.k] if unit_coll is not None else None
+            first += b.k
+            batch = _batch_losses(model, b, config, u)
             total = sum(weights[name] * batch[name] for name in weights)
             (share * total).backward()
             losses += share * torch.stack([total.detach()] + [batch[n].detach() for n in weights])

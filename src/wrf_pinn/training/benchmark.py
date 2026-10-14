@@ -1,6 +1,6 @@
 """Step-time statistics and run-to-run equivalence for training benchmarks.
 
-A benchmark run is a JSON record (written by ``scripts/bench_conditional.py``)
+A benchmark run is a JSON record (written by ``drivers/bench_conditional.py``)
 holding the per-step losses and per-step wall times of a short fixed-seed run.
 This module summarizes one record and compares two: the losses must agree
 within a stated tolerance (pass or fail), and the speed difference is reported

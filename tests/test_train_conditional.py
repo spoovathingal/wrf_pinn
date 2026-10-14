@@ -111,3 +111,30 @@ def test_split_cases():
     cases = [_make_case(f"c{i}", i) for i in range(10)]
     train, held = split_cases(cases, chi=0.8, seed=0)
     assert len(train) == 8 and len(held) == 2
+
+
+def test_collocation_points_independent_of_cases_per_pass(monkeypatch):
+    """The PDE points a step sees must not depend on how its cases are split into passes."""
+    import wrf_pinn.training.train_conditional as tc
+
+    cases = [_make_case(f"c{i}", i) for i in range(8)]
+
+    def collocation(cases_per_pass: int) -> torch.Tensor:
+        seen = []
+
+        def fake_pde(model, coll, z_rows, cfg, scaling):  # random data NaNs the real PDE
+            seen.append(coll.detach().clone())
+            return (model(coll, z_rows) * 0.0).sum()
+
+        monkeypatch.setattr(tc, "_pde_loss", fake_pde)
+        torch.manual_seed(0)
+        model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=16))
+        cfg = ConditionalTrainConfig(epochs=3, batch_cases=4, cases_per_pass=cases_per_pass,
+                                     n_collocation=16, device="cpu", log_every=100,
+                                     weight_surface=0.0)
+        train_conditional(model, cases, cfg)
+        return torch.cat(seen)
+
+    whole = collocation(0)
+    assert torch.equal(whole, collocation(1))
+    assert torch.equal(whole, collocation(2))
