@@ -14,7 +14,7 @@ from torch import nn
 
 from wrf_pinn.data.conditional_case import (
     ConditionalCase, COORD_NAMES, STATE_VARS, localize_coords, localized_scaling,
-    read_conditional_case,
+    read_conditional_case, with_terrain,
 )
 from wrf_pinn.config.physics import DEFAULT_PHYSICS, PhysicsConfig
 from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING, ResidualScalingConfig
@@ -68,6 +68,8 @@ class ConditionalTrainConfig:
     #: per-case (x, y, t) span; when set, each case's x, y, t are shifted to its own
     #: origin and divided by it (local coords), and the residual scales follow.
     coord_span: "tuple[float, float, float] | None" = None
+    #: append each tile's terrain features to z (the model's latent_dim must include them)
+    terrain: bool = False
     log_every: int = 100
     device: str = "auto"
     seed: int = 0
@@ -283,7 +285,9 @@ def train_conditional(
     if span is not None:
         config = replace(config, scaling=localized_scaling(
             config.scaling if config.scaling is not None else DEFAULT_RESIDUAL_SCALING, span))
-    prep = (lambda c: localize_coords(c, span)) if span is not None else (lambda c: c)
+    def prep(c: ConditionalCase) -> ConditionalCase:
+        c = localize_coords(c, span) if span is not None else c
+        return with_terrain(c) if config.terrain else c
     # Resident cases live in HOST memory; only the per-step batch is moved to the GPU.
     if cases is not None:
         cases = [prep(c).as_torch(device="cpu") for c in cases]

@@ -133,6 +133,29 @@ def localize_coords(case: ConditionalCase, span: tuple[float, float, float]) -> 
         boundary_coords=local(np.asarray(case.boundary_coords)), surface=surface)
 
 
+#: Terrain features appended to z: tile mean height / 1000 m, then an 8x8 coarse map
+#: of height above that mean / 200 m (65 numbers; tiles here span 0-1000 m, relief <400 m).
+TERRAIN_COARSE = 8
+TERRAIN_FEATURES = 1 + TERRAIN_COARSE ** 2
+
+
+def terrain_features(terrain: np.ndarray) -> np.ndarray:
+    """(n_terr, 3) x, y, elevation [m] on a full square tile -> (65,) conditioning features."""
+    h = np.asarray(terrain, dtype=np.float32)
+    h = h[np.lexsort((h[:, 1], h[:, 0])), 2]                # x-major, y fastest
+    n = int(round(h.size ** 0.5))
+    b = n // TERRAIN_COARSE
+    coarse = h.reshape(TERRAIN_COARSE, b, TERRAIN_COARSE, b).mean(axis=(1, 3))
+    mean = h.mean()
+    return np.concatenate([[mean / 1000.0], ((coarse - mean) / 200.0).ravel()]).astype(np.float32)
+
+
+def with_terrain(case: ConditionalCase) -> ConditionalCase:
+    """Append the tile's terrain features to the conditioning latent z."""
+    return dataclasses.replace(case, z=np.concatenate(
+        [np.asarray(case.z, dtype=np.float32), terrain_features(case.terrain)]))
+
+
 def localized_scaling(scaling, span: tuple[float, float, float]):
     """Residual scaling for localized coords: x, y, t scales times their case span."""
     return dataclasses.replace(
