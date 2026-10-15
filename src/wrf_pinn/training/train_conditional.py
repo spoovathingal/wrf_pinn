@@ -7,6 +7,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, fields
+from functools import partial
 from functools import lru_cache
 from pathlib import Path
 
@@ -83,6 +84,10 @@ class ConditionalTrainConfig:
     #: bf16 autocast: their matmuls use bf16 tensor cores. The PDE and surface paths,
     #: which differentiate the network, stay in float32. Off by default.
     bf16_data: bool = False
+    #: lazy mode: read and stack cases in this many DataLoader worker processes
+    #: instead of threads in the training process, so case decoding does not compete
+    #: with the training loop for the GIL. 0 = reader threads (``readers``).
+    loader_workers: int = 0
     #: torch.compile the network forward, the first-order Taylor pass and the PDE
     #: residuals (fuses their many small elementwise kernels). The first steps pay
     #: the compile time. Off by default.
@@ -138,6 +143,8 @@ class CaseBatch:
 
     def pin(self) -> "CaseBatch":
         return CaseBatch(**{f.name: getattr(self, f.name).pin_memory() for f in fields(self)})
+
+    pin_memory = pin  # what DataLoader(pin_memory=True) calls on custom batch types
 
 
 def stack_cases(cases: list[ConditionalCase]) -> CaseBatch:
@@ -336,6 +343,61 @@ def _case_losses(model: nn.Module, case: ConditionalCase,
     return _batch_losses(model, stack_cases([case]), cfg)
 
 
+def _average_across_processes(params: list[nn.Parameter], losses: torch.Tensor,
+                              world: int) -> torch.Tensor:
+    """Average every gradient and the logged losses over processes in ONE all-reduce.
+
+    All gradients and the losses are packed into one flat buffer, reduced once and
+    unpacked: the same sum-then-divide as reducing each tensor alone, but one
+    collective call per step instead of one per parameter (each a network round
+    trip across nodes). Returns the averaged losses; gradients are updated in place."""
+    grads = [p.grad if p.grad is not None else torch.zeros_like(p) for p in params]
+    flat = torch.cat([g.reshape(-1) for g in grads] + [losses.reshape(-1)])
+    dist.all_reduce(flat)
+    flat.div_(world)
+    offset = 0
+    for p, g in zip(params, grads):
+        n = g.numel()
+        if p.grad is None:
+            p.grad = g
+        p.grad.copy_(flat[offset:offset + n].view_as(g))
+        offset += n
+    return flat[offset:].view_as(losses)
+
+
+class _CaseFiles(torch.utils.data.Dataset):
+    """One case per index, read in a DataLoader worker process."""
+
+    def __init__(self, paths: "list[str | Path]") -> None:
+        self.paths = list(paths)
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, i: int) -> ConditionalCase:
+        return read_conditional_case(self.paths[i]).as_torch(device="cpu")
+
+
+class _StepDraws(torch.utils.data.Sampler):
+    """Each step's case indices, drawn exactly as the in-process path draws them."""
+
+    def __init__(self, n_cases: int, k: int, seed: int, n_steps: int) -> None:
+        self.n_cases, self.k, self.seed, self.n_steps = n_cases, k, seed, n_steps
+
+    def __len__(self) -> int:
+        return self.n_steps
+
+    def __iter__(self):
+        rng = torch.Generator().manual_seed(self.seed)
+        for _ in range(self.n_steps):
+            yield torch.randperm(self.n_cases, generator=rng)[:self.k].tolist()
+
+
+def _collate_passes(picked: "list[ConditionalCase]", per_pass: int) -> list[CaseBatch]:
+    """A step's cases, stacked into its passes (runs in the worker)."""
+    return [stack_cases(picked[s:s + per_pass]) for s in range(0, len(picked), per_pass)]
+
+
 def _world() -> tuple[int, int]:
     """(rank, world_size); (0, 1) when not running distributed."""
     if dist.is_available() and dist.is_initialized():
@@ -402,14 +464,28 @@ def train_conditional(
     t_start = t_window = time.perf_counter()
     wait_window, steps_window = 0.0, 0
 
-    # Prefetch: the next step's batch is stacked + pinned on a thread while the GPU works.
-    pool = ThreadPoolExecutor(max_workers=1)
-    pending = pool.submit(host_batch, draw())
+    # Prefetch: the next step's batch is stacked + pinned while the GPU works, on a
+    # thread, or in DataLoader worker processes (same draws, same order).
+    n_steps = config.epochs - start_epoch + 1
+    if case_paths is not None and config.loader_workers > 0:
+        loader = torch.utils.data.DataLoader(
+            _CaseFiles(case_paths), batch_sampler=_StepDraws(n_cases, k, config.seed + rank,
+                                                                    n_steps),
+            num_workers=config.loader_workers, collate_fn=partial(_collate_passes, per_pass=per_pass),
+            pin_memory=cuda, prefetch_factor=2, persistent_workers=False)
+        batches = iter(loader)
+        next_batch = lambda: next(batches)
+        pool = None
+    else:
+        pool = ThreadPoolExecutor(max_workers=1)
+        pending = pool.submit(host_batch, draw())
+        next_batch = lambda: pending.result()
+
     for epoch in range(start_epoch, config.epochs + 1):
         t_wait = time.perf_counter()
-        passes = [b.to(device) for b in pending.result()]
+        passes = [b.to(device) for b in next_batch()]
         wait_window += time.perf_counter() - t_wait
-        if epoch < config.epochs:
+        if pool is not None and epoch < config.epochs:
             pending = pool.submit(host_batch, draw())
 
         if prof is not None and cuda:
@@ -440,11 +516,7 @@ def train_conditional(
             prof["fwd"] += time.perf_counter() - t; t = time.perf_counter()
         if world > 1:  # average gradients and logged losses across processes
             with record_function("step/all_reduce"):
-                for p in model.parameters():
-                    dist.all_reduce(p.grad)
-                    p.grad.div_(world)
-                dist.all_reduce(losses)
-                losses.div_(world)
+                losses = _average_across_processes(list(model.parameters()), losses, world)
         losses = losses.cpu().tolist()
         if not all(map(lambda x: x == x and abs(x) != float("inf"), losses)):
             raise FloatingPointError(f"Non-finite loss at epoch {epoch}.")
@@ -493,7 +565,8 @@ def train_conditional(
                                                      or epoch == config.epochs):
             _save_checkpoint(model, optimizer, history, epoch, config)
 
-    pool.shutdown()
+    if pool is not None:
+        pool.shutdown()
     if readers is not None:
         readers.shutdown()
     return history
