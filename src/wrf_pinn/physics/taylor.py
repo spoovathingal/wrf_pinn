@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 
 import torch
 from torch import nn
@@ -193,14 +194,23 @@ def coordinate_jet(values: torch.Tensor, axis: int, n_coord: int = 4) -> Jet:
     return Jet(values, d.expand(n_coord, values.shape[0], 1))
 
 
+@lru_cache(maxsize=32)
+def _scale_column(scales: tuple[float, ...], device: torch.device,
+                  dtype: torch.dtype) -> torch.Tensor:
+    """Coordinate scales as a (n_coord, 1) tensor on ``device``, built once: a
+    per-call host-to-device copy makes the CPU wait for the GPU."""
+    return torch.tensor(scales, dtype=dtype, device=device)[:, None]
+
+
 def taylor_forward(net: nn.Sequential, coordinates: torch.Tensor, z_rows: torch.Tensor,
-                   coordinate_scales: Sequence[float]) -> Jet:
+                   coordinate_scales: Sequence[float], second: bool = True) -> Jet:
     """Network outputs with first (x, y, z, t) and spatial second derivatives.
 
     ``net`` is a Sequential of Linear layers with Tanh between them, fed
     ``[coordinates | z_rows]`` (the ConditionalModel layout). Coordinates are
     normalized, physical = offset + scale * normalized, so derivatives come out
-    with respect to physical coordinates."""
+    with respect to physical coordinates. ``second=False`` carries first
+    derivatives only (5 channels instead of 11; the result has ``h=None``)."""
     layers = list(net)
     if not (isinstance(layers[0], nn.Linear) and isinstance(layers[-1], nn.Linear)
             and all(isinstance(m, nn.Tanh) for m in layers[1::2])
@@ -210,23 +220,26 @@ def taylor_forward(net: nn.Sequential, coordinates: torch.Tensor, z_rows: torch.
     x = torch.cat([coordinates, z_rows], dim=1) if z_rows.shape[1] else coordinates
 
     first = layers[0]
-    seeds = 1.0 / torch.as_tensor(coordinate_scales, dtype=x.dtype, device=x.device)
+    scales = _scale_column(tuple(coordinate_scales), x.device, x.dtype)  # (4, 1), cached
     v = first(x)
     # d(W x + b)/d(coord k) = W[:, k] / scale_k: the same for every point.
-    d = (first.weight[:, :n_coord].T * seeds[:, None])[:, None, :]       # (4, 1, width)
+    d = (first.weight[:, :n_coord].T / scales)[:, None, :]               # (4, 1, width)
     h = None                                                             # zero so far
 
     for i in range(1, len(layers), 2):
         a = torch.tanh(v)
         s = 1.0 - a * a                     # tanh'
-        s2 = -2.0 * a * s                   # tanh''
         d_next = s * d                      # broadcasts (4, 1, w) -> (4, n, w)
-        hs = [s2 * d[p] * d[q] for p, q in PAIRS]
-        h_next = torch.stack(hs) if h is None else s * h + torch.stack(hs)
-        lin = layers[i + 1]
         n, w = a.shape
-        stacked = torch.cat([a[None], d_next, h_next]).reshape(-1, w)      # (11 n, w)
-        out = (stacked @ lin.weight.T).reshape(1 + n_coord + len(PAIRS), n, -1)
+        parts = [a[None], d_next]
+        if second:
+            s2 = -2.0 * a * s               # tanh''
+            hs = [s2 * d[p] * d[q] for p, q in PAIRS]
+            parts.append(torch.stack(hs) if h is None else s * h + torch.stack(hs))
+        lin = layers[i + 1]
+        stacked = torch.cat(parts).reshape(-1, w)          # (11 n, w), or (5 n, w) first-order
+        out = (stacked @ lin.weight.T).reshape(-1, n, lin.out_features)   # (channels, n, out)
         v = out[0] + lin.bias
-        d, h = out[1:1 + n_coord], out[1 + n_coord:]
+        d = out[1:1 + n_coord]
+        h = out[1 + n_coord:] if second else None
     return Jet(v, d, h)

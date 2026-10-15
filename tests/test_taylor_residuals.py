@@ -118,3 +118,39 @@ def test_taylor_rejects_unsupported_activation():
                                                             activation="silu"))
     with pytest.raises(TypeError):
         taylor_forward(model.net, torch.zeros(4, 4), torch.zeros(4, LATENT), (1, 1, 1, 1))
+
+
+def test_surface_residuals_with_taylor_jacobian_match_autograd():
+    """The wall residual reads its gradients from a first-order Taylor pass."""
+    from wrf_pinn.physics.residuals_boundary import no_penetration_z_wall_residuals
+
+    def run(taylor: bool):
+        model, coords, z_rows = _setup(seed=3)
+        wall = coords.clone()
+        wall[:, 2] = (0.0 - SCALING.z.offset) / SCALING.z.scale          # z = 0 physical
+        reference = wall.clone()
+        reference[:, 2] = (PHYSICS.constants.surface_reference_height
+                           - SCALING.z.offset) / SCALING.z.scale
+        gen = torch.Generator().manual_seed(0)
+        fric = 0.1 + 0.4 * torch.rand(wall.shape[0], 1, generator=gen, dtype=torch.float64)
+        heat = 0.05 * torch.randn(wall.shape[0], 1, generator=gen, dtype=torch.float64)
+        if taylor:
+            jet = taylor_forward(model.net, wall, z_rows, SCALING.coordinate_scales(), second=False)
+            assert jet.h is None
+            state, jac = jet.v, jet.d
+        else:
+            wall = wall.requires_grad_(True)
+            state, jac = model(wall, z_rows), None
+        res = no_penetration_z_wall_residuals(
+            coordinates=wall, state=state, reference_coordinates=reference,
+            reference_state=model(reference, z_rows), physics=PHYSICS, scaling=SCALING,
+            fric_vel=fric, ht_flux=heat, state_jacobian=jac)
+        loss = sum(r.square().mean() for r in res.values())
+        return res, torch.autograd.grad(loss, list(model.parameters()))
+
+    (new, g_new), (old, g_old) = run(True), run(False)
+    for name in old:
+        assert old[name].numel() > 0
+        torch.testing.assert_close(new[name], old[name], rtol=1e-10, atol=1e-12)
+    for a, b in zip(g_new, g_old):
+        torch.testing.assert_close(a, b, rtol=1e-9, atol=1e-12)

@@ -23,6 +23,7 @@ from wrf_pinn.physics.residuals_pde import (
     cartesian_zero_forcing_residuals, cartesian_zero_forcing_residuals_taylor,
 )
 from wrf_pinn.physics.residuals_boundary import no_penetration_z_wall_residuals
+from wrf_pinn.physics.taylor import taylor_forward
 
 #: the five losses of the conditional PINN, in order.
 LOSS_NAMES: tuple[str, ...] = ("data", "initial", "flow_boundary", "pde", "surface")
@@ -172,6 +173,12 @@ def _device_constant(values: tuple[float, ...], device: torch.device,
     return torch.tensor(values, device=device, dtype=dtype)
 
 
+def _taylor_supported(model: nn.Module) -> bool:
+    """A tanh ConditionalModel: its coordinate derivatives can be carried forward
+    (``physics.taylor``) instead of taken with nested autograd."""
+    return getattr(getattr(model, "config", None), "activation", None) == "tanh"
+
+
 def _surface_loss(model, b: CaseBatch, cfg, scaling) -> torch.Tensor:
     """Surface-layer residual on each case's bottom face, using its stored fluxes.
 
@@ -183,8 +190,13 @@ def _surface_loss(model, b: CaseBatch, cfg, scaling) -> torch.Tensor:
     z_floor = (0.0 - scaling.z.offset) / scaling.z.scale
     wall = torch.stack([surf[:, 0], surf[:, 1],
                         torch.full((surf.shape[0],), z_floor, device=dev, dtype=dt),
-                        surf[:, 2]], dim=1).requires_grad_(True)
-    wall_state = model(wall, z_rows)
+                        surf[:, 2]], dim=1)
+    if _taylor_supported(model):  # wall gradients from one first-order forward pass
+        jet = taylor_forward(model.net, wall, z_rows, scaling.coordinate_scales(), second=False)
+        wall_state, state_jacobian = jet.v, jet.d
+    else:
+        wall = wall.requires_grad_(True)
+        wall_state, state_jacobian = model(wall, z_rows), None
 
     reference = wall.detach().clone()
     z1 = (cfg.physics.constants.surface_reference_height - scaling.z.offset) / scaling.z.scale
@@ -200,7 +212,8 @@ def _surface_loss(model, b: CaseBatch, cfg, scaling) -> torch.Tensor:
         physics=cfg.physics, scaling=scaling,
         fric_vel=phys[:, 0:1], ht_flux=phys[:, 1:2],
         surface_stress_scale=cfg.surface_stress_scale,
-        surface_heat_flux_scale=cfg.surface_heat_flux_scale)
+        surface_heat_flux_scale=cfg.surface_heat_flux_scale,
+        state_jacobian=state_jacobian)
     per_eq = torch.stack([_per_case_mean(r.square().reshape(-1), b.surface_sizes, b.k)
                           for r in res.values()])                    # (n_eq, k)
     return per_eq.mean(dim=0).mean()
@@ -211,7 +224,7 @@ def _pde_loss(model, coll: torch.Tensor, z_rows: torch.Tensor, cfg, scaling) -> 
 
     A tanh ConditionalModel takes the forward-Taylor path (derivatives carried
     through one forward pass); anything else falls back to nested autograd."""
-    if getattr(getattr(model, "config", None), "activation", None) == "tanh":
+    if _taylor_supported(model):
         res = cartesian_zero_forcing_residuals_taylor(model.net, coll, z_rows,
                                                       physics=cfg.physics, scaling=scaling)
     else:

@@ -175,7 +175,8 @@ def no_penetration_z_wall_residuals(
     scaling: ResidualScalingConfig = DEFAULT_RESIDUAL_SCALING,
     surface_stress_scale: float = 3.8273,
     *, fric_vel: torch.Tensor, ht_flux: torch.Tensor,
-    surface_heat_flux_scale: float = 1.0
+    surface_heat_flux_scale: float = 1.0,
+    state_jacobian: "torch.Tensor | None" = None,
 ) -> dict[str, torch.Tensor]:
     """Return no-penetration and neutral surface stress residuals.
 
@@ -186,6 +187,11 @@ def no_penetration_z_wall_residuals(
     fric_vel [m/s] and ht_flux [K m/s] must be physical (N, 1) tensors,
     aligned with every row of coordinates. Surface losses use bottom rows.
     Flat z=0 geometry is retained until the terrain update.
+
+    ``state_jacobian`` (n_coord, N, n_state), if given, holds d(state)/d(physical
+    coordinate) of the normalized state at the wall points (e.g. ``taylor_forward``'s
+    ``d``); the wall gradients are read from it instead of taken with autograd, so
+    ``coordinates`` need not require grad.
     """
     bottom_mask = _validate_no_penetration_z_wall_inputs(
         coordinates=coordinates, state=state,
@@ -226,10 +232,15 @@ def no_penetration_z_wall_residuals(
     rho_wall = _physical_density_from_state(coordinates, state, physics, scaling)
     rho_1 = _physical_density_from_state(reference_coordinates, reference_state, physics, scaling)
 
-    grad_u = _physical_gradient(u_wall, coordinates, scaling)
-    grad_v = _physical_gradient(v_wall, coordinates, scaling)
-    grad_w = _physical_gradient(w_wall, coordinates, scaling)
-    grad_theta = _physical_gradient(theta_wall, coordinates, scaling)
+    if state_jacobian is not None:
+        grad = lambda name, i: getattr(scaling, name).scale * state_jacobian[:, :, i].T
+        grad_u, grad_v = grad("u", u_index), grad("v", v_index)
+        grad_w, grad_theta = grad("w", w_index), grad("theta", theta_index)
+    else:
+        grad_u = _physical_gradient(u_wall, coordinates, scaling)
+        grad_v = _physical_gradient(v_wall, coordinates, scaling)
+        grad_w = _physical_gradient(w_wall, coordinates, scaling)
+        grad_theta = _physical_gradient(theta_wall, coordinates, scaling)
 
     u_z = grad_u[:, 2:3]
     v_z = grad_v[:, 2:3]
