@@ -138,3 +138,20 @@ def test_collocation_points_independent_of_cases_per_pass(monkeypatch):
     whole = collocation(0)
     assert torch.equal(whole, collocation(1))
     assert torch.equal(whole, collocation(2))
+
+
+def test_bf16_data_forwards_stay_close_to_float32():
+    """bf16 autocast on the derivative-free forwards changes losses only at bf16 rounding."""
+    cases = [_make_case(f"c{i}", i) for i in range(8)]
+
+    def history(bf16: bool):
+        torch.manual_seed(0)
+        model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=32))
+        cfg = ConditionalTrainConfig(epochs=5, batch_cases=4, device="cpu", log_every=100,
+                                     bf16_data=bf16, **_DATA_ONLY)
+        return np.array(train_conditional(model, cases, cfg).total)
+
+    fp32, bf16 = history(False), history(True)
+    assert np.isfinite(bf16).all()
+    assert not np.array_equal(fp32, bf16), "bf16 flag had no effect"
+    np.testing.assert_allclose(bf16, fp32, rtol=2e-2)

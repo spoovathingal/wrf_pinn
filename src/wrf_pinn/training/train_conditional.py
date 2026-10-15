@@ -78,6 +78,10 @@ class ConditionalTrainConfig:
     checkpoint_every: int = 100
     #: when True, time forward/backward/step per epoch (CUDA-synced) for profiling.
     profile: bool = False
+    #: run the derivative-free forwards (data, initial, flow-boundary points) under
+    #: bf16 autocast: their matmuls use bf16 tensor cores. The PDE and surface paths,
+    #: which differentiate the network, stay in float32. Off by default.
+    bf16_data: bool = False
 
 
 def _resolve_device(name: str) -> torch.device:
@@ -234,6 +238,14 @@ def _pde_loss(model, coll: torch.Tensor, z_rows: torch.Tensor, cfg, scaling) -> 
     return torch.stack([r.square().mean() for r in res.values()]).mean()
 
 
+def _forward_maybe_bf16(model: nn.Module, coords: torch.Tensor, z_rows: torch.Tensor,
+                        bf16: bool) -> torch.Tensor:
+    """model(coords, z_rows), under bf16 autocast when ``bf16``; always float32 out."""
+    with torch.autocast(device_type=coords.device.type, dtype=torch.bfloat16, enabled=bf16):
+        out = model(coords, z_rows)
+    return out.float()
+
+
 def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
                   unit_coll: "torch.Tensor | None" = None) -> dict[str, torch.Tensor]:
     """The five losses, each averaged over the batch's cases (one forward per loss).
@@ -245,8 +257,11 @@ def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
     # output_size is each point set's row count: passing it keeps repeat_interleave
     # from reading the GPU-resident sizes back to the host (a sync per call).
     rows = lambda sizes, n: torch.repeat_interleave(b.z, sizes, dim=0, output_size=n)
+    # derivative-free forwards, optionally in bf16; results back to float32 for the losses
+    plain = lambda coords, sizes: _forward_maybe_bf16(
+        model, coords, rows(sizes, coords.shape[0]), cfg.bf16_data)[:, :n_obs]
 
-    pred = model(b.interior, rows(b.interior_sizes, b.interior.shape[0]))[:, :n_obs]
+    pred = plain(b.interior, b.interior_sizes)
     err2 = (((pred - b.targets) * b.target_mask) ** 2).sum(dim=1)
     seg = torch.repeat_interleave(torch.arange(k, device=pred.device), b.interior_sizes,
                                   output_size=b.interior.shape[0])
@@ -254,11 +269,11 @@ def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
     n_meas = torch.zeros(k, device=pred.device).index_add_(0, seg, b.target_mask.sum(dim=1))
     data = (sse / n_meas.clamp_min(1.0)).mean()
 
-    ic = model(b.initial_coords, rows(b.initial_sizes, b.initial_coords.shape[0]))[:, :n_obs]
+    ic = plain(b.initial_coords, b.initial_sizes)
     initial = (_per_case_mean(((ic - b.initial_targets) ** 2).sum(dim=1), b.initial_sizes, k)
                / n_obs).mean()
 
-    bc = model(b.boundary_coords, rows(b.boundary_sizes, b.boundary_coords.shape[0]))[:, :n_obs]
+    bc = plain(b.boundary_coords, b.boundary_sizes)
     flow = (_per_case_mean(((bc - b.boundary_targets) ** 2).sum(dim=1), b.boundary_sizes, k)
             / n_obs).mean()
 
