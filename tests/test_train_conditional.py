@@ -75,7 +75,8 @@ def test_checkpoint_save_and_resume(tmp_path):
 
     model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=16))
     cfg = ConditionalTrainConfig(epochs=20, batch_cases=3, device="cpu", log_every=20,
-                                 checkpoint_path=str(ckpt), checkpoint_every=10, **_DATA_ONLY)
+                                 checkpoint_path=str(ckpt), checkpoint_every=10,
+                                 events_path=str(tmp_path / "events.jsonl"), **_DATA_ONLY)
     hist = train_conditional(model, cases, cfg)
     assert ckpt.is_file(), "checkpoint file was not written"
     assert len(hist.total) == 20
@@ -83,6 +84,15 @@ def test_checkpoint_save_and_resume(tmp_path):
     # the saved epoch must be the last multiple of checkpoint_every (or final epoch)
     ck = torch.load(str(ckpt), map_location="cpu")
     assert ck["epoch"] == 20
+    assert ck["schema_version"] == 2
+    assert ck["manifest"]["model"]["latent_dim"] == LATENT_DIM
+    assert ck["manifest"]["model"]["config"]["hidden_width"] == 16
+    assert ck["manifest"]["training"]["seed"] == cfg.seed
+    import json
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    assert events[0]["event"] == "run_start"
+    assert any(e["event"] == "step" and e["gradient_norm_finite"] for e in events)
+    assert events[-1]["event"] == "checkpoint" and events[-1]["epoch"] == 20
 
     # resume into a FRESH model: weights load from the checkpoint, start epoch advances.
     fresh = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=16))

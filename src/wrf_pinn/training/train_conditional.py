@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import math
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +27,7 @@ from wrf_pinn.physics.residuals_pde import (
 )
 from wrf_pinn.physics.residuals_boundary import no_penetration_z_wall_residuals
 from wrf_pinn.physics.taylor import taylor_forward
+from wrf_pinn.training.provenance import run_manifest, write_event
 
 #: the five losses of the conditional PINN, in order.
 LOSS_NAMES: tuple[str, ...] = ("data", "initial", "flow_boundary", "pde", "surface")
@@ -92,6 +94,8 @@ class ConditionalTrainConfig:
     #: residuals (fuses their many small elementwise kernels). The first steps pay
     #: the compile time. Off by default.
     compile: bool = False
+    #: Optional JSONL optimization events; checkpoint provenance is always saved.
+    events_path: "str | None" = None
 
 
 def _resolve_device(name: str) -> torch.device:
@@ -427,6 +431,11 @@ def train_conditional(
     device = _resolve_device(config.device)
     cuda = device.type == "cuda"
     model.to(device)
+    manifest = (run_manifest(model, config, case_paths=case_paths, cases=cases)
+                if rank == 0 and (config.checkpoint_path or config.events_path) else None)
+    if rank == 0:
+        write_event(config.events_path, {"event": "run_start", "manifest": manifest,
+                                        "device": str(device), "world_size": world})
     if world > 1:  # every process starts from rank 0's weights
         for p in model.parameters():
             dist.broadcast(p.data, src=0)
@@ -522,7 +531,7 @@ def train_conditional(
             raise FloatingPointError(f"Non-finite loss at epoch {epoch}.")
         # Clip gradients: PDE residual gradients (2nd derivatives via autograd) can
         # spike and freeze training. Standard PINN safeguard.
-        torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
         if prof is not None:
             if cuda:
                 torch.cuda.synchronize()
@@ -542,6 +551,15 @@ def train_conditional(
             on_step(epoch)
 
         if rank == 0 and (epoch == 1 or epoch == config.epochs or epoch % config.log_every == 0):
+            if config.events_path:
+                norm = float(grad_norm.detach().cpu())
+                write_event(config.events_path, {
+                    "event": "step", "epoch": epoch,
+                    "losses": dict(zip(("total", *weights), losses)),
+                    "gradient_norm_before_clip": norm if math.isfinite(norm) else None,
+                    "gradient_norm_finite": math.isfinite(norm),
+                    "gradient_clip_norm": config.grad_clip_norm,
+                })
             now = time.perf_counter()
             s_step = (now - t_window) / steps_window
             eta_h = s_step * (config.epochs - epoch) / 3600
@@ -563,7 +581,7 @@ def train_conditional(
 
         if rank == 0 and config.checkpoint_path and (epoch % config.checkpoint_every == 0
                                                      or epoch == config.epochs):
-            _save_checkpoint(model, optimizer, history, epoch, config)
+            _save_checkpoint(model, optimizer, history, epoch, config, manifest)
 
     if pool is not None:
         pool.shutdown()
@@ -572,16 +590,18 @@ def train_conditional(
     return history
 
 
-def _save_checkpoint(model, optimizer, history, epoch, config) -> None:
+def _save_checkpoint(model, optimizer, history, epoch, config, manifest=None) -> None:
     """Atomically write a resumable checkpoint, plus a step-tagged copy kept for good."""
     path = Path(config.checkpoint_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    torch.save({"epoch": epoch, "model": model.state_dict(),
+    torch.save({"schema_version": 2, "manifest": manifest,
+                "epoch": epoch, "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(), "history": vars(history)}, tmp)
     tagged = path.with_name(f"{path.stem}_step{epoch:06d}{path.suffix}")
     tagged.write_bytes(tmp.read_bytes())
     tmp.replace(path)
+    write_event(config.events_path, {"event": "checkpoint", "epoch": epoch, "path": str(path)})
     print(f"checkpoint @ epoch {epoch} -> {path} (+ {tagged.name})", file=sys.stderr, flush=True)
 
 
