@@ -19,7 +19,9 @@ from wrf_pinn.data.conditional_case import (
 )
 from wrf_pinn.config.physics import DEFAULT_PHYSICS, PhysicsConfig
 from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING, ResidualScalingConfig
-from wrf_pinn.physics.residuals_pde import cartesian_zero_forcing_residuals
+from wrf_pinn.physics.residuals_pde import (
+    cartesian_zero_forcing_residuals, cartesian_zero_forcing_residuals_taylor,
+)
 from wrf_pinn.physics.residuals_boundary import no_penetration_z_wall_residuals
 
 #: the five losses of the conditional PINN, in order.
@@ -205,10 +207,17 @@ def _surface_loss(model, b: CaseBatch, cfg, scaling) -> torch.Tensor:
 
 
 def _pde_loss(model, coll: torch.Tensor, z_rows: torch.Tensor, cfg, scaling) -> torch.Tensor:
-    """Mean squared PDE residual over equal-sized per-case collocation sets."""
-    coll = coll.requires_grad_(True)
-    res = cartesian_zero_forcing_residuals(coll, model(coll, z_rows),
-                                           physics=cfg.physics, scaling=scaling)
+    """Mean squared PDE residual over equal-sized per-case collocation sets.
+
+    A tanh ConditionalModel takes the forward-Taylor path (derivatives carried
+    through one forward pass); anything else falls back to nested autograd."""
+    if getattr(getattr(model, "config", None), "activation", None) == "tanh":
+        res = cartesian_zero_forcing_residuals_taylor(model.net, coll, z_rows,
+                                                      physics=cfg.physics, scaling=scaling)
+    else:
+        coll = coll.requires_grad_(True)
+        res = cartesian_zero_forcing_residuals(coll, model(coll, z_rows),
+                                               physics=cfg.physics, scaling=scaling)
     return torch.stack([r.square().mean() for r in res.values()]).mean()
 
 
