@@ -74,6 +74,30 @@ def _physical_gradient(
     return gradient / coordinate_scales
 
 
+def _product_gradient(*factors: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    """Gradient of a product of fields from each factor's (field, gradient) pair.
+
+    ``grad(f_1 ... f_n) = sum_i (prod_{j != i} f_j) grad(f_i)``. Fields are (n, 1),
+    gradients (n, n_coord), in the same (physical) coordinates."""
+    fields = [f for f, _ in factors]
+    total = None
+    for i, (_, grad) in enumerate(factors):
+        others = None
+        for j, f in enumerate(fields):
+            if j != i:
+                others = f if others is None else others * f
+        term = grad if others is None else others * grad
+        total = term if total is None else total + term
+    return total
+
+
+@lru_cache(maxsize=32)
+def _device_scalar(value: float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """0-d tensor holding ``value`` on ``device``, built once (``new_tensor`` per call
+    copied it host-to-device, a CPU-GPU sync each time). Do not modify in place."""
+    return torch.tensor(value, dtype=dtype, device=device)
+
+
 @lru_cache(maxsize=32)
 def _coordinate_scale_tensor(scales: tuple[float, ...], device: torch.device,
                              dtype: torch.dtype) -> torch.Tensor:
@@ -266,8 +290,8 @@ def _brunt_vaisala_squared(theta: torch.Tensor, theta_z: torch.Tensor, physics: 
 def _sgs_mixing_length(n_squared: torch.Tensor, e_sgs: torch.Tensor, physics: PhysicsConfig) -> torch.Tensor:
     """Return the SGS mixing length for stable and unstable flow."""
 
-    delta = e_sgs.new_tensor(physics.uniform_filter_width)
-    minimum_length = e_sgs.new_tensor(physics.minimum_mixing_length)
+    delta = _device_scalar(physics.uniform_filter_width, e_sgs.device, e_sgs.dtype)
+    minimum_length = _device_scalar(physics.minimum_mixing_length, e_sgs.device, e_sgs.dtype)
 
     numerical_floor = torch.finfo(e_sgs.dtype).tiny
     sqrt_e_sgs = torch.sqrt(e_sgs.clamp_min(0.0) + numerical_floor)
@@ -297,7 +321,7 @@ def _diagnostic_sgs_coefficients(
 
     k_m = (physics.sgs_mixing_coefficient * mixing_length * sqrt_e_sgs)
 
-    delta = e_sgs.new_tensor(physics.uniform_filter_width)
+    delta = _device_scalar(physics.uniform_filter_width, e_sgs.device, e_sgs.dtype)
 
     k_scalar = k_m * (1.0 + 2.0 * mixing_length / delta)
 
@@ -378,24 +402,29 @@ def cartesian_zero_forcing_residuals(
     k_theta = k_scalar
     k_q_v = k_scalar
 
-    # Dry-air mass and momentum storage/transport products.
+    # Dry-air mass and momentum storage/transport products. Only rho_d needs its own
+    # backward pass; the product gradients follow from the product rule on the
+    # gradients already computed (autograd would apply the same rule, at the cost
+    # of one full backward pass through the network per product).
     grad_rho_d = _physical_gradient(rho_d, coordinates, scaling)
-    grad_rho_d_u = _physical_gradient(rho_d * u, coordinates, scaling)
-    grad_rho_d_v = _physical_gradient(rho_d * v, coordinates, scaling)
-    grad_rho_d_w = _physical_gradient(rho_d * w, coordinates, scaling)
+    rho = (rho_d, grad_rho_d)
+    gu, gv, gw = (u, grad_u), (v, grad_v), (w, grad_w)
+    grad_rho_d_u = _product_gradient(rho, gu)
+    grad_rho_d_v = _product_gradient(rho, gv)
+    grad_rho_d_w = _product_gradient(rho, gw)
 
     _, _, _, rho_d_t = grad_rho_d.split(1, dim=1)
     rho_d_u_x, _, _, rho_d_u_t = grad_rho_d_u.split(1, dim=1)
     _, rho_d_v_y, _, rho_d_v_t = grad_rho_d_v.split(1, dim=1)
     _, _, rho_d_w_z, rho_d_w_t = grad_rho_d_w.split(1, dim=1)
 
-    rho_d_uu_x = _physical_gradient(rho_d * u * u, coordinates, scaling)[:, 0:1]
-    rho_d_vv_y = _physical_gradient(rho_d * v * v, coordinates, scaling)[:, 1:2]    
-    rho_d_ww_z = _physical_gradient(rho_d * w * w, coordinates, scaling)[:, 2:3]
+    rho_d_uu_x = _product_gradient(rho, gu, gu)[:, 0:1]
+    rho_d_vv_y = _product_gradient(rho, gv, gv)[:, 1:2]
+    rho_d_ww_z = _product_gradient(rho, gw, gw)[:, 2:3]
 
-    grad_rho_d_uv = _physical_gradient(rho_d * u * v, coordinates, scaling)
-    grad_rho_d_uw = _physical_gradient(rho_d * u * w, coordinates, scaling)
-    grad_rho_d_vw = _physical_gradient(rho_d * v * w, coordinates, scaling)
+    grad_rho_d_uv = _product_gradient(rho, gu, gv)
+    grad_rho_d_uw = _product_gradient(rho, gu, gw)
+    grad_rho_d_vw = _product_gradient(rho, gv, gw)
 
     rho_d_uv_x = grad_rho_d_uv[:, 0:1]
     rho_d_uv_y = grad_rho_d_uv[:, 1:2]
@@ -404,17 +433,18 @@ def cartesian_zero_forcing_residuals(
     rho_d_vw_y = grad_rho_d_vw[:, 1:2]
     rho_d_vw_z = grad_rho_d_vw[:, 2:3]
 
-    # Conservative potential-temperature products.
-    rho_d_theta_t = _physical_gradient(rho_d * theta, coordinates, scaling)[:, 3:4]
-    rho_d_u_theta_x = _physical_gradient(rho_d * u * theta, coordinates, scaling)[:, 0:1]
-    rho_d_v_theta_y = _physical_gradient(rho_d * v * theta, coordinates, scaling)[:, 1:2]
-    rho_d_w_theta_z = _physical_gradient(rho_d * w * theta, coordinates, scaling)[:, 2:3]
+    # Conservative potential-temperature products (product rule, as above).
+    gth, gqv = (theta, grad_theta), (q_v, grad_q_v)
+    rho_d_theta_t = _product_gradient(rho, gth)[:, 3:4]
+    rho_d_u_theta_x = _product_gradient(rho, gu, gth)[:, 0:1]
+    rho_d_v_theta_y = _product_gradient(rho, gv, gth)[:, 1:2]
+    rho_d_w_theta_z = _product_gradient(rho, gw, gth)[:, 2:3]
 
     # Conservative water-vapor products.
-    rho_d_q_v_t = _physical_gradient(rho_d * q_v, coordinates, scaling)[:, 3:4]
-    rho_d_u_q_v_x = _physical_gradient(rho_d * u * q_v, coordinates, scaling)[:, 0:1]
-    rho_d_v_q_v_y = _physical_gradient(rho_d * v * q_v, coordinates, scaling)[:, 1:2]
-    rho_d_w_q_v_z = _physical_gradient(rho_d * w * q_v, coordinates, scaling)[:, 2:3]
+    rho_d_q_v_t = _product_gradient(rho, gqv)[:, 3:4]
+    rho_d_u_q_v_x = _product_gradient(rho, gu, gqv)[:, 0:1]
+    rho_d_v_q_v_y = _product_gradient(rho, gv, gqv)[:, 1:2]
+    rho_d_w_q_v_z = _product_gradient(rho, gw, gqv)[:, 2:3]
 
     divergence = u_x + v_y + w_z
     # Physical SGS momentum stresses:
