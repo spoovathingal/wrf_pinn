@@ -165,3 +165,20 @@ def test_compiled_taylor_residuals_match_eager():
         model.net, coords, z_rows, physics=PHYSICS, scaling=SCALING)
     for name in eager:
         torch.testing.assert_close(compiled[name], eager[name], rtol=1e-12, atol=1e-14)
+
+
+def test_taylor_per_case_latent_matches_per_point_rows():
+    """taylor_forward and the residuals give the same results with z per case."""
+    model, coords, z_rows = _setup(seed=4)
+    z_case = z_rows[::coords.shape[0] // 3]                       # the 3 distinct cases
+    n = coords.shape[0] // 3
+    a = taylor_forward(model.net, coords, z_rows, SCALING.coordinate_scales())
+    b = taylor_forward(model.net, coords, z_case, SCALING.coordinate_scales(), sizes=n)
+    for x, y in ((a.v, b.v), (a.d, b.d), (a.h, b.h)):
+        torch.testing.assert_close(x, y, rtol=1e-12, atol=1e-12)
+    ra = cartesian_zero_forcing_residuals_taylor(model.net, coords, z_rows, physics=PHYSICS,
+                                                 scaling=SCALING)
+    rb = cartesian_zero_forcing_residuals_taylor(model.net, coords, z_case, physics=PHYSICS,
+                                                 scaling=SCALING, sizes=n)
+    for name in ra:
+        torch.testing.assert_close(ra[name], rb[name], rtol=1e-10, atol=1e-12)

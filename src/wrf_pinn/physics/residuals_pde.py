@@ -539,6 +539,7 @@ def cartesian_zero_forcing_residuals_taylor(
     z_rows: torch.Tensor,
     physics: PhysicsConfig = DEFAULT_PHYSICS,
     scaling: ResidualScalingConfig = DEFAULT_RESIDUAL_SCALING,
+    sizes: "torch.Tensor | int | None" = None,
 ) -> TensorDict:
     """The residuals of ``cartesian_zero_forcing_residuals``, without nested autograd.
 
@@ -548,7 +549,8 @@ def cartesian_zero_forcing_residuals_taylor(
     pass (``taylor_forward``) and every pointwise quantity is a ``Jet`` carrying its
     gradient, so products, the equation of state and the SGS stresses differentiate
     themselves. ``net`` is the Linear/Tanh MLP fed ``[coordinates | z_rows]``
-    (``ConditionalModel.net``); ``coordinates`` need not require grad.
+    (``ConditionalModel.net``); ``coordinates`` need not require grad. With
+    ``sizes``, ``z_rows`` holds one latent row per case (``ConditionalModel.forward``).
     """
 
     _validate_physics_config(physics)
@@ -556,7 +558,7 @@ def cartesian_zero_forcing_residuals_taylor(
     if coordinates.ndim != 2 or coordinates.shape[1] != 4:
         raise ValueError("coordinates must have shape (n_points, 4).")
 
-    out = taylor_forward(net, coordinates, z_rows, scaling.coordinate_scales())
+    out = taylor_forward(net, coordinates, z_rows, scaling.coordinate_scales(), sizes=sizes)
     if out.v.shape[1] < physics.state_dim:
         raise ValueError(
             "state has too few columns for the configured active variables; "

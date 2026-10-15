@@ -44,10 +44,33 @@ class ConditionalModel(nn.Module):
         layers.append(nn.Linear(width, config.state_dim))
         return nn.Sequential(*layers)
 
-    def forward(self, coordinates: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        """Predict state at coordinates. z is (1, latent_dim), broadcast to every
-        point, or (n_points, latent_dim) for a batch mixing several cases."""
+    def forward(self, coordinates: torch.Tensor, z: torch.Tensor,
+                sizes: "torch.Tensor | int | None" = None) -> torch.Tensor:
+        """Predict state at coordinates.
+
+        z is (1, latent_dim), broadcast to every point; (n_points, latent_dim), one
+        row per point; or, with ``sizes``, (k, latent_dim), one row per case, where
+        case i owns the next ``sizes[i]`` rows of ``coordinates`` (an int: the same
+        count for every case). The per-case forms multiply z through the first layer
+        once per case instead of once per point: same math, without building an
+        (n_points, latent_dim) copy of z."""
         if z.shape[1] == 0:
             return self.net(coordinates)
-        z_rows = z if z.shape[0] == coordinates.shape[0] else z.expand(coordinates.shape[0], -1)
-        return self.net(torch.cat([coordinates, z_rows], dim=1))
+        if sizes is None and z.shape[0] == coordinates.shape[0]:
+            return self.net(torch.cat([coordinates, z], dim=1))
+        return self.net[1:](first_layer(self.net[0], coordinates, z, sizes))
+
+
+def first_layer(layer: nn.Linear, coordinates: torch.Tensor, z: torch.Tensor,
+                sizes: "torch.Tensor | int | None") -> torch.Tensor:
+    """``layer([coordinates | z per point])`` with z given per case (or broadcast).
+
+    W [c; z] + b = W_c c + (W_z z + b): the z term is computed for the k cases and
+    repeated to their rows, so its cost no longer scales with the number of points."""
+    n_coord = coordinates.shape[1]
+    per_case = nn.functional.linear(z, layer.weight[:, n_coord:], layer.bias)   # (k, width)
+    if sizes is None:
+        rows = per_case.expand(coordinates.shape[0], -1)
+    else:
+        rows = per_case.repeat_interleave(sizes, dim=0, output_size=coordinates.shape[0])
+    return nn.functional.linear(coordinates, layer.weight[:, :n_coord]) + rows

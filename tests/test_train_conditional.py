@@ -124,7 +124,7 @@ def test_collocation_points_independent_of_cases_per_pass(monkeypatch):
 
         def fake_pde(model, coll, z_rows, cfg, scaling, fns=None):  # random data NaNs the real PDE
             seen.append(coll.detach().clone())
-            return (model(coll, z_rows) * 0.0).sum()
+            return (model(coll, z_rows, cfg.n_collocation) * 0.0).sum()  # z per case
 
         monkeypatch.setattr(tc, "_pde_loss", fake_pde)
         torch.manual_seed(0)
@@ -169,3 +169,21 @@ def test_compiled_step_tracks_eager():
         return np.array(train_conditional(model, cases, cfg).total)
 
     np.testing.assert_allclose(history(True), history(False), rtol=1e-5)
+
+
+def test_per_case_latent_matches_per_point_rows():
+    """ConditionalModel(coords, z, sizes) equals feeding z repeated per point."""
+    torch.manual_seed(0)
+    model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=16)).double()
+    z = torch.randn(3, LATENT_DIM, dtype=torch.float64)
+    sizes = torch.tensor([4, 1, 5])
+    coords = torch.randn(int(sizes.sum()), 4, dtype=torch.float64)
+    rows = z.repeat_interleave(sizes, dim=0)
+    torch.testing.assert_close(model(coords, z, sizes), model(coords, rows), rtol=1e-12, atol=1e-12)
+    # an int size gives every case the same number of rows
+    coords2 = torch.randn(6, 4, dtype=torch.float64)
+    torch.testing.assert_close(model(coords2, z, 2), model(coords2, z.repeat_interleave(2, dim=0)),
+                               rtol=1e-12, atol=1e-12)
+    # broadcast form: one latent for all points
+    torch.testing.assert_close(model(coords2, z[:1]), model(coords2, z[:1].expand(6, -1)),
+                               rtol=1e-12, atol=1e-12)

@@ -31,6 +31,8 @@ from functools import lru_cache
 import torch
 from torch import nn
 
+from wrf_pinn.models.conditional import first_layer
+
 #: spatial second-derivative channels, in order (xx, yy, zz, xy, xz, yz)
 PAIRS: tuple[tuple[int, int], ...] = ((0, 0), (1, 1), (2, 2), (0, 1), (0, 2), (1, 2))
 #: (i, j) and (j, i) -> channel of d2/(di dj)
@@ -202,25 +204,32 @@ def _scale_column(scales: tuple[float, ...], device: torch.device,
 
 
 def taylor_forward(net: nn.Sequential, coordinates: torch.Tensor, z_rows: torch.Tensor,
-                   coordinate_scales: Sequence[float], second: bool = True) -> Jet:
+                   coordinate_scales: Sequence[float], second: bool = True,
+                   sizes: "torch.Tensor | int | None" = None) -> Jet:
     """Network outputs with first (x, y, z, t) and spatial second derivatives.
 
     ``net`` is a Sequential of Linear layers with Tanh between them, fed
     ``[coordinates | z_rows]`` (the ConditionalModel layout). Coordinates are
     normalized, physical = offset + scale * normalized, so derivatives come out
     with respect to physical coordinates. ``second=False`` carries first
-    derivatives only (5 channels instead of 11; the result has ``h=None``)."""
+    derivatives only (5 channels instead of 11; the result has ``h=None``).
+    With ``sizes``, ``z_rows`` is one latent row per case (see
+    ``ConditionalModel.forward``) and is multiplied through the first layer once per
+    case; it carries no coordinate derivatives either way."""
     layers = list(net)
     if not (isinstance(layers[0], nn.Linear) and isinstance(layers[-1], nn.Linear)
             and all(isinstance(m, nn.Tanh) for m in layers[1::2])
             and all(isinstance(m, nn.Linear) for m in layers[0::2])):
         raise TypeError("taylor_forward supports Linear/Tanh MLPs only.")
     n_coord = coordinates.shape[1]
-    x = torch.cat([coordinates, z_rows], dim=1) if z_rows.shape[1] else coordinates
-
     first = layers[0]
-    scales = _scale_column(tuple(coordinate_scales), x.device, x.dtype)  # (4, 1), cached
-    v = first(x)
+    scales = _scale_column(tuple(coordinate_scales), coordinates.device, coordinates.dtype)
+    if not z_rows.shape[1]:
+        v = first(coordinates)
+    elif sizes is None and z_rows.shape[0] == coordinates.shape[0]:
+        v = first(torch.cat([coordinates, z_rows], dim=1))
+    else:
+        v = first_layer(first, coordinates, z_rows, sizes)
     # d(W x + b)/d(coord k) = W[:, k] / scale_k: the same for every point.
     d = (first.weight[:, :n_coord].T / scales)[:, None, :]               # (4, 1, width)
     h = None                                                             # zero so far
