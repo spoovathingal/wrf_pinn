@@ -154,3 +154,14 @@ def test_surface_residuals_with_taylor_jacobian_match_autograd():
         torch.testing.assert_close(new[name], old[name], rtol=1e-10, atol=1e-12)
     for a, b in zip(g_new, g_old):
         torch.testing.assert_close(a, b, rtol=1e-9, atol=1e-12)
+
+
+def test_compiled_taylor_residuals_match_eager():
+    """torch.compile traces the jet residuals as one graph and reproduces them."""
+    model, coords, z_rows = _setup(seed=1, stable=True)
+    eager = cartesian_zero_forcing_residuals_taylor(model.net, coords, z_rows,
+                                                    physics=PHYSICS, scaling=SCALING)
+    compiled = torch.compile(cartesian_zero_forcing_residuals_taylor)(
+        model.net, coords, z_rows, physics=PHYSICS, scaling=SCALING)
+    for name in eager:
+        torch.testing.assert_close(compiled[name], eager[name], rtol=1e-12, atol=1e-14)

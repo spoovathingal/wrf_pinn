@@ -24,7 +24,7 @@ import torch
 
 from wrf_pinn.config.physics import DEFAULT_PHYSICS, PhysicsConfig
 from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING, ResidualScalingConfig
-from wrf_pinn.physics.taylor import Jet, coordinate_jet, taylor_forward
+from wrf_pinn.physics.taylor import Jet, coordinate_jet, taylor_forward, where
 
 
 TensorDict = dict[str, torch.Tensor]
@@ -90,13 +90,6 @@ def _product_gradient(*factors: tuple[torch.Tensor, torch.Tensor]) -> torch.Tens
         term = grad if others is None else others * grad
         total = term if total is None else total + term
     return total
-
-
-@lru_cache(maxsize=32)
-def _device_scalar(value: float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """0-d tensor holding ``value`` on ``device``, built once (``new_tensor`` per call
-    copied it host-to-device, a CPU-GPU sync each time). Do not modify in place."""
-    return torch.tensor(value, dtype=dtype, device=device)
 
 
 @lru_cache(maxsize=32)
@@ -291,21 +284,22 @@ def _brunt_vaisala_squared(theta: torch.Tensor, theta_z: torch.Tensor, physics: 
 def _sgs_mixing_length(n_squared: torch.Tensor, e_sgs: torch.Tensor, physics: PhysicsConfig) -> torch.Tensor:
     """Return the SGS mixing length for stable and unstable flow."""
 
-    delta = _device_scalar(physics.uniform_filter_width, e_sgs.device, e_sgs.dtype)
-    minimum_length = _device_scalar(physics.minimum_mixing_length, e_sgs.device, e_sgs.dtype)
+    delta = physics.uniform_filter_width            # plain floats: no device copy, no sync
+    minimum_length = physics.minimum_mixing_length
 
     numerical_floor = torch.finfo(e_sgs.dtype).tiny
-    sqrt_e_sgs = torch.sqrt(e_sgs.clamp_min(0.0) + numerical_floor)
+    sqrt_e_sgs = (e_sgs.clamp_min(0.0) + numerical_floor).sqrt()
 
     # torch.where evaluates both branches, so N^2 must be clamped before
     # taking its square root even where the unstable branch is selected.
-    stable_n = torch.sqrt(n_squared.clamp_min(numerical_floor))
+    stable_n = n_squared.clamp_min(numerical_floor).sqrt()
 
     stable_candidate = (physics.stable_mixing_length_coefficient * sqrt_e_sgs / stable_n)
 
-    stable_length = torch.maximum(torch.minimum(stable_candidate, delta), minimum_length)
+    # = max(min(candidate, delta), minimum_length), since minimum_length <= delta
+    stable_length = stable_candidate.clamp_max(delta).clamp_min(minimum_length)
 
-    return torch.where(n_squared > 0.0, stable_length, delta)
+    return where(n_squared > 0.0, stable_length, delta)
 
 def _diagnostic_sgs_coefficients(
     theta: torch.Tensor,
@@ -318,11 +312,11 @@ def _diagnostic_sgs_coefficients(
     mixing_length = _sgs_mixing_length(n_squared, e_sgs, physics)
 
     numerical_floor = torch.finfo(e_sgs.dtype).tiny
-    sqrt_e_sgs = torch.sqrt(e_sgs.clamp_min(0.0) + numerical_floor)
+    sqrt_e_sgs = (e_sgs.clamp_min(0.0) + numerical_floor).sqrt()
 
     k_m = (physics.sgs_mixing_coefficient * mixing_length * sqrt_e_sgs)
 
-    delta = _device_scalar(physics.uniform_filter_width, e_sgs.device, e_sgs.dtype)
+    delta = physics.uniform_filter_width
 
     k_scalar = k_m * (1.0 + 2.0 * mixing_length / delta)
 

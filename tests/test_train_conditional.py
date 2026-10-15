@@ -122,7 +122,7 @@ def test_collocation_points_independent_of_cases_per_pass(monkeypatch):
     def collocation(cases_per_pass: int) -> torch.Tensor:
         seen = []
 
-        def fake_pde(model, coll, z_rows, cfg, scaling):  # random data NaNs the real PDE
+        def fake_pde(model, coll, z_rows, cfg, scaling, fns=None):  # random data NaNs the real PDE
             seen.append(coll.detach().clone())
             return (model(coll, z_rows) * 0.0).sum()
 
@@ -155,3 +155,17 @@ def test_bf16_data_forwards_stay_close_to_float32():
     assert np.isfinite(bf16).all()
     assert not np.array_equal(fp32, bf16), "bf16 flag had no effect"
     np.testing.assert_allclose(bf16, fp32, rtol=2e-2)
+
+
+def test_compiled_step_tracks_eager():
+    """compile=True gives the same training (to float32 kernel-fusion rounding)."""
+    cases = [_make_case(f"c{i}", i) for i in range(8)]
+
+    def history(compile_: bool):
+        torch.manual_seed(0)
+        model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=32))
+        cfg = ConditionalTrainConfig(epochs=4, batch_cases=4, device="cpu", log_every=100,
+                                     compile=compile_, **_DATA_ONLY)
+        return np.array(train_conditional(model, cases, cfg).total)
+
+    np.testing.assert_allclose(history(True), history(False), rtol=1e-5)

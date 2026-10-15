@@ -82,6 +82,10 @@ class ConditionalTrainConfig:
     #: bf16 autocast: their matmuls use bf16 tensor cores. The PDE and surface paths,
     #: which differentiate the network, stay in float32. Off by default.
     bf16_data: bool = False
+    #: torch.compile the network forward, the first-order Taylor pass and the PDE
+    #: residuals (fuses their many small elementwise kernels). The first steps pay
+    #: the compile time. Off by default.
+    compile: bool = False
 
 
 def _resolve_device(name: str) -> torch.device:
@@ -177,13 +181,30 @@ def _device_constant(values: tuple[float, ...], device: torch.device,
     return torch.tensor(values, device=device, dtype=dtype)
 
 
+@dataclass(frozen=True)
+class StepFunctions:
+    """The callables one training step uses, eager or compiled (``step_functions``)."""
+
+    forward: Callable                # (coords, z_rows) -> state
+    taylor: Callable                 # physics.taylor.taylor_forward
+    pde_residuals: Callable          # cartesian_zero_forcing_residuals_taylor
+
+
+def step_functions(model: nn.Module, compile: bool = False) -> StepFunctions:
+    """Eager step functions, or torch.compile'd ones sharing the model's parameters."""
+    fns = StepFunctions(model, taylor_forward, cartesian_zero_forcing_residuals_taylor)
+    if not compile:
+        return fns
+    return StepFunctions(*(torch.compile(f) for f in (fns.forward, fns.taylor, fns.pde_residuals)))
+
+
 def _taylor_supported(model: nn.Module) -> bool:
     """A tanh ConditionalModel: its coordinate derivatives can be carried forward
     (``physics.taylor``) instead of taken with nested autograd."""
     return getattr(getattr(model, "config", None), "activation", None) == "tanh"
 
 
-def _surface_loss(model, b: CaseBatch, cfg, scaling) -> torch.Tensor:
+def _surface_loss(model, b: CaseBatch, cfg, scaling, fns: StepFunctions) -> torch.Tensor:
     """Surface-layer residual on each case's bottom face, using its stored fluxes.
 
     Wall coords come from the surface rows (x,y,t normalized; z at the floor);
@@ -196,7 +217,7 @@ def _surface_loss(model, b: CaseBatch, cfg, scaling) -> torch.Tensor:
                         torch.full((surf.shape[0],), z_floor, device=dev, dtype=dt),
                         surf[:, 2]], dim=1)
     if _taylor_supported(model):  # wall gradients from one first-order forward pass
-        jet = taylor_forward(model.net, wall, z_rows, scaling.coordinate_scales(), second=False)
+        jet = fns.taylor(model.net, wall, z_rows, scaling.coordinate_scales(), second=False)
         wall_state, state_jacobian = jet.v, jet.d
     else:
         wall = wall.requires_grad_(True)
@@ -205,7 +226,7 @@ def _surface_loss(model, b: CaseBatch, cfg, scaling) -> torch.Tensor:
     reference = wall.detach().clone()
     z1 = (cfg.physics.constants.surface_reference_height - scaling.z.offset) / scaling.z.scale
     reference[:, 2] = z1
-    reference_state = model(reference, z_rows)
+    reference_state = fns.forward(reference, z_rows)
 
     f_off = _device_constant(tuple(cfg.flux_offset), dev, dt)
     f_scale = _device_constant(tuple(cfg.flux_scale), dev, dt)
@@ -223,13 +244,14 @@ def _surface_loss(model, b: CaseBatch, cfg, scaling) -> torch.Tensor:
     return per_eq.mean(dim=0).mean()
 
 
-def _pde_loss(model, coll: torch.Tensor, z_rows: torch.Tensor, cfg, scaling) -> torch.Tensor:
+def _pde_loss(model, coll: torch.Tensor, z_rows: torch.Tensor, cfg, scaling,
+              fns: StepFunctions) -> torch.Tensor:
     """Mean squared PDE residual over equal-sized per-case collocation sets.
 
     A tanh ConditionalModel takes the forward-Taylor path (derivatives carried
     through one forward pass); anything else falls back to nested autograd."""
     if _taylor_supported(model):
-        res = cartesian_zero_forcing_residuals_taylor(model.net, coll, z_rows,
+        res = fns.pde_residuals(model.net, coll, z_rows,
                                                       physics=cfg.physics, scaling=scaling)
     else:
         coll = coll.requires_grad_(True)
@@ -238,16 +260,17 @@ def _pde_loss(model, coll: torch.Tensor, z_rows: torch.Tensor, cfg, scaling) -> 
     return torch.stack([r.square().mean() for r in res.values()]).mean()
 
 
-def _forward_maybe_bf16(model: nn.Module, coords: torch.Tensor, z_rows: torch.Tensor,
+def _forward_maybe_bf16(forward: Callable, coords: torch.Tensor, z_rows: torch.Tensor,
                         bf16: bool) -> torch.Tensor:
-    """model(coords, z_rows), under bf16 autocast when ``bf16``; always float32 out."""
+    """forward(coords, z_rows), under bf16 autocast when ``bf16``; always float32 out."""
     with torch.autocast(device_type=coords.device.type, dtype=torch.bfloat16, enabled=bf16):
-        out = model(coords, z_rows)
+        out = forward(coords, z_rows)
     return out.float()
 
 
 def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
-                  unit_coll: "torch.Tensor | None" = None) -> dict[str, torch.Tensor]:
+                  unit_coll: "torch.Tensor | None" = None,
+                  fns: "StepFunctions | None" = None) -> dict[str, torch.Tensor]:
     """The five losses, each averaged over the batch's cases (one forward per loss).
 
     ``unit_coll`` is (k, n_collocation, n_coord) uniform [0, 1) draws placing each
@@ -258,8 +281,9 @@ def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
     # from reading the GPU-resident sizes back to the host (a sync per call).
     rows = lambda sizes, n: torch.repeat_interleave(b.z, sizes, dim=0, output_size=n)
     # derivative-free forwards, optionally in bf16; results back to float32 for the losses
+    fns = fns if fns is not None else step_functions(model)
     plain = lambda coords, sizes: _forward_maybe_bf16(
-        model, coords, rows(sizes, coords.shape[0]), cfg.bf16_data)[:, :n_obs]
+        fns.forward, coords, rows(sizes, coords.shape[0]), cfg.bf16_data)[:, :n_obs]
 
     pred = plain(b.interior, b.interior_sizes)
     err2 = (((pred - b.targets) * b.target_mask) ** 2).sum(dim=1)
@@ -284,11 +308,12 @@ def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
         u = unit_coll if unit_coll is not None else torch.rand(
             (k, cfg.n_collocation, b.box_lo.shape[1]), device=pred.device, dtype=pred.dtype)
         coll = (b.box_lo[:, None] + u * (b.box_hi - b.box_lo)[:, None]).reshape(-1, b.box_lo.shape[1])
-        pde = _pde_loss(model, coll, b.z.repeat_interleave(cfg.n_collocation, dim=0), cfg, scaling)
+        pde = _pde_loss(model, coll, b.z.repeat_interleave(cfg.n_collocation, dim=0), cfg, scaling,
+                        fns)
     else:
         pde = zero
 
-    surface = _surface_loss(model, b, cfg, scaling) if cfg.weight_surface != 0.0 else zero
+    surface = _surface_loss(model, b, cfg, scaling, fns) if cfg.weight_surface != 0.0 else zero
 
     return {"data": data, "initial": initial, "flow_boundary": flow,
             "pde": pde, "surface": surface}
@@ -351,6 +376,7 @@ def train_conditional(
         return [b.pin() for b in passes] if cuda else passes
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+    fns = step_functions(model, compile=config.compile)
     rng = torch.Generator().manual_seed(config.seed + rank)
     history = ConditionalHistory()
     weights = {"data": config.weight_data, "initial": config.weight_initial,
@@ -391,7 +417,7 @@ def train_conditional(
             share = b.k / k
             u = unit_coll[first:first + b.k] if unit_coll is not None else None
             first += b.k
-            batch = _batch_losses(model, b, config, u)
+            batch = _batch_losses(model, b, config, u, fns)
             total = sum(weights[name] * batch[name] for name in weights)
             (share * total).backward()
             losses += share * torch.stack([total.detach()] + [batch[n].detach() for n in weights])

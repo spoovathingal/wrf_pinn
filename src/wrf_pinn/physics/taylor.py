@@ -69,7 +69,7 @@ class Jet:
     def _k(self) -> int:
         return self.d.shape[0]
 
-    # -- tensor protocol, so the residual helpers run unchanged on jets --------
+    # -- tensor-like surface used by the residual helpers (dtype, comparisons) --
     @property
     def dtype(self) -> torch.dtype:
         return self.v.dtype
@@ -93,19 +93,6 @@ class Jet:
 
     def __le__(self, other):
         return self.v <= Jet._value(other)
-
-    @classmethod
-    def __torch_function__(cls, func, types, args=(), kwargs=None):
-        kwargs = kwargs or {}
-        if func is torch.sqrt:
-            return args[0].sqrt()
-        if func is torch.minimum:
-            return minimum(*args, **kwargs)
-        if func is torch.maximum:
-            return maximum(*args, **kwargs)
-        if func is torch.where:
-            return where(*args, **kwargs)
-        return NotImplemented
 
     # -- arithmetic (first order; h is dropped) --------------------------------
     @staticmethod
@@ -163,28 +150,40 @@ class Jet:
         keep = self.v >= low  # torch.clamp's gradient mask is inclusive too
         return Jet(self.v.clamp_min(low), self.d * keep)
 
+    def clamp_max(self, high: Scalar) -> "Jet":
+        keep = self.v <= high
+        return Jet(self.v.clamp_max(high), self.d * keep)
 
-def where(cond: torch.Tensor, a: "Jet | torch.Tensor | Scalar",
-          b: "Jet | torch.Tensor | Scalar") -> Jet:
-    """Elementwise select between jets (or constants, which have zero derivative)."""
+
+def where(cond: torch.Tensor, a, b):
+    """``torch.where`` for tensors or jets; non-jet operands (tensors or Python
+    numbers) are constants with zero derivative.
+
+    Written as plain Python on ``.v``/``.d`` (not through ``__torch_function__``) so
+    torch.compile traces it without graph breaks; the same holds for minimum/maximum."""
     ja, jb = (x if isinstance(x, Jet) else None for x in (a, b))
-    ref = ja if ja is not None else jb
-    va = ja.v if ja is not None else torch.as_tensor(a, dtype=ref.v.dtype, device=ref.v.device)
-    vb = jb.v if jb is not None else torch.as_tensor(b, dtype=ref.v.dtype, device=ref.v.device)
+    if ja is None and jb is None:
+        return torch.where(cond, a, b)
     k = min(j._k() for j in (ja, jb) if j is not None)
-    da = ja.d[:k] if ja is not None else torch.zeros((), dtype=ref.v.dtype, device=ref.v.device)
-    db = jb.d[:k] if jb is not None else torch.zeros((), dtype=ref.v.dtype, device=ref.v.device)
+    va = ja.v if ja is not None else a
+    vb = jb.v if jb is not None else b
+    da = ja.d[:k] if ja is not None else 0.0
+    db = jb.d[:k] if jb is not None else 0.0
     return Jet(torch.where(cond, va, vb), torch.where(cond, da, db))
 
 
-def minimum(a: Jet, b: "Jet | torch.Tensor | Scalar") -> Jet:
-    vb = b.v if isinstance(b, Jet) else b
-    return where(a.v <= vb, a, b)
+def minimum(a, b):
+    """``torch.minimum`` for tensors or jets; for jets, ties take ``a``."""
+    if not isinstance(a, Jet) and not isinstance(b, Jet):
+        return torch.minimum(a, b)
+    return where(Jet._value(a) <= Jet._value(b), a, b)
 
 
-def maximum(a: Jet, b: "Jet | torch.Tensor | Scalar") -> Jet:
-    vb = b.v if isinstance(b, Jet) else b
-    return where(a.v >= vb, a, b)
+def maximum(a, b):
+    """``torch.maximum`` for tensors or jets; for jets, ties take ``a``."""
+    if not isinstance(a, Jet) and not isinstance(b, Jet):
+        return torch.maximum(a, b)
+    return where(Jet._value(a) >= Jet._value(b), a, b)
 
 
 def coordinate_jet(values: torch.Tensor, axis: int, n_coord: int = 4) -> Jet:
