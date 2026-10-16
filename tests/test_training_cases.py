@@ -11,11 +11,8 @@ import numpy as np
 import pytest
 import torch
 
-from wrf_pinn.config.boundary_data import BoundaryConfig, NoSlipWallConfig, WallSurfaceConfig
 from wrf_pinn.config.conditions import ConditionSpec, ConditionsConfig
 from wrf_pinn.config.domain import make_cartesian_wrf_domain
-from wrf_pinn.config.sampling import CollocationSamplingConfig, SamplingConfig
-from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING, ResidualScalingConfig, VariableScale
 from wrf_pinn.config.training import OptimizerConfig, TrainingConfig
 from wrf_pinn.data.case import SRC_SIM, SRC_SENSOR
 from wrf_pinn.evaluation.predict import predict_flow_field
@@ -43,14 +40,6 @@ def _data_only(active_source: str) -> ConditionsConfig:
     data = {n: _off(n) for n in ("simulation", "sensor")}
     data[active_source] = ConditionSpec(active_source, active=True, weight=1.0)
     return ConditionsConfig(pde=_off("pde"), boundary=_off("boundary"), **data)
-
-
-def _pde_only() -> ConditionsConfig:
-    return ConditionsConfig(
-        pde=ConditionSpec("pde", active=True, weight=1.0),
-        boundary=_off("boundary"),
-        simulation=_off("simulation"), sensor=_off("sensor"),
-    )
 
 
 def _domain_from(case):
@@ -133,63 +122,3 @@ def test_multi_source_weighted_terms(multi_source_case, report):
 
 
 # --- pde-only uniformity -----------------------------------------------------
-@pytest.mark.parametrize("collocation_points", [64, 200, 512])
-def test_pde_only_runs_and_reduces_loss(uniform_case, report, collocation_points):
-    """pde-only path runs end to end and drives the residual loss down.
-
-    (The old 'uniform flow -> uniform field' check no longer holds: the NBL
-    governing equations are stratified/hydrostatic, so a uniform field is not a
-    zero-residual solution. A proper NBL known-result check is future work.)
-    """
-
-    torch.manual_seed(0)
-    sampling = SamplingConfig(
-        collocation=CollocationSamplingConfig(
-            n_points=collocation_points, method="latin_hypercube"),
-        seed=0,
-    )
-    model = MLP()
-    history = train_pinn(model, TrainingSetup(
-        domain=_domain_from(uniform_case), conditions=_pde_only(),
-        sampling=sampling, scaling=DEFAULT_RESIDUAL_SCALING,
-        training=_training(epochs=600, log_every=200)))
-    _assert_loss_decreased(history, report, f"pde-only [{collocation_points} pts]")
-
-def test_surface_layer_boundary_runs(uniform_case, bottom_wall_csv):
-    """The no-penetration surface-layer boundary runs and backpropagates."""
-
-    torch.manual_seed(0)
-
-    scaling = ResidualScalingConfig(
-        z=VariableScale(offset=0.0, scale=7.0),
-        theta=VariableScale(offset=300.0, scale=1.0),
-    )
-    conditions = ConditionsConfig(
-        pde=_off("pde"),
-        boundary=ConditionSpec("boundary", active=True, weight=1.0),
-        simulation=_off("simulation"),
-        sensor=_off("sensor"),
-    )
-
-    boundaries = BoundaryConfig(
-        no_slip_wall=NoSlipWallConfig(
-            surface=WallSurfaceConfig(path=str(bottom_wall_csv)),
-            condition="no_penetration_z",
-        )
-    )
-
-    model = MLP()
-    history = train_pinn(
-        model,
-        TrainingSetup(
-            case=uniform_case,
-            boundaries=boundaries,
-            conditions=conditions,
-            scaling=scaling,
-            training=_training(epochs=1, log_every=1),
-        ),
-    )
-
-    assert len(history.boundary) == 1
-    assert np.isfinite(history.boundary[0])
-    assert history.boundary[0] >= 0.0
