@@ -250,7 +250,7 @@ def _surface_loss(model, b: CaseBatch, cfg, scaling, fns: StepFunctions) -> torc
         fric_vel=phys[:, 0:1], ht_flux=phys[:, 1:2],
         surface_stress_scale=cfg.surface_stress_scale,
         surface_heat_flux_scale=cfg.surface_heat_flux_scale,
-        state_jacobian=state_jacobian)
+        state_jacobian=state_jacobian, check_values=False)  # wall rows are built at z=0 above
     per_eq = torch.stack([_per_case_mean(r.square().reshape(-1), b.surface_sizes, b.k)
                           for r in res.values()])                    # (n_eq, k)
     return per_eq.mean(dim=0).mean()

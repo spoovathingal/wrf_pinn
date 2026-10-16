@@ -156,6 +156,28 @@ def test_surface_residuals_with_taylor_jacobian_match_autograd():
         torch.testing.assert_close(a, b, rtol=1e-9, atol=1e-12)
 
 
+def test_surface_residuals_unchecked_match_checked():
+    """check_values=False (no GPU reads, no z=0 mask) gives the same residuals at z=0."""
+    from wrf_pinn.physics.residuals_boundary import no_penetration_z_wall_residuals
+
+    model, coords, z_rows = _setup(seed=3)
+    wall = coords.clone()
+    wall[:, 2] = (0.0 - SCALING.z.offset) / SCALING.z.scale
+    reference = wall.clone()
+    reference[:, 2] = (PHYSICS.constants.surface_reference_height - SCALING.z.offset) / SCALING.z.scale
+    gen = torch.Generator().manual_seed(0)
+    fric = 0.1 + 0.4 * torch.rand(wall.shape[0], 1, generator=gen, dtype=torch.float64)
+    heat = 0.05 * torch.randn(wall.shape[0], 1, generator=gen, dtype=torch.float64)
+    jet = taylor_forward(model.net, wall, z_rows, SCALING.coordinate_scales(), second=False)
+    run = lambda check: no_penetration_z_wall_residuals(
+        coordinates=wall, state=jet.v, reference_coordinates=reference,
+        reference_state=model(reference, z_rows), physics=PHYSICS, scaling=SCALING,
+        fric_vel=fric, ht_flux=heat, state_jacobian=jet.d, check_values=check)
+    checked, unchecked = run(True), run(False)
+    for name in checked:
+        torch.testing.assert_close(unchecked[name], checked[name], rtol=0, atol=0)
+
+
 def test_compiled_taylor_residuals_match_eager():
     """torch.compile traces the jet residuals as one graph and reproduces them."""
     model, coords, z_rows = _setup(seed=1, stable=True)
