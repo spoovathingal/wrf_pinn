@@ -18,11 +18,13 @@ terms are assembled.
 from __future__ import annotations
 import math
 from collections.abc import Mapping
+from functools import lru_cache
 
 import torch
 
 from wrf_pinn.config.physics import DEFAULT_PHYSICS, PhysicsConfig
 from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING, ResidualScalingConfig
+from wrf_pinn.physics.taylor import Jet, coordinate_jet, taylor_forward, where
 
 
 TensorDict = dict[str, torch.Tensor]
@@ -68,12 +70,36 @@ def _physical_gradient(
     """
 
     gradient = _gradient(field, coordinates)
-    coordinate_scales = torch.tensor(
-        scaling.coordinate_scales(),
-        dtype=gradient.dtype,
-        device=gradient.device,
-    ).reshape(1, -1)
+    coordinate_scales = _coordinate_scale_tensor(
+        scaling.coordinate_scales(), gradient.device, gradient.dtype)
     return gradient / coordinate_scales
+
+
+def _product_gradient(*factors: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    """Gradient of a product of fields from each factor's (field, gradient) pair.
+
+    ``grad(f_1 ... f_n) = sum_i (prod_{j != i} f_j) grad(f_i)``. Fields are (n, 1),
+    gradients (n, n_coord), in the same (physical) coordinates."""
+    fields = [f for f, _ in factors]
+    total = None
+    for i, (_, grad) in enumerate(factors):
+        others = None
+        for j, f in enumerate(fields):
+            if j != i:
+                others = f if others is None else others * f
+        term = grad if others is None else others * grad
+        total = term if total is None else total + term
+    return total
+
+
+@lru_cache(maxsize=32)
+def _coordinate_scale_tensor(scales: tuple[float, ...], device: torch.device,
+                             dtype: torch.dtype) -> torch.Tensor:
+    """(1, n_coord) coordinate scales on ``device``, built once per (scales, device,
+    dtype). Building it per call copied it host-to-device each time, and every such
+    copy made the CPU wait for the GPU. Callers must not modify it in place."""
+    return torch.tensor(scales, dtype=dtype, device=device).reshape(1, -1)
+
 
 def _hydrostatic_reference_state(
     z: torch.Tensor,
@@ -258,21 +284,22 @@ def _brunt_vaisala_squared(theta: torch.Tensor, theta_z: torch.Tensor, physics: 
 def _sgs_mixing_length(n_squared: torch.Tensor, e_sgs: torch.Tensor, physics: PhysicsConfig) -> torch.Tensor:
     """Return the SGS mixing length for stable and unstable flow."""
 
-    delta = e_sgs.new_tensor(physics.uniform_filter_width)
-    minimum_length = e_sgs.new_tensor(physics.minimum_mixing_length)
+    delta = physics.uniform_filter_width            # plain floats: no device copy, no sync
+    minimum_length = physics.minimum_mixing_length
 
     numerical_floor = torch.finfo(e_sgs.dtype).tiny
-    sqrt_e_sgs = torch.sqrt(e_sgs.clamp_min(0.0) + numerical_floor)
+    sqrt_e_sgs = (e_sgs.clamp_min(0.0) + numerical_floor).sqrt()
 
     # torch.where evaluates both branches, so N^2 must be clamped before
     # taking its square root even where the unstable branch is selected.
-    stable_n = torch.sqrt(n_squared.clamp_min(numerical_floor))
+    stable_n = n_squared.clamp_min(numerical_floor).sqrt()
 
     stable_candidate = (physics.stable_mixing_length_coefficient * sqrt_e_sgs / stable_n)
 
-    stable_length = torch.maximum(torch.minimum(stable_candidate, delta), minimum_length)
+    # = max(min(candidate, delta), minimum_length), since minimum_length <= delta
+    stable_length = stable_candidate.clamp_max(delta).clamp_min(minimum_length)
 
-    return torch.where(n_squared > 0.0, stable_length, delta)
+    return where(n_squared > 0.0, stable_length, delta)
 
 def _diagnostic_sgs_coefficients(
     theta: torch.Tensor,
@@ -285,11 +312,11 @@ def _diagnostic_sgs_coefficients(
     mixing_length = _sgs_mixing_length(n_squared, e_sgs, physics)
 
     numerical_floor = torch.finfo(e_sgs.dtype).tiny
-    sqrt_e_sgs = torch.sqrt(e_sgs.clamp_min(0.0) + numerical_floor)
+    sqrt_e_sgs = (e_sgs.clamp_min(0.0) + numerical_floor).sqrt()
 
     k_m = (physics.sgs_mixing_coefficient * mixing_length * sqrt_e_sgs)
 
-    delta = e_sgs.new_tensor(physics.uniform_filter_width)
+    delta = physics.uniform_filter_width
 
     k_scalar = k_m * (1.0 + 2.0 * mixing_length / delta)
 
@@ -370,24 +397,29 @@ def cartesian_zero_forcing_residuals(
     k_theta = k_scalar
     k_q_v = k_scalar
 
-    # Dry-air mass and momentum storage/transport products.
+    # Dry-air mass and momentum storage/transport products. Only rho_d needs its own
+    # backward pass; the product gradients follow from the product rule on the
+    # gradients already computed (autograd would apply the same rule, at the cost
+    # of one full backward pass through the network per product).
     grad_rho_d = _physical_gradient(rho_d, coordinates, scaling)
-    grad_rho_d_u = _physical_gradient(rho_d * u, coordinates, scaling)
-    grad_rho_d_v = _physical_gradient(rho_d * v, coordinates, scaling)
-    grad_rho_d_w = _physical_gradient(rho_d * w, coordinates, scaling)
+    rho = (rho_d, grad_rho_d)
+    gu, gv, gw = (u, grad_u), (v, grad_v), (w, grad_w)
+    grad_rho_d_u = _product_gradient(rho, gu)
+    grad_rho_d_v = _product_gradient(rho, gv)
+    grad_rho_d_w = _product_gradient(rho, gw)
 
     _, _, _, rho_d_t = grad_rho_d.split(1, dim=1)
     rho_d_u_x, _, _, rho_d_u_t = grad_rho_d_u.split(1, dim=1)
     _, rho_d_v_y, _, rho_d_v_t = grad_rho_d_v.split(1, dim=1)
     _, _, rho_d_w_z, rho_d_w_t = grad_rho_d_w.split(1, dim=1)
 
-    rho_d_uu_x = _physical_gradient(rho_d * u * u, coordinates, scaling)[:, 0:1]
-    rho_d_vv_y = _physical_gradient(rho_d * v * v, coordinates, scaling)[:, 1:2]    
-    rho_d_ww_z = _physical_gradient(rho_d * w * w, coordinates, scaling)[:, 2:3]
+    rho_d_uu_x = _product_gradient(rho, gu, gu)[:, 0:1]
+    rho_d_vv_y = _product_gradient(rho, gv, gv)[:, 1:2]
+    rho_d_ww_z = _product_gradient(rho, gw, gw)[:, 2:3]
 
-    grad_rho_d_uv = _physical_gradient(rho_d * u * v, coordinates, scaling)
-    grad_rho_d_uw = _physical_gradient(rho_d * u * w, coordinates, scaling)
-    grad_rho_d_vw = _physical_gradient(rho_d * v * w, coordinates, scaling)
+    grad_rho_d_uv = _product_gradient(rho, gu, gv)
+    grad_rho_d_uw = _product_gradient(rho, gu, gw)
+    grad_rho_d_vw = _product_gradient(rho, gv, gw)
 
     rho_d_uv_x = grad_rho_d_uv[:, 0:1]
     rho_d_uv_y = grad_rho_d_uv[:, 1:2]
@@ -396,17 +428,18 @@ def cartesian_zero_forcing_residuals(
     rho_d_vw_y = grad_rho_d_vw[:, 1:2]
     rho_d_vw_z = grad_rho_d_vw[:, 2:3]
 
-    # Conservative potential-temperature products.
-    rho_d_theta_t = _physical_gradient(rho_d * theta, coordinates, scaling)[:, 3:4]
-    rho_d_u_theta_x = _physical_gradient(rho_d * u * theta, coordinates, scaling)[:, 0:1]
-    rho_d_v_theta_y = _physical_gradient(rho_d * v * theta, coordinates, scaling)[:, 1:2]
-    rho_d_w_theta_z = _physical_gradient(rho_d * w * theta, coordinates, scaling)[:, 2:3]
+    # Conservative potential-temperature products (product rule, as above).
+    gth, gqv = (theta, grad_theta), (q_v, grad_q_v)
+    rho_d_theta_t = _product_gradient(rho, gth)[:, 3:4]
+    rho_d_u_theta_x = _product_gradient(rho, gu, gth)[:, 0:1]
+    rho_d_v_theta_y = _product_gradient(rho, gv, gth)[:, 1:2]
+    rho_d_w_theta_z = _product_gradient(rho, gw, gth)[:, 2:3]
 
     # Conservative water-vapor products.
-    rho_d_q_v_t = _physical_gradient(rho_d * q_v, coordinates, scaling)[:, 3:4]
-    rho_d_u_q_v_x = _physical_gradient(rho_d * u * q_v, coordinates, scaling)[:, 0:1]
-    rho_d_v_q_v_y = _physical_gradient(rho_d * v * q_v, coordinates, scaling)[:, 1:2]
-    rho_d_w_q_v_z = _physical_gradient(rho_d * w * q_v, coordinates, scaling)[:, 2:3]
+    rho_d_q_v_t = _product_gradient(rho, gqv)[:, 3:4]
+    rho_d_u_q_v_x = _product_gradient(rho, gu, gqv)[:, 0:1]
+    rho_d_v_q_v_y = _product_gradient(rho, gv, gqv)[:, 1:2]
+    rho_d_w_q_v_z = _product_gradient(rho, gw, gqv)[:, 2:3]
 
     divergence = u_x + v_y + w_z
     # Physical SGS momentum stresses:
@@ -477,6 +510,149 @@ def cartesian_zero_forcing_residuals(
     z_momentum = (
         rho_d_w_t + rho_d_uw_x + rho_d_vw_y + rho_d_ww_z
         + density_ratio*(p_prime_z + physics.constants.gravity * rho_m_prime) 
+        + tau_xz_x + tau_yz_y + tau_zz_z
+    )
+
+    potential_temperature = (
+        rho_d_theta_t + rho_d_u_theta_x + rho_d_v_theta_y + rho_d_w_theta_z
+        + tau_theta_x_x + tau_theta_y_y + tau_theta_z_z
+    )
+
+    water_vapor = (
+        rho_d_q_v_t + rho_d_u_q_v_x + rho_d_v_q_v_y + rho_d_w_q_v_z
+        + tau_q_v_x_x + tau_q_v_y_y + tau_q_v_z_z
+    )
+
+    return {
+        "mass": mass,
+        "x_momentum": x_momentum,
+        "y_momentum": y_momentum,
+        "z_momentum": z_momentum,
+        "potential_temperature": potential_temperature,
+        "water_vapor": water_vapor
+    }
+
+
+def cartesian_zero_forcing_residuals_taylor(
+    net: torch.nn.Sequential,
+    coordinates: torch.Tensor,
+    z_rows: torch.Tensor,
+    physics: PhysicsConfig = DEFAULT_PHYSICS,
+    scaling: ResidualScalingConfig = DEFAULT_RESIDUAL_SCALING,
+    sizes: "torch.Tensor | int | None" = None,
+) -> TensorDict:
+    """The residuals of ``cartesian_zero_forcing_residuals``, without nested autograd.
+
+    Same equations, term for term. Instead of evaluating the network and then taking
+    one ``autograd.grad`` per field (19 backward passes, each differentiated again by
+    training), the network's coordinate derivatives come from one forward Taylor
+    pass (``taylor_forward``) and every pointwise quantity is a ``Jet`` carrying its
+    gradient, so products, the equation of state and the SGS stresses differentiate
+    themselves. ``net`` is the Linear/Tanh MLP fed ``[coordinates | z_rows]``
+    (``ConditionalModel.net``); ``coordinates`` need not require grad. With
+    ``sizes``, ``z_rows`` holds one latent row per case (``ConditionalModel.forward``).
+    """
+
+    _validate_physics_config(physics)
+
+    if coordinates.ndim != 2 or coordinates.shape[1] != 4:
+        raise ValueError("coordinates must have shape (n_points, 4).")
+
+    out = taylor_forward(net, coordinates, z_rows, scaling.coordinate_scales(), sizes=sizes)
+    if out.v.shape[1] < physics.state_dim:
+        raise ValueError(
+            "state has too few columns for the configured active variables; "
+            f"expected at least {physics.state_dim}, got {out.v.shape[1]}."
+        )
+
+    def physical(name: str) -> Jet:
+        j = out.column(physics.variable_index(name))
+        s = getattr(scaling, name)
+        return Jet(s.offset + s.scale * j.v, s.scale * j.d, s.scale * j.h)
+
+    u, v, w, theta, p_prime, q_v, e_sgs = (
+        physical(n) for n in ("u", "v", "w", "theta", "p_prime", "q_v", "e_sgs"))
+
+    z = coordinate_jet(scaling.z.offset + scaling.z.scale * coordinates[:, 2:3], axis=2)
+    (_pressure, _temperature, rho_d, _rho_m, rho_m_prime, density_ratio,
+     ) = _diagnose_moist_state(theta, p_prime, q_v, z, physics)
+
+    p_prime_x, p_prime_y, p_prime_z, _p_prime_t = p_prime.d
+
+    # Diagnose the SGS coefficients from local theta_z and e_sgs (jets in x, y, z,
+    # so their gradients carry theta's second derivatives).
+    _n_squared, _mixing_length, k_m, k_scalar = _diagnostic_sgs_coefficients(
+        theta, theta.deriv(2), e_sgs, physics)
+    k_theta = k_scalar
+    k_q_v = k_scalar
+
+    # Dry-air mass and momentum storage/transport products.
+    rho_d_u, rho_d_v, rho_d_w = rho_d * u, rho_d * v, rho_d * w
+    rho_d_t = rho_d.d[3]
+    rho_d_u_x, rho_d_u_t = rho_d_u.d[0], rho_d_u.d[3]
+    rho_d_v_y, rho_d_v_t = rho_d_v.d[1], rho_d_v.d[3]
+    rho_d_w_z, rho_d_w_t = rho_d_w.d[2], rho_d_w.d[3]
+
+    rho_d_uu_x = (rho_d_u * u).d[0]
+    rho_d_vv_y = (rho_d_v * v).d[1]
+    rho_d_ww_z = (rho_d_w * w).d[2]
+    rho_d_uv, rho_d_uw, rho_d_vw = rho_d_u * v, rho_d_u * w, rho_d_v * w
+    rho_d_uv_x, rho_d_uv_y = rho_d_uv.d[0], rho_d_uv.d[1]
+    rho_d_uw_x, rho_d_uw_z = rho_d_uw.d[0], rho_d_uw.d[2]
+    rho_d_vw_y, rho_d_vw_z = rho_d_vw.d[1], rho_d_vw.d[2]
+
+    # Conservative potential-temperature and water-vapor products.
+    rho_d_theta_t = (rho_d * theta).d[3]
+    rho_d_u_theta_x = (rho_d_u * theta).d[0]
+    rho_d_v_theta_y = (rho_d_v * theta).d[1]
+    rho_d_w_theta_z = (rho_d_w * theta).d[2]
+    rho_d_q_v_t = (rho_d * q_v).d[3]
+    rho_d_u_q_v_x = (rho_d_u * q_v).d[0]
+    rho_d_v_q_v_y = (rho_d_v * q_v).d[1]
+    rho_d_w_q_v_z = (rho_d_w * q_v).d[2]
+
+    # Physical SGS momentum stresses, as jets of the velocity derivatives:
+    # tau_ij = -rho_d K_m S_ij + (2/3) rho_d e_sgs delta_ij.
+    u_x, u_y, u_z = u.deriv(0), u.deriv(1), u.deriv(2)
+    v_x, v_y, v_z = v.deriv(0), v.deriv(1), v.deriv(2)
+    w_x, w_y, w_z = w.deriv(0), w.deriv(1), w.deriv(2)
+    divergence = u_x + v_y + w_z
+    tau_xx = -rho_d * k_m * (2.0 * u_x - (2.0 / 3.0) * divergence) + (2.0 / 3.0) * rho_d * e_sgs
+    tau_yy = -rho_d * k_m * (2.0 * v_y - (2.0 / 3.0) * divergence) + (2.0 / 3.0) * rho_d * e_sgs
+    tau_zz = -rho_d * k_m * (2.0 * w_z - (2.0 / 3.0) * divergence) + (2.0 / 3.0) * rho_d * e_sgs
+    tau_xy = -rho_d * k_m * (u_y + v_x)
+    tau_xz = -rho_d * k_m * (u_z + w_x)
+    tau_yz = -rho_d * k_m * (v_z + w_y)
+
+    tau_xx_x, tau_yy_y, tau_zz_z = tau_xx.d[0], tau_yy.d[1], tau_zz.d[2]
+    tau_xy_x, tau_xy_y = tau_xy.d[0], tau_xy.d[1]
+    tau_xz_x, tau_xz_z = tau_xz.d[0], tau_xz.d[2]
+    tau_yz_y, tau_yz_z = tau_yz.d[1], tau_yz.d[2]
+
+    # SGS potential-temperature and water-vapor flux divergences.
+    tau_theta_x_x = (-rho_d * k_theta * theta.deriv(0)).d[0]
+    tau_theta_y_y = (-rho_d * k_theta * theta.deriv(1)).d[1]
+    tau_theta_z_z = (-rho_d * k_theta * theta.deriv(2)).d[2]
+    tau_q_v_x_x = (-rho_d * k_q_v * q_v.deriv(0)).d[0]
+    tau_q_v_y_y = (-rho_d * k_q_v * q_v.deriv(1)).d[1]
+    tau_q_v_z_z = (-rho_d * k_q_v * q_v.deriv(2)).d[2]
+
+    ratio = density_ratio.v
+    mass = rho_d_t + rho_d_u_x + rho_d_v_y + rho_d_w_z
+
+    x_momentum = (
+        rho_d_u_t + rho_d_uu_x + rho_d_uv_y + rho_d_uw_z
+        + ratio * p_prime_x + tau_xx_x + tau_xy_y + tau_xz_z
+    )
+
+    y_momentum = (
+        rho_d_v_t + rho_d_uv_x + rho_d_vv_y + rho_d_vw_z
+        + ratio * p_prime_y + tau_xy_x + tau_yy_y + tau_yz_z
+    )
+
+    z_momentum = (
+        rho_d_w_t + rho_d_uw_x + rho_d_vw_y + rho_d_ww_z
+        + ratio * (p_prime_z + physics.constants.gravity * rho_m_prime.v)
         + tau_xz_x + tau_yz_y + tau_zz_z
     )
 

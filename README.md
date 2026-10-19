@@ -336,3 +336,18 @@ test_pipeline.py     end-to-end read -> tensors -> model: the tensors fed to the
   metadata.
 - The uniform-flow case is a pipeline smoke test. Because a constant state has
   zero derivatives, it does not strongly validate the PDE implementation.
+
+### Conditional training provenance
+
+Conditional checkpoints retain model/optimizer/history and add schema version 2
+plus a manifest with architecture, latent dimension, training configuration,
+metadata hashes/normalization when case paths are supplied, rank-local case IDs,
+Git revision/status, seed and runtime precision settings. Metadata hashes identify
+metadata files, not case contents. Resident cases do not supply dataset metadata;
+rank-local IDs do not describe all ranks in distributed runs.
+
+Set `ConditionalTrainConfig(events_path="run/events.jsonl", ...)` to append
+rank-zero run-start, logged-step loss/pre-clip gradient norm, and checkpoint events.
+The usual log interval controls step events. This records the initial torch seed,
+not a complete resumable RNG state. These diagnostics do not estimate predictive
+uncertainty or provide calibrated intervals.

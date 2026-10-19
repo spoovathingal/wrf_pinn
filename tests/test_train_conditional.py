@@ -75,7 +75,8 @@ def test_checkpoint_save_and_resume(tmp_path):
 
     model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=16))
     cfg = ConditionalTrainConfig(epochs=20, batch_cases=3, device="cpu", log_every=20,
-                                 checkpoint_path=str(ckpt), checkpoint_every=10, **_DATA_ONLY)
+                                 checkpoint_path=str(ckpt), checkpoint_every=10,
+                                 events_path=str(tmp_path / "events.jsonl"), **_DATA_ONLY)
     hist = train_conditional(model, cases, cfg)
     assert ckpt.is_file(), "checkpoint file was not written"
     assert len(hist.total) == 20
@@ -83,6 +84,15 @@ def test_checkpoint_save_and_resume(tmp_path):
     # the saved epoch must be the last multiple of checkpoint_every (or final epoch)
     ck = torch.load(str(ckpt), map_location="cpu")
     assert ck["epoch"] == 20
+    assert ck["schema_version"] == 2
+    assert ck["manifest"]["model"]["latent_dim"] == LATENT_DIM
+    assert ck["manifest"]["model"]["config"]["hidden_width"] == 16
+    assert ck["manifest"]["training"]["seed"] == cfg.seed
+    import json
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    assert events[0]["event"] == "run_start"
+    assert any(e["event"] == "step" and e["gradient_norm_finite"] for e in events)
+    assert events[-1]["event"] == "checkpoint" and events[-1]["epoch"] == 20
 
     # resume into a FRESH model: weights load from the checkpoint, start epoch advances.
     fresh = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=16))
@@ -111,3 +121,156 @@ def test_split_cases():
     cases = [_make_case(f"c{i}", i) for i in range(10)]
     train, held = split_cases(cases, chi=0.8, seed=0)
     assert len(train) == 8 and len(held) == 2
+
+
+def test_collocation_points_independent_of_cases_per_pass(monkeypatch):
+    """The PDE points a step sees must not depend on how its cases are split into passes."""
+    import wrf_pinn.training.train_conditional as tc
+
+    cases = [_make_case(f"c{i}", i) for i in range(8)]
+
+    def collocation(cases_per_pass: int) -> torch.Tensor:
+        seen = []
+
+        def fake_pde(model, coll, z_rows, cfg, scaling, fns=None):  # random data NaNs the real PDE
+            seen.append(coll.detach().clone())
+            return (model(coll, z_rows, cfg.n_collocation) * 0.0).sum()  # z per case
+
+        monkeypatch.setattr(tc, "_pde_loss", fake_pde)
+        torch.manual_seed(0)
+        model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=16))
+        cfg = ConditionalTrainConfig(epochs=3, batch_cases=4, cases_per_pass=cases_per_pass,
+                                     n_collocation=16, device="cpu", log_every=100,
+                                     weight_surface=0.0)
+        train_conditional(model, cases, cfg)
+        return torch.cat(seen)
+
+    whole = collocation(0)
+    assert torch.equal(whole, collocation(1))
+    assert torch.equal(whole, collocation(2))
+
+
+def test_bf16_data_forwards_stay_close_to_float32():
+    """bf16 autocast on the derivative-free forwards changes losses only at bf16 rounding."""
+    cases = [_make_case(f"c{i}", i) for i in range(8)]
+
+    def history(bf16: bool):
+        torch.manual_seed(0)
+        model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=32))
+        cfg = ConditionalTrainConfig(epochs=5, batch_cases=4, device="cpu", log_every=100,
+                                     bf16_data=bf16, **_DATA_ONLY)
+        return np.array(train_conditional(model, cases, cfg).total)
+
+    fp32, bf16 = history(False), history(True)
+    assert np.isfinite(bf16).all()
+    assert not np.array_equal(fp32, bf16), "bf16 flag had no effect"
+    np.testing.assert_allclose(bf16, fp32, rtol=2e-2)
+
+
+def test_compiled_step_tracks_eager():
+    """compile=True gives the same training (to float32 kernel-fusion rounding)."""
+    cases = [_make_case(f"c{i}", i) for i in range(8)]
+
+    def history(compile_: bool):
+        torch.manual_seed(0)
+        model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=32))
+        cfg = ConditionalTrainConfig(epochs=4, batch_cases=4, device="cpu", log_every=100,
+                                     compile=compile_, **_DATA_ONLY)
+        return np.array(train_conditional(model, cases, cfg).total)
+
+    np.testing.assert_allclose(history(True), history(False), rtol=1e-5)
+
+
+def test_per_case_latent_matches_per_point_rows():
+    """ConditionalModel(coords, z, sizes) equals feeding z repeated per point."""
+    torch.manual_seed(0)
+    model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=16)).double()
+    z = torch.randn(3, LATENT_DIM, dtype=torch.float64)
+    sizes = torch.tensor([4, 1, 5])
+    coords = torch.randn(int(sizes.sum()), 4, dtype=torch.float64)
+    rows = z.repeat_interleave(sizes, dim=0)
+    torch.testing.assert_close(model(coords, z, sizes), model(coords, rows), rtol=1e-12, atol=1e-12)
+    # an int size gives every case the same number of rows
+    coords2 = torch.randn(6, 4, dtype=torch.float64)
+    torch.testing.assert_close(model(coords2, z, 2), model(coords2, z.repeat_interleave(2, dim=0)),
+                               rtol=1e-12, atol=1e-12)
+    # broadcast form: one latent for all points
+    torch.testing.assert_close(model(coords2, z[:1]), model(coords2, z[:1].expand(6, -1)),
+                               rtol=1e-12, atol=1e-12)
+
+
+def _write_case_npz(path, seed: int) -> None:
+    """A synthetic case in the preprocessor's .npz layout (rank-1 POD pieces)."""
+    case = _make_case(path.stem, seed)
+    nv, nz, nxy = case.initial.shape
+    _, nf, nt, fl = case.boundary.shape
+    rng = np.random.default_rng(seed)
+    f32 = np.float32
+    blob = {k: getattr(case, k) for k in ("initial_coords", "boundary_coords", "surface", "terrain",
+                                          "interior", "targets", "times")}
+    for v in STATE_VARS:
+        blob[f"ini_mean_{v}"] = rng.standard_normal(nxy).astype(f32)
+        blob[f"ini_modes_{v}"] = rng.standard_normal((nxy, 1)).astype(f32)
+        blob[f"ini_coeffs_{v}"] = rng.standard_normal((nz, 1)).astype(f32)
+        for f in range(nf):
+            blob[f"bnd_mean_{v}_{f}"] = rng.standard_normal(fl).astype(f32)
+            blob[f"bnd_modes_{v}_{f}"] = rng.standard_normal((fl, 1)).astype(f32)
+            blob[f"bnd_coeffs_{v}_{f}"] = rng.standard_normal((nt, 1)).astype(f32)
+    np.savez(path, **blob)
+
+
+def test_loader_workers_give_identical_training(tmp_path):
+    """Reading cases in DataLoader worker processes changes nothing but where they are read."""
+    paths = []
+    for i in range(8):
+        path = tmp_path / f"c{i}.npz"
+        _write_case_npz(path, i)
+        paths.append(str(path))
+
+    def history(workers: int):
+        torch.manual_seed(0)
+        from wrf_pinn.data.conditional_case import read_conditional_case
+        latent = read_conditional_case(paths[0]).z.shape[0]
+        model = ConditionalModel(latent, ConditionalModelConfig(hidden_layers=2, hidden_width=16))
+        cfg = ConditionalTrainConfig(epochs=5, batch_cases=4, cases_per_pass=2, device="cpu",
+                                     log_every=100, loader_workers=workers, **_DATA_ONLY)
+        return train_conditional(model, config=cfg, case_paths=paths).total
+
+    assert history(2) == history(0)
+
+
+def test_average_across_processes_matches_per_tensor_reduce(monkeypatch):
+    """One packed all-reduce gives each gradient and the losses their own average."""
+    import wrf_pinn.training.train_conditional as tc
+
+    world = 3
+    # stand-in all-reduce: the sum over `world` processes holding the same values
+    monkeypatch.setattr(tc.dist, "all_reduce", lambda t: t.mul_(world))
+    torch.manual_seed(0)
+    model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=8))
+    params = list(model.parameters())
+    for p in params:
+        p.grad = torch.randn_like(p)
+    expected = [p.grad.clone() for p in params]     # sum of world copies / world
+    losses = torch.tensor([1.0, 2.0, 3.0])
+    out = tc._average_across_processes(params, losses, world)
+    for p, e in zip(params, expected):
+        torch.testing.assert_close(p.grad, e)
+    torch.testing.assert_close(out, losses)
+
+
+def test_average_across_processes_two_real_processes(tmp_path):
+    """Packed all-reduce = per-tensor all-reduces, across two real gloo processes."""
+    import socket
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = str(s.getsockname()[1])
+    worker = Path(__file__).with_name("_dist_worker.py")
+    procs = [subprocess.Popen([sys.executable, str(worker), str(r), "2", port, str(tmp_path)])
+             for r in range(2)]
+    assert all(p.wait(timeout=120) == 0 for p in procs)
+    assert [(tmp_path / f"rank{r}.txt").read_text() for r in range(2)] == ["ok", "ok"]

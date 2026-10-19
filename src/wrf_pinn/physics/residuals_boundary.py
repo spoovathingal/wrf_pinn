@@ -134,8 +134,10 @@ def _physical_density_from_state(coordinates: torch.Tensor, state: torch.Tensor,
 def _validate_no_penetration_z_wall_inputs(coordinates: torch.Tensor, state: torch.Tensor,
                                            reference_coordinates: torch.Tensor, reference_state: torch.Tensor, 
                                            physics: PhysicsConfig, scaling: ResidualScalingConfig,
-                                           surface_stress_scale: float) -> torch.Tensor:
-    """Validate surface-boundary inputs and return the bottom-point mask."""
+                                           surface_stress_scale: float,
+                                           check_values: bool = True) -> "torch.Tensor | None":
+    """Validate surface-boundary inputs and return the bottom-point mask (None when
+    ``check_values`` is off: every row is taken to be at z=0)."""
     _validate_state(state)
     _validate_state(reference_state)
     if coordinates.ndim != 2 or coordinates.shape[1] != 4:
@@ -158,6 +160,8 @@ def _validate_no_penetration_z_wall_inputs(coordinates: torch.Tensor, state: tor
 
     if not math.isfinite(surface_stress_scale) or surface_stress_scale <= 0.0:
         raise ValueError("surface_stress_scale must be finite and positive.")
+    if not check_values:
+        return None
 
     z_physical = (scaling.z.offset + scaling.z.scale * coordinates[:, 2:3])
 
@@ -175,7 +179,9 @@ def no_penetration_z_wall_residuals(
     scaling: ResidualScalingConfig = DEFAULT_RESIDUAL_SCALING,
     surface_stress_scale: float = 3.8273,
     *, fric_vel: torch.Tensor, ht_flux: torch.Tensor,
-    surface_heat_flux_scale: float = 1.0
+    surface_heat_flux_scale: float = 1.0,
+    state_jacobian: "torch.Tensor | None" = None,
+    check_values: bool = True,
 ) -> dict[str, torch.Tensor]:
     """Return no-penetration and neutral surface stress residuals.
 
@@ -186,19 +192,29 @@ def no_penetration_z_wall_residuals(
     fric_vel [m/s] and ht_flux [K m/s] must be physical (N, 1) tensors,
     aligned with every row of coordinates. Surface losses use bottom rows.
     Flat z=0 geometry is retained until the terrain update.
+
+    ``state_jacobian`` (n_coord, N, n_state), if given, holds d(state)/d(physical
+    coordinate) of the normalized state at the wall points (e.g. ``taylor_forward``'s
+    ``d``); the wall gradients are read from it instead of taken with autograd, so
+    ``coordinates`` need not require grad.
+
+    ``check_values=False`` skips the checks that read GPU values (finite, nonnegative
+    fluxes; the z=0 mask), each of which makes the CPU wait for the GPU. The caller
+    then guarantees valid fluxes and that every row is at z=0.
     """
     bottom_mask = _validate_no_penetration_z_wall_inputs(
         coordinates=coordinates, state=state,
         reference_coordinates=reference_coordinates, reference_state=reference_state,
         physics=physics, scaling=scaling, surface_stress_scale=surface_stress_scale,
+        check_values=check_values,
     )
 
     for name, field in (("fric_vel", fric_vel), ("ht_flux", ht_flux)):
         if field.shape != (state.shape[0], 1):
             raise ValueError(f"{name} must have shape (num_wall_points, 1).")
-        if not torch.isfinite(field).all():
+        if check_values and not torch.isfinite(field).all():
             raise ValueError(f"{name} must contain only finite values.")
-    if torch.any(fric_vel < 0.0):
+    if check_values and torch.any(fric_vel < 0.0):
         raise ValueError("fric_vel must be nonnegative.")
     if not math.isfinite(surface_heat_flux_scale) or surface_heat_flux_scale <= 0.0:
         raise ValueError("surface_heat_flux_scale must be finite and positive.")
@@ -226,10 +242,15 @@ def no_penetration_z_wall_residuals(
     rho_wall = _physical_density_from_state(coordinates, state, physics, scaling)
     rho_1 = _physical_density_from_state(reference_coordinates, reference_state, physics, scaling)
 
-    grad_u = _physical_gradient(u_wall, coordinates, scaling)
-    grad_v = _physical_gradient(v_wall, coordinates, scaling)
-    grad_w = _physical_gradient(w_wall, coordinates, scaling)
-    grad_theta = _physical_gradient(theta_wall, coordinates, scaling)
+    if state_jacobian is not None:
+        grad = lambda name, i: getattr(scaling, name).scale * state_jacobian[:, :, i].T
+        grad_u, grad_v = grad("u", u_index), grad("v", v_index)
+        grad_w, grad_theta = grad("w", w_index), grad("theta", theta_index)
+    else:
+        grad_u = _physical_gradient(u_wall, coordinates, scaling)
+        grad_v = _physical_gradient(v_wall, coordinates, scaling)
+        grad_w = _physical_gradient(w_wall, coordinates, scaling)
+        grad_theta = _physical_gradient(theta_wall, coordinates, scaling)
 
     u_z = grad_u[:, 2:3]
     v_z = grad_v[:, 2:3]
@@ -251,9 +272,10 @@ def no_penetration_z_wall_residuals(
     # Potential-temperature SGS flux equals the supplied surface flux.
     tau_theta_wall = -rho_wall * k_theta_wall * theta_z
     tau_theta_surface = rho_1 * ht_flux
+    bottom = (lambda r: r) if bottom_mask is None else (lambda r: r[bottom_mask])
     return {
         "no_penetration_w": w_wall / scaling.w.scale, # z = 0 and z = z_max
-        "surface_stress_xz": ((tau_xz_wall + tau_xz_surface) / surface_stress_scale)[bottom_mask], # z = 0
-        "surface_stress_yz": ((tau_yz_wall + tau_yz_surface) / surface_stress_scale)[bottom_mask], # z = 0
-        "surface_heat_flux": ((tau_theta_wall - tau_theta_surface) / surface_heat_flux_scale)[bottom_mask],
+        "surface_stress_xz": bottom((tau_xz_wall + tau_xz_surface) / surface_stress_scale), # z = 0
+        "surface_stress_yz": bottom((tau_yz_wall + tau_yz_surface) / surface_stress_scale), # z = 0
+        "surface_heat_flux": bottom((tau_theta_wall - tau_theta_surface) / surface_heat_flux_scale),
     }
