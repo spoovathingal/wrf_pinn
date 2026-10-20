@@ -12,7 +12,8 @@ from typing import Literal
 
 CoordinateSystem = Literal["local_cartesian"]
 PhysicsVariable = Literal["u", "v", "w", "theta", "p_prime", "q_v", "e_sgs"]
-ResidualName = Literal["mass", "x_momentum", "y_momentum", "z_momentum", "potential_temperature","water_vapor"]
+ResidualName = Literal["mass", "x_momentum", "y_momentum", "z_momentum",
+                       "potential_temperature","water_vapor", "sgs_tke"]
 
 @dataclass(frozen=True)
 class PhysicalConstants:
@@ -112,7 +113,8 @@ class PhysicsConfig:
         "y_momentum",
         "z_momentum",
         "potential_temperature",
-        "water_vapor"
+        "water_vapor",
+        "sgs_tke",
     )
     include_coriolis: bool = False
     include_gravity: bool = True
@@ -139,6 +141,12 @@ class PhysicsConfig:
     sgs_mixing_coefficient: float = 0.10          # c_k
     stable_mixing_length_coefficient: float = 0.76
     minimum_mixing_length: float = 0.01           # m
+    # Prognostic SGS TKE dissipation:
+    # c_e = a*c_k + (c0 - a*c_k)*(l_sgs/Delta)
+    tke_dissipation_coefficient: float = 0.93  # c0
+    tke_dissipation_mixing_factor: float = 1.9  # a
+    # T = c_T * div(rho_d * K_m * grad(e_sgs))
+    tke_transport_coefficient: float = 2.0  # c_T
 
     @property
     def state_dim(self) -> int:

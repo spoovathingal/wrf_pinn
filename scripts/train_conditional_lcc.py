@@ -83,6 +83,12 @@ def main() -> int:
     ap.add_argument(
         "--model-z-max", type=float, default=None,
         help="Physical-height normalization scale; not a model ceiling")
+    ap.add_argument(
+        "--tke-weight", type=float, default=1.0,
+        help="Relative SGS TKE weight within the PDE loss; 0 disables this term")
+    ap.add_argument(
+        "--tke-residual-scale", type=float, default=1.0,
+        help="Conservative TKE residual scale [kg m^-1 s^-3]")
     args = ap.parse_args()
 
     if (args.model_z_max is not None and not 0.0 < args.model_z_max < float("inf")):
@@ -152,7 +158,7 @@ def main() -> int:
             readers=args.readers, loader_workers=args.loader_workers, device=device,
             log_every=args.log_every,
             source_scaling=source_scaling, source_z_mode=args.source_z_mode, scaling=scaling,
-            physics=physics,
+            physics=physics, tke_weight=args.tke_weight, tke_residual_scale=args.tke_residual_scale,
             flux_offset=tuple(recipe["flux_offset"]), flux_scale=tuple(s or 1.0 for s in recipe["flux_scale"]),
             profile=args.profile, bf16_data=args.bf16_data,
             compile=args.compile_model, events_path=args.events,

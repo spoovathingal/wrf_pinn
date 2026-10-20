@@ -59,6 +59,10 @@ class ConditionalTrainConfig:
     weight_flow_boundary: float = 1.0
     weight_pde: float = 1.0
     weight_surface: float = 1.0
+    # Relative TKE weight within the PDE loss.
+    tke_weight: float = 1.0
+    # Conservative TKE residual scale [kg m^-1 s^-3].
+    tke_residual_scale: float = 1.0
     n_collocation: int = 2048     # PDE collocation points per case per step
     n_wall: int = 512             # surface/wall points per case per step
     grad_clip_norm: float = 1.0   # clip grads (PINN PDE gradients can spike)
@@ -102,6 +106,11 @@ class ConditionalTrainConfig:
     compile: bool = False
     #: Optional JSONL optimization events; checkpoint provenance is always saved.
     events_path: "str | None" = None
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.tke_weight) or self.tke_weight < 0.0:
+            raise ValueError("tke_weight must be finite and nonnegative.")
+        if not math.isfinite(self.tke_residual_scale) or self.tke_residual_scale <= 0.0:
+            raise ValueError("tke_residual_scale must be finite and positive.")
 
 
 def _resolve_device(name: str) -> torch.device:
@@ -322,7 +331,15 @@ def _pde_loss(model, coll: torch.Tensor, z: torch.Tensor, cfg, scaling,
         coll = coll.requires_grad_(True)
         res = cartesian_zero_forcing_residuals(coll, model(coll, z, cfg.n_collocation),
                                                physics=cfg.physics, scaling=scaling)
-    return torch.stack([r.square().mean() for r in res.values()]).mean()
+    base_terms = [
+        residual.square().mean() for name, residual in res.items() if name != "sgs_tke"
+    ]
+    if cfg.tke_weight == 0.0:
+        return torch.stack(base_terms).mean()
+
+    tke_mse = (res["sgs_tke"] / cfg.tke_residual_scale).square().mean()
+    return (torch.stack(base_terms).sum() + cfg.tke_weight * tke_mse
+    ) / (len(base_terms) + cfg.tke_weight)
 
 
 def _forward_maybe_bf16(forward: Callable, coords: torch.Tensor, z: torch.Tensor,
@@ -680,10 +697,10 @@ def _maybe_resume(model, optimizer, history, config, device) -> int:
     ckpt = torch.load(config.checkpoint_path, map_location=device)
     saved = (ckpt.get("manifest") or {}).get("training", {})
     current = asdict(config)
-    keys = ("scaling", "source_scaling", "source_z_mode")
+    keys = ("scaling", "source_scaling", "source_z_mode", "physics", "tke_weight", "tke_residual_scale")
 
     if (ckpt.get("geometry_version") != 1 or any(saved.get(k) != current[k] for k in keys)):
-        raise ValueError("Checkpoint geometry/scaling differs; use a new checkpoint path.")
+        raise ValueError("Checkpoint geometry/physics/TKE loss settings differ; use a new checkpoint path.")
     
     model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])

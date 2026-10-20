@@ -18,7 +18,7 @@ from wrf_pinn.config.conditions import ConditionsConfig
 TensorMap = dict[str, torch.Tensor]
 
 PDE_RESIDUAL_NAMES: tuple[str, ...] = ("mass", "x_momentum", "y_momentum", "z_momentum",
-                                       "potential_temperature", "water_vapor")
+                                       "potential_temperature", "water_vapor", "sgs_tke")
 
 @dataclass(frozen=True)
 class PDEResidualScales:
@@ -30,7 +30,8 @@ class PDEResidualScales:
     z_momentum: float = 1.0
     potential_temperature: float = 1.0
     water_vapor: float = 1.0
-
+    sgs_tke: float = 1.0
+    
     def __post_init__(self) -> None:
         for name in PDE_RESIDUAL_NAMES:
             value = getattr(self, name)

@@ -209,7 +209,7 @@ def _validate_physics_config(physics: PhysicsConfig) -> None:
     if physics.active_variables != ("u", "v", "w", "theta", "p_prime", "q_v", "e_sgs"):
         raise ValueError("Residuals currently require active variables u, v, w, theta, p_prime, q_v, e_sgs")
 
-    expected_residuals = ("mass", "x_momentum", "y_momentum", "z_momentum", "potential_temperature", "water_vapor")
+    expected_residuals = ("mass", "x_momentum", "y_momentum", "z_momentum", "potential_temperature", "water_vapor", "sgs_tke")
     if physics.residuals != expected_residuals:
         raise ValueError(f"Residuals require equations {expected_residuals}.")
 
@@ -321,6 +321,16 @@ def _diagnostic_sgs_coefficients(
     k_scalar = k_m * (1.0 + 2.0 * mixing_length / delta)
 
     return (n_squared, mixing_length, k_m, k_scalar)
+
+def _sgs_tke_dissipation(rho_d: torch.Tensor, e_sgs: torch.Tensor, 
+    mixing_length: torch.Tensor, physics: PhysicsConfig) -> torch.Tensor:
+    """Positive dissipation magnitude, using physical tensor values."""
+    a_ck = physics.tke_dissipation_mixing_factor * physics.sgs_mixing_coefficient
+    c_e = a_ck + (physics.tke_dissipation_coefficient - a_ck) *(
+        mixing_length / physics.uniform_filter_width)
+
+    e_positive = e_sgs.clamp_min(0.0)
+    return rho_d * c_e * e_positive.pow(1.5) / mixing_length
 
 def cartesian_zero_forcing_residuals(
     coordinates: torch.Tensor,
@@ -523,13 +533,42 @@ def cartesian_zero_forcing_residuals(
         + tau_q_v_x_x + tau_q_v_y_y + tau_q_v_z_z
     )
 
+    # Conservative SGS TKE budget in physical units.
+    grad_e_sgs = _physical_gradient(e_sgs, coordinates, scaling)
+    ge = (e_sgs, grad_e_sgs)
+    tke_storage = _product_gradient(rho, ge)[:, 3:4]
+    tke_advection = (
+        _product_gradient(rho, gu, ge)[:, 0:1]
+        + _product_gradient(rho, gv, ge)[:, 1:2]
+        + _product_gradient(rho, gw, ge)[:, 2:3]
+    )
+
+    # B = -rho_d * K_theta * N^2.
+    tke_buoyancy = -rho_d * k_theta * _n_squared
+    tke_shear = -(
+        tau_xx * u_x + tau_yy * v_y + tau_zz * w_z
+        + tau_xy * (u_y + v_x) + tau_xz * (u_z + w_x) + tau_yz * (v_z + w_y) )
+    
+    tke_dissipation = _sgs_tke_dissipation(rho_d, e_sgs, _mixing_length, physics)
+    
+    tke_transport = physics.tke_transport_coefficient * sum(
+        _physical_gradient(
+            rho_d * k_m * grad_e_sgs[:, j:j + 1], coordinates, scaling
+        )[:, j:j + 1] for j in range(3)
+    )
+    sgs_tke = (
+        tke_storage + tke_advection
+        - tke_buoyancy - tke_shear + tke_dissipation - tke_transport
+    )
+
     return {
         "mass": mass,
         "x_momentum": x_momentum,
         "y_momentum": y_momentum,
         "z_momentum": z_momentum,
         "potential_temperature": potential_temperature,
-        "water_vapor": water_vapor
+        "water_vapor": water_vapor,
+        "sgs_tke": sgs_tke,
     }
 
 
@@ -666,11 +705,34 @@ def cartesian_zero_forcing_residuals_taylor(
         + tau_q_v_x_x + tau_q_v_y_y + tau_q_v_z_z
     )
 
+    # Keep the original energy Jet for conservative and diffusion derivatives.
+    rho_d_e = rho_d * e_sgs
+    tke_storage = rho_d_e.d[3]
+    tke_advection = sum(
+        (rho_d_e * velocity).d[j] for j, velocity in enumerate((u, v, w))
+    )
+
+    tke_buoyancy = -rho_d.v * k_theta.v * _n_squared.v
+    tke_shear = -(
+        tau_xx.v * u_x.v + tau_yy.v * v_y.v + tau_zz.v * w_z.v
+        + tau_xy.v * (u_y.v + v_x.v) + tau_xz.v * (u_z.v + w_x.v) + tau_yz.v * (v_z.v + w_y.v)
+    )
+    tke_dissipation = _sgs_tke_dissipation(rho_d.v, e_sgs.v, _mixing_length.v, physics)
+    tke_transport = physics.tke_transport_coefficient * sum(
+        (rho_d * k_m * e_sgs.deriv(j)).d[j] for j in range(3)
+    )
+
+    sgs_tke = (
+        tke_storage + tke_advection
+        - tke_buoyancy - tke_shear + tke_dissipation - tke_transport
+    )
+
     return {
         "mass": mass,
         "x_momentum": x_momentum,
         "y_momentum": y_momentum,
         "z_momentum": z_momentum,
         "potential_temperature": potential_temperature,
-        "water_vapor": water_vapor
+        "water_vapor": water_vapor,
+        "sgs_tke": sgs_tke,
     }
