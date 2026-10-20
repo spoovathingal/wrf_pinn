@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-
+import torch
 import numpy as np
 
 #: Variables carried in the conditioning fields and predicted by the model.
@@ -170,3 +170,74 @@ class ConditionalMetadata:
             coord_names=tuple(schema.get("coord_names", COORD_NAMES)),
             normalization=raw.get("normalization", {}),
         )
+
+def prepare_terrain(terrain):
+    """Build sorted terrain axes and heights once on CPU.
+
+    Input columns are physical x, y, elevation in metres.
+    Returns x_axis, y_axis, height[x_index, y_index].
+    """
+    terrain = torch.as_tensor(terrain, device="cpu").detach()
+    if not terrain.is_floating_point():
+        terrain = terrain.float()
+
+    if (terrain.ndim != 2 or terrain.shape[1] != 3 or not torch.isfinite(terrain).all()):
+        raise ValueError("terrain must contain finite (x, y, elevation) rows")
+
+    x_axis = torch.unique(terrain[:, 0], sorted=True)
+    y_axis = torch.unique(terrain[:, 1], sorted=True)
+    nx, ny = x_axis.numel(), y_axis.numel()
+
+    if nx < 2 or ny < 2:
+        raise ValueError("terrain requires at least two x and y values")
+
+    ix = torch.searchsorted(x_axis, terrain[:, 0].contiguous())
+    iy = torch.searchsorted(y_axis, terrain[:, 1].contiguous())
+
+    if (len(terrain) != nx * ny or torch.unique(ix * ny + iy).numel() != nx * ny):
+        raise ValueError("terrain must be a complete grid without duplicate rows")
+
+    height = terrain.new_empty((nx, ny))
+    height[ix, iy] = terrain[:, 2]
+    return x_axis, y_axis, height
+
+
+def terrain_at(xq, yq, x_axis, y_axis, height):
+    """Return physical terrain height and slopes dh/dx, dh/dy.
+
+    Single grid: axes (nx,), (ny,), height (nx, ny).
+    Batched grids: axes (k, nx), (k, ny), height (k, nx, ny);
+    queries must then have shape (k, n).
+
+    Queries and grid tensors must use physical metres and the same device.
+    Boundary cells extrapolate linearly beyond the sampled terrain.
+    """
+
+    ix = torch.searchsorted(x_axis, xq.contiguous(), right=True).clamp(1, x_axis.shape[-1] - 1) - 1
+    iy = torch.searchsorted(y_axis, yq.contiguous(), right=True).clamp(1, y_axis.shape[-1] - 1) - 1
+
+    batch = ()
+    if x_axis.ndim == 2:
+        batch = (torch.arange(height.shape[0], device=height.device)[:, None],)
+
+    x0 = x_axis[batch + (ix,)]
+    x1 = x_axis[batch + (ix + 1,)]
+    y0 = y_axis[batch + (iy,)]
+    y1 = y_axis[batch + (iy + 1,)]
+
+    h00 = height[batch + (ix, iy)]
+    h10 = height[batch + (ix + 1, iy)]
+    h01 = height[batch + (ix, iy + 1)]
+    h11 = height[batch + (ix + 1, iy + 1)]
+
+    tx = (xq - x0) / (x1 - x0)
+    ty = (yq - y0) / (y1 - y0)
+
+    a = h00 + tx * (h10 - h00)
+    b = h01 + tx * (h11 - h01)
+
+    h = a + ty * (b - a)
+    hx = ( (1 - ty) * (h10 - h00) + ty * (h11 - h01) ) / (x1 - x0)
+    hy = (b - a) / (y1 - y0)
+
+    return h, hx, hy

@@ -135,7 +135,9 @@ def _validate_no_penetration_z_wall_inputs(coordinates: torch.Tensor, state: tor
                                            reference_coordinates: torch.Tensor, reference_state: torch.Tensor, 
                                            physics: PhysicsConfig, scaling: ResidualScalingConfig,
                                            surface_stress_scale: float,
-                                           check_values: bool = True) -> "torch.Tensor | None":
+                                           check_values: bool = True,
+                                           terrain_height: "torch.Tensor | None" = None,
+                                           terrain_slopes: "torch.Tensor | None" = None) -> "torch.Tensor | None":
     """Validate surface-boundary inputs and return the bottom-point mask (None when
     ``check_values`` is off: every row is taken to be at z=0)."""
     _validate_state(state)
@@ -160,15 +162,27 @@ def _validate_no_penetration_z_wall_inputs(coordinates: torch.Tensor, state: tor
 
     if not math.isfinite(surface_stress_scale) or surface_stress_scale <= 0.0:
         raise ValueError("surface_stress_scale must be finite and positive.")
+
+    for name, value, width in (("terrain_height", terrain_height, 1), ("terrain_slopes", terrain_slopes, 2)):
+        if value is not None:
+            if value.shape != (coordinates.shape[0], width):
+                raise ValueError(f"{name} must have shape (num_wall_points, {width}).")
+            if check_values and not torch.isfinite(value).all():
+                raise ValueError(f"{name} must contain only finite values.")
+    
     if not check_values:
         return None
 
-    z_physical = (scaling.z.offset + scaling.z.scale * coordinates[:, 2:3])
+    z_physical = scaling.z.offset + scaling.z.scale * coordinates[:, 2:3]
+    h = 0.0 if terrain_height is None else terrain_height.to(coordinates)
 
-    bottom_mask = torch.isclose(z_physical, torch.zeros_like(z_physical),
-                                rtol=0.0, atol=1.0e-5).squeeze(dim=1)
+    # Allow float32 roundoff when reconstructing physical height.
+    tolerance = max(1.0e-5,
+        4.0 * torch.finfo(coordinates.dtype).eps * max(abs(scaling.z.offset), abs(scaling.z.scale), 1.0))
+    bottom_mask = torch.isclose(z_physical - h, torch.zeros_like(z_physical),
+                                rtol=0.0, atol=tolerance).squeeze(dim=1)
     if not torch.any(bottom_mask):
-        raise ValueError("No z=0 bottom-boundary points were supplied.")
+        raise ValueError("No points on the supplied terrain surface were supplied.")
     
     return bottom_mask
 
@@ -182,6 +196,8 @@ def no_penetration_z_wall_residuals(
     surface_heat_flux_scale: float = 1.0,
     state_jacobian: "torch.Tensor | None" = None,
     check_values: bool = True,
+    terrain_height: "torch.Tensor | None" = None,
+    terrain_slopes: "torch.Tensor | None" = None,
 ) -> dict[str, torch.Tensor]:
     """Return no-penetration and neutral surface stress residuals.
 
@@ -206,7 +222,7 @@ def no_penetration_z_wall_residuals(
         coordinates=coordinates, state=state,
         reference_coordinates=reference_coordinates, reference_state=reference_state,
         physics=physics, scaling=scaling, surface_stress_scale=surface_stress_scale,
-        check_values=check_values,
+        check_values=check_values, terrain_height=terrain_height, terrain_slopes=terrain_slopes,
     )
 
     for name, field in (("fric_vel", fric_vel), ("ht_flux", ht_flux)):
@@ -272,9 +288,15 @@ def no_penetration_z_wall_residuals(
     # Potential-temperature SGS flux equals the supplied surface flux.
     tau_theta_wall = -rho_wall * k_theta_wall * theta_z
     tau_theta_surface = rho_1 * ht_flux
+    normal_velocity = w_wall
+    if terrain_slopes is not None:
+        slopes = terrain_slopes.to(state)
+        hx = slopes[:, 0:1]
+        hy = slopes[:, 1:2]
+        normal_velocity = (w_wall - u_wall * hx - v_wall * hy) / torch.sqrt(1.0 + hx.square() + hy.square())
     bottom = (lambda r: r) if bottom_mask is None else (lambda r: r[bottom_mask])
     return {
-        "no_penetration_w": w_wall / scaling.w.scale, # z = 0 and z = z_max
+        "no_penetration_w": normal_velocity / scaling.w.scale, # z = 0 and z = z_max
         "surface_stress_xz": bottom((tau_xz_wall + tau_xz_surface) / surface_stress_scale), # z = 0
         "surface_stress_yz": bottom((tau_yz_wall + tau_yz_surface) / surface_stress_scale), # z = 0
         "surface_heat_flux": bottom((tau_theta_wall - tau_theta_surface) / surface_heat_flux_scale),

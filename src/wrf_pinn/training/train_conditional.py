@@ -7,7 +7,7 @@ import math
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, asdict
 from functools import partial
 from functools import lru_cache
 from pathlib import Path
@@ -18,7 +18,7 @@ from torch.profiler import record_function
 from torch import nn
 
 from wrf_pinn.data.conditional_case import (
-    ConditionalCase, COORD_NAMES, STATE_VARS, read_conditional_case,
+    ConditionalCase, COORD_NAMES, STATE_VARS, read_conditional_case,prepare_terrain, terrain_at,
 )
 from wrf_pinn.config.physics import DEFAULT_PHYSICS, PhysicsConfig
 from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING, ResidualScalingConfig
@@ -65,6 +65,12 @@ class ConditionalTrainConfig:
     #: affine scaling (physical = offset + scale*normalized) for the residuals,
     #: built from the pre-processor's normalization recipe. Identity if None.
     scaling: "ResidualScalingConfig | None" = None
+    #: SOURCE normalization: saved NPZ coordinates -> source units.
+    source_scaling: "ResidualScalingConfig | None" = None
+    #: reference_plus_terrain: current data, approximate Z = terrain + source z
+    #: height_above_ground:    source z already means height above ground
+    #: physical_altitude:      source z already means physical altitude
+    source_z_mode: str = "reference_plus_terrain"
     #: physics for the residuals; carries the q_v unit conversion.
     physics: PhysicsConfig = DEFAULT_PHYSICS
     #: flux (fricVel, htFlux) offset/scale from the recipe, to un-normalize
@@ -130,6 +136,10 @@ class CaseBatch:
     boundary_coords: torch.Tensor
     boundary_targets: torch.Tensor
     surface: torch.Tensor
+    terrain_x: torch.Tensor
+    terrain_y: torch.Tensor
+    terrain_h: torch.Tensor
+    surface_geometry: torch.Tensor  # physical h, dh/dx, dh/dy per surface row
     box_lo: torch.Tensor          # (k, n_coord) interior bounding box, for collocation
     box_hi: torch.Tensor
     interior_sizes: torch.Tensor
@@ -151,31 +161,68 @@ class CaseBatch:
     pin_memory = pin  # what DataLoader(pin_memory=True) calls on custom batch types
 
 
-def stack_cases(cases: list[ConditionalCase]) -> CaseBatch:
+def stack_cases(cases: list[ConditionalCase], cfg: ConditionalTrainConfig) -> CaseBatch:
     """Concatenate torch cases (on one device) into a CaseBatch."""
-    n_coord = len(COORD_NAMES)
-    cat = lambda xs: torch.cat(xs, dim=0)
-    sizes = lambda xs: torch.tensor([x.shape[0] for x in xs], dtype=torch.long)
-    bc = [c.boundary_coords.reshape(-1, n_coord) for c in cases]
-    surf = [c.surface.reshape(-1, c.surface.shape[-1]) for c in cases]
+    """Prepare model coordinates and terrain on CPU."""
+    if cfg.source_scaling is None:
+        raise ValueError("Set source_scaling from the dataset normalization recipe.")
+    if cfg.source_z_mode not in ("reference_plus_terrain", "height_above_ground", "physical_altitude"):
+        raise ValueError(f"Unsupported source_z_mode: {cfg.source_z_mode}")
+    scaling = cfg.scaling if cfg.scaling is not None else DEFAULT_RESIDUAL_SCALING
+    source_off, source_scale = _coordinate_affine(cfg.source_scaling, cases[0].interior)
+    model_off, model_scale = _coordinate_affine(scaling, cases[0].interior)
+
+    grids = [prepare_terrain(c.terrain) for c in cases]
+    cat = lambda values: torch.cat(values, dim=0)
+    sizes = lambda values: torch.tensor([len(v) for v in values], dtype=torch.long)
+
+    def convert(coords, grid):
+        physical = coords * source_scale + source_off
+        if cfg.source_z_mode != "physical_altitude":
+            h = terrain_at(physical[:, 0], physical[:, 1], *grid)[0]
+            physical[:, 2] = physical[:, 2] + h
+        return (physical - model_off) / model_scale
+
+    interior, initial, boundary, surface, geometry = [], [], [], [], []
+
+    for c, grid in zip(cases, grids):
+        interior.append( convert(c.interior, grid) )
+        initial.append( convert(c.initial_coords, grid) )
+        boundary.append( convert(c.boundary_coords.reshape(-1, 4), grid) )
+
+        rows = c.surface.reshape(-1, c.surface.shape[-1])
+        physical_xyt = (rows[:, :3] * source_scale[[0, 1, 3]] + source_off[[0, 1, 3]])
+        h, hx, hy = terrain_at(physical_xyt[:, 0], physical_xyt[:, 1], *grid)
+        model_xyt = (physical_xyt - model_off[[0, 1, 3]]) / model_scale[[0, 1, 3]]
+
+        surface.append( torch.cat( (model_xyt, rows[:, 3:]) , dim=1) )
+        geometry.append( torch.stack( (h, hx, hy) , dim=1) )
+
+        # Future physical-altitude mode uses the above-ground part
+        # of the case's physical bounding box for PDE sampling.
+        if cfg.source_z_mode == "physical_altitude":
+            p = c.interior * source_scale + source_off
+            lo, hi = p.amin(dim=0), p.amax(dim=0)
+            xs, ys, _ = grid
+            xs = torch.unique(  torch.cat( (xs[(xs >= lo[0]) & (xs <= hi[0])], lo[0:1], hi[0:1]) )  )
+            ys = torch.unique(  torch.cat( (ys[(ys >= lo[1]) & (ys <= hi[1])], lo[1:2], hi[1:2]) )  )
+            xx, yy = torch.meshgrid(xs, ys, indexing="ij")
+            if terrain_at(xx, yy, *grid)[0].max() >= hi[2]:
+                raise ValueError(f"{c.name}: physical case top must be above terrain.")
+
     return CaseBatch(
         z=torch.stack([c.z for c in cases]),
-        interior=cat([c.interior for c in cases]),
-        targets=cat([c.targets for c in cases]),
-        target_mask=cat([c.target_mask for c in cases]),
-        initial_coords=cat([c.initial_coords for c in cases]),
-        initial_targets=cat([_initial_targets(c) for c in cases]),
-        boundary_coords=cat(bc),
-        boundary_targets=cat([_boundary_targets(c) for c in cases]),
-        surface=cat(surf),
-        box_lo=torch.stack([c.interior.min(dim=0).values for c in cases]),
-        box_hi=torch.stack([c.interior.max(dim=0).values for c in cases]),
-        interior_sizes=sizes([c.interior for c in cases]),
-        initial_sizes=sizes([c.initial_coords for c in cases]),
-        boundary_sizes=sizes(bc),
-        surface_sizes=sizes(surf),
+        interior=cat(interior),
+        targets=cat([c.targets for c in cases]), target_mask=cat([c.target_mask for c in cases]),
+        initial_coords=cat(initial), initial_targets=cat([_initial_targets(c) for c in cases]),
+        boundary_coords=cat(boundary), boundary_targets=cat([_boundary_targets(c) for c in cases]),
+        surface=cat(surface), terrain_x=torch.stack([g[0] for g in grids]),
+        terrain_y=torch.stack([g[1] for g in grids]), terrain_h=torch.stack([g[2] for g in grids]),
+        surface_geometry=cat(geometry),
+        # SOURCE-normalized bounds, deliberately kept unconverted.
+        box_lo=torch.stack([c.interior.amin(dim=0) for c in cases]), box_hi=torch.stack([c.interior.amax(dim=0) for c in cases]),
+        interior_sizes=sizes(interior), initial_sizes=sizes(initial), boundary_sizes=sizes(boundary), surface_sizes=sizes(surface),
     )
-
 
 def _per_case_mean(values: torch.Tensor, sizes: torch.Tensor, k: int) -> torch.Tensor:
     """Mean of per-point values within each case -> (k,)."""
@@ -192,6 +239,11 @@ def _device_constant(values: tuple[float, ...], device: torch.device,
     copy made the CPU wait for the GPU. Callers must not modify it in place."""
     return torch.tensor(values, device=device, dtype=dtype)
 
+def _coordinate_affine(scaling, like):
+    offsets = tuple(getattr(scaling, name).offset for name in COORD_NAMES)
+    return (_device_constant(offsets, like.device, like.dtype), _device_constant(
+            tuple(scaling.coordinate_scales()), like.device, like.dtype),
+    )
 
 @dataclass(frozen=True)
 class StepFunctions:
@@ -223,10 +275,9 @@ def _surface_loss(model, b: CaseBatch, cfg, scaling, fns: StepFunctions) -> torc
     fluxes are un-normalized to physical for the no-penetration-z residual."""
     surf = b.surface
     dev, dt = surf.device, surf.dtype
-    z_floor = (0.0 - scaling.z.offset) / scaling.z.scale
-    wall = torch.stack([surf[:, 0], surf[:, 1],
-                        torch.full((surf.shape[0],), z_floor, device=dev, dtype=dt),
-                        surf[:, 2]], dim=1)
+    h = b.surface_geometry[:, 0:1]
+    z_floor = (h[:, 0] - scaling.z.offset) / scaling.z.scale
+    wall = torch.stack( (surf[:, 0], surf[:, 1], z_floor, surf[:, 2]), dim=1)
     if _taylor_supported(model):  # wall gradients from one first-order forward pass
         jet = fns.taylor(model.net, wall, b.z, scaling.coordinate_scales(), second=False,
                          sizes=b.surface_sizes)
@@ -236,8 +287,7 @@ def _surface_loss(model, b: CaseBatch, cfg, scaling, fns: StepFunctions) -> torc
         wall_state, state_jacobian = model(wall, b.z, b.surface_sizes), None
 
     reference = wall.detach().clone()
-    z1 = (cfg.physics.constants.surface_reference_height - scaling.z.offset) / scaling.z.scale
-    reference[:, 2] = z1
+    reference[:, 2] = (h[:, 0] + cfg.physics.constants.surface_reference_height - scaling.z.offset) / scaling.z.scale
     reference_state = fns.forward(reference, b.z, b.surface_sizes)
 
     f_off = _device_constant(tuple(cfg.flux_offset), dev, dt)
@@ -250,7 +300,8 @@ def _surface_loss(model, b: CaseBatch, cfg, scaling, fns: StepFunctions) -> torc
         fric_vel=phys[:, 0:1], ht_flux=phys[:, 1:2],
         surface_stress_scale=cfg.surface_stress_scale,
         surface_heat_flux_scale=cfg.surface_heat_flux_scale,
-        state_jacobian=state_jacobian, check_values=False)  # wall rows are built at z=0 above
+        state_jacobian=state_jacobian, check_values=False,
+        terrain_height=h, terrain_slopes=b.surface_geometry[:, 1:3])  # wall rows are built at z=0 above
     per_eq = torch.stack([_per_case_mean(r.square().reshape(-1), b.surface_sizes, b.k)
                           for r in res.values()])                    # (n_eq, k)
     return per_eq.mean(dim=0).mean()
@@ -326,7 +377,23 @@ def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
         with record_function("loss/pde"):
             u = unit_coll if unit_coll is not None else torch.rand(
                 (k, cfg.n_collocation, b.box_lo.shape[1]), device=pred.device, dtype=pred.dtype)
-            coll = (b.box_lo[:, None] + u * (b.box_hi - b.box_lo)[:, None]).reshape(-1, b.box_lo.shape[1])
+            source_off, source_scale = _coordinate_affine(cfg.source_scaling, u)
+            model_off, model_scale = _coordinate_affine(scaling, u)
+
+            sampled = (b.box_lo[:, None] + u * (b.box_hi - b.box_lo)[:, None])
+            physical = sampled * source_scale + source_off
+            h = terrain_at(physical[:, :, 0], physical[:, :, 1], b.terrain_x, b.terrain_y, b.terrain_h,)[0]
+
+            if cfg.source_z_mode == "physical_altitude":
+                z0 = b.box_lo[:, 2:3] * source_scale[2] + source_off[2]
+                z1 = b.box_hi[:, 2:3] * source_scale[2] + source_off[2]
+                lower = torch.maximum(torch.minimum(z0, z1), h)
+                upper = torch.maximum(z0, z1)
+                physical[:, :, 2] = (lower + u[:, :, 2] * (upper - lower))
+            else:
+                physical[:, :, 2] = physical[:, :, 2] + h
+
+            coll = ((physical - model_off) / model_scale).reshape(-1, 4)
             pde = _pde_loss(model, coll, b.z, cfg, scaling, fns)
     else:
         pde = zero
@@ -344,7 +411,7 @@ def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
 def _case_losses(model: nn.Module, case: ConditionalCase,
                  cfg: "ConditionalTrainConfig") -> dict[str, torch.Tensor]:
     """The five losses for one case."""
-    return _batch_losses(model, stack_cases([case]), cfg)
+    return _batch_losses(model, stack_cases([case], cfg), cfg)
 
 
 def _average_across_processes(params: list[nn.Parameter], losses: torch.Tensor,
@@ -397,9 +464,10 @@ class _StepDraws(torch.utils.data.Sampler):
             yield torch.randperm(self.n_cases, generator=rng)[:self.k].tolist()
 
 
-def _collate_passes(picked: "list[ConditionalCase]", per_pass: int) -> list[CaseBatch]:
+def _collate_passes(picked: "list[ConditionalCase]", per_pass: int,
+                    cfg: ConditionalTrainConfig) -> list[CaseBatch]:
     """A step's cases, stacked into its passes (runs in the worker)."""
-    return [stack_cases(picked[s:s + per_pass]) for s in range(0, len(picked), per_pass)]
+    return [stack_cases(picked[s:s + per_pass], cfg) for s in range(0, len(picked), per_pass)]
 
 
 def _world() -> tuple[int, int]:
@@ -454,7 +522,8 @@ def train_conditional(
             picked = list(readers.map(load, idx))
         else:
             picked = [cases[i] for i in idx]
-        passes = [stack_cases(picked[s:s + per_pass]) for s in range(0, len(picked), per_pass)]
+        passes = [stack_cases(picked[s:s + per_pass], config)
+                  for s in range(0, len(picked), per_pass)]
         return [b.pin() for b in passes] if cuda else passes
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
@@ -478,9 +547,8 @@ def train_conditional(
     n_steps = config.epochs - start_epoch + 1
     if case_paths is not None and config.loader_workers > 0:
         loader = torch.utils.data.DataLoader(
-            _CaseFiles(case_paths), batch_sampler=_StepDraws(n_cases, k, config.seed + rank,
-                                                                    n_steps),
-            num_workers=config.loader_workers, collate_fn=partial(_collate_passes, per_pass=per_pass),
+            _CaseFiles(case_paths), batch_sampler=_StepDraws(n_cases, k, config.seed + rank, n_steps),
+            num_workers=config.loader_workers, collate_fn=partial(_collate_passes, per_pass=per_pass, cfg=config),
             pin_memory=cuda, prefetch_factor=2, persistent_workers=False)
         batches = iter(loader)
         next_batch = lambda: next(batches)
@@ -595,7 +663,7 @@ def _save_checkpoint(model, optimizer, history, epoch, config, manifest=None) ->
     path = Path(config.checkpoint_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    torch.save({"schema_version": 2, "manifest": manifest,
+    torch.save({"schema_version": 3, "geometry_version": 1, "manifest": manifest,
                 "epoch": epoch, "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(), "history": vars(history)}, tmp)
     tagged = path.with_name(f"{path.stem}_step{epoch:06d}{path.suffix}")
@@ -610,6 +678,13 @@ def _maybe_resume(model, optimizer, history, config, device) -> int:
     if not config.checkpoint_path or not Path(config.checkpoint_path).is_file():
         return 1
     ckpt = torch.load(config.checkpoint_path, map_location=device)
+    saved = (ckpt.get("manifest") or {}).get("training", {})
+    current = asdict(config)
+    keys = ("scaling", "source_scaling", "source_z_mode")
+
+    if (ckpt.get("geometry_version") != 1 or any(saved.get(k) != current[k] for k in keys)):
+        raise ValueError("Checkpoint geometry/scaling differs; use a new checkpoint path.")
+    
     model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
     for name, vals in ckpt["history"].items():
