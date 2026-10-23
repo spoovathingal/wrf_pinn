@@ -83,6 +83,13 @@ def main() -> int:
     ap.add_argument(
         "--model-z-max", type=float, default=None,
         help="Physical-height normalization scale; not a model ceiling")
+    ap.add_argument("--lr", type=float, default=1e-3, help="(peak) learning rate")
+    ap.add_argument(
+        "--lr-min", type=float, default=None,
+        help="cosine-decay the learning rate to this by the last epoch; omit for constant")
+    ap.add_argument(
+        "--boundary-weight", type=float, default=1.0,
+        help="weight of the flow-boundary (side faces) loss")
     ap.add_argument(
         "--tke-weight", type=float, default=1.0,
         help="Relative SGS TKE weight within the PDE loss; 0 disables this term")
@@ -157,6 +164,8 @@ def main() -> int:
             epochs=args.epochs, batch_cases=batch_cases, cases_per_pass=args.cases_per_pass,
             readers=args.readers, loader_workers=args.loader_workers, device=device,
             log_every=args.log_every,
+            learning_rate=args.lr, learning_rate_min=args.lr_min,
+            weight_flow_boundary=args.boundary_weight,
             source_scaling=source_scaling, source_z_mode=args.source_z_mode, scaling=scaling,
             physics=physics, tke_weight=args.tke_weight, tke_residual_scale=args.tke_residual_scale,
             flux_offset=tuple(recipe["flux_offset"]), flux_scale=tuple(s or 1.0 for s in recipe["flux_scale"]),
@@ -167,11 +176,13 @@ def main() -> int:
 
         log.info(
             "device=%s; local cases=%d/%d; latent dim=%d; "
-            "batch/GPU=%d; global batch=%d; q_v conversion=%g; mode=%s",
+            "batch/GPU=%d; global batch=%d; q_v conversion=%g; mode=%s; "
+            "lr=%g->%s; boundary weight=%g; tke weight=%g",
             device, len(paths), len(all_paths), z_dim,
             batch_cases, batch_cases * world,
             args.q_v_to_kg_per_kg,
             "lazy" if args.lazy else "resident",
+            args.lr, args.lr_min, args.boundary_weight, args.tke_weight,
         )
 
         if args.lazy:

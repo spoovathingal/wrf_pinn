@@ -54,6 +54,8 @@ class ConditionalTrainConfig:
     cases_per_pass: int = 0
     readers: int = 8              # threads reading cases in lazy mode
     learning_rate: float = 1e-3
+    #: cosine-decay the learning rate to this value by the last epoch. None = constant.
+    learning_rate_min: "float | None" = None
     weight_data: float = 1.0
     weight_initial: float = 1.0
     weight_flow_boundary: float = 1.0
@@ -585,6 +587,9 @@ def train_conditional(
         if prof is not None and cuda:
             torch.cuda.synchronize()
         t = time.perf_counter()
+        lr = _learning_rate(epoch, config)
+        for group in optimizer.param_groups:
+            group["lr"] = lr
         optimizer.zero_grad()
         # Gradient accumulation: each pass's loss is weighted by its share of the
         # batch, so the summed gradients equal one pass over all k cases.
@@ -652,7 +657,7 @@ def train_conditional(
             parts = " ".join(f"{n}={v:.4e}" for n, v in zip(weights, losses[1:]))
             # stderr + flush so progress is live in the SLURM log, never buffered
             print(f"epoch {epoch}/{config.epochs} total={losses[0]:.4e} {parts} | "
-                  f"{s_step:.2f}s/step wait={wait_window / steps_window * 1e3:.0f}ms/step "
+                  f"lr={lr:.2e} {s_step:.2f}s/step wait={wait_window / steps_window * 1e3:.0f}ms/step "
                   f"elapsed={(now - t_start) / 3600:.2f}h eta={eta_h:.2f}h{mem}",
                   file=sys.stderr, flush=True)
             if prof is not None:
@@ -673,6 +678,15 @@ def train_conditional(
     if readers is not None:
         readers.shutdown()
     return history
+
+
+def _learning_rate(epoch: int, config: ConditionalTrainConfig) -> float:
+    """Constant, or cosine from learning_rate at epoch 1 to learning_rate_min at the last."""
+    if config.learning_rate_min is None:
+        return config.learning_rate
+    frac = (epoch - 1) / max(config.epochs - 1, 1)
+    lo, hi = config.learning_rate_min, config.learning_rate
+    return lo + 0.5 * (hi - lo) * (1.0 + math.cos(math.pi * frac))
 
 
 def _save_checkpoint(model, optimizer, history, epoch, config, manifest=None) -> None:
