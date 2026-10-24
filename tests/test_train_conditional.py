@@ -18,6 +18,10 @@ from wrf_pinn.models.conditional import (  # noqa: E402
 from wrf_pinn.training.train_conditional import (  # noqa: E402
     ConditionalTrainConfig, split_cases, train_conditional,
 )
+from dataclasses import replace
+
+from wrf_pinn.config.scaling import ResidualScalingConfig, VariableScale
+import wrf_pinn.training.train_conditional as tc
 
 LATENT_DIM = 8
 
@@ -26,28 +30,103 @@ def _make_case(name: str, seed: int) -> ConditionalCase:
     nv, nc, nf = len(STATE_VARS), len(COORD_NAMES), len(FACE_NAMES)
     nx, ny, nz = 3, 3, 4
     n_ic = nx * ny * nz
-    n_times, face_len, n_terr, n_pts = 3, 4, 6, 12
+    n_times, face_len, n_pts = 3, 4, 12
     rng = np.random.default_rng(seed)
     f32 = np.float32
     return ConditionalCase(
         name=name,
         z=rng.standard_normal(LATENT_DIM).astype(f32),
-        initial_coords=rng.standard_normal((n_ic, nc)).astype(f32),
-        initial=rng.standard_normal((nv, nz, nx * ny)).astype(f32),
-        boundary=rng.standard_normal((nv, nf, n_times, face_len)).astype(f32),
-        boundary_coords=rng.standard_normal((nf, n_times, face_len, nc)).astype(f32),
-        surface=rng.standard_normal((n_times, 9, 5)).astype(f32),
-        terrain=rng.standard_normal((n_terr, 3)).astype(f32),
-        interior=rng.standard_normal((n_pts, nc)).astype(f32),
+        initial_coords=rng.random((n_ic, nc)).astype(f32),
+        initial=rng.standard_normal(
+            (nv, nz, nx * ny)
+        ).astype(f32),
+        boundary=rng.standard_normal(
+            (nv, nf, n_times, face_len)
+        ).astype(f32),
+        boundary_coords=rng.random(
+            (nf, n_times, face_len, nc)
+        ).astype(f32),
+        surface=rng.random((n_times, 9, 5)).astype(f32),
+        terrain=np.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [1.0, 1.0, 0.0],
+            ],
+            dtype=f32,
+            ),
+        interior=rng.random((n_pts, nc)).astype(f32),
         targets=rng.standard_normal((n_pts, nv)).astype(f32),
         target_mask=np.ones((n_pts, nv), dtype=f32),
         times=np.arange(n_times, dtype=f32),
     )
 
+def _geometry_fixture():
+    # Source-normalized coordinates: x, y, reference z, t.
+    rows = np.array(
+        [
+            [0.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.5, 1.0 / 3.0],
+            [0.0, 1.0, 1.0, 2.0 / 3.0],
+            [1.0, 1.0, 0.25, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+    case = ConditionalCase(
+        name="geometry",
+        z=np.zeros(LATENT_DIM, dtype=np.float32),
+        initial_coords=rows.copy(),
+        initial=np.zeros((len(STATE_VARS), 1, 4), dtype=np.float32),
+        boundary_coords=np.tile(rows, (len(FACE_NAMES), 1, 1, 1)),
+        boundary=np.zeros(
+            (len(STATE_VARS), len(FACE_NAMES), 1, 4),
+            dtype=np.float32,
+        ),
+        surface=np.column_stack(
+            (rows[:, [0, 1, 3]], np.zeros((4, 2), dtype=np.float32))
+        )[None],
+        terrain=np.array(
+            [
+                [0.0, 0.0, 100.0],
+                [100.0, 0.0, 300.0],
+                [0.0, 100.0, 400.0],
+                [100.0, 100.0, 600.0],
+            ],
+            dtype=np.float32,
+        ),
+        interior=rows.copy(),
+        targets=np.zeros((4, len(STATE_VARS)), dtype=np.float32),
+        target_mask=np.ones((4, len(STATE_VARS)), dtype=np.float32),
+        times=np.array([0.0], dtype=np.float32),
+    ).as_torch()
+
+    source = ResidualScalingConfig(
+        x=VariableScale(scale=100.0),
+        y=VariableScale(scale=100.0),
+        z=VariableScale(offset=10.0, scale=90.0),
+        t=VariableScale(scale=60.0),
+    )
+    model_scaling = replace(
+        source, z=VariableScale(offset=-20.0, scale=1000.0)
+    )
+    cfg = ConditionalTrainConfig(
+        source_scaling=source,
+        scaling=model_scaling,
+        source_z_mode="fe_terrain_following",
+        terrain_top_height=1000.0,
+        fe_surface_reference_z=10.0,
+        n_collocation=4,
+        weight_surface=0.0,
+        device="cpu",
+    )
+    return case, cfg
 
 # PDE/surface losses need physical fields; random synthetic data drives the moist
 # EOS to NaN, so the data-wiring smoke tests zero those weights.
-_DATA_ONLY = dict(weight_pde=0.0, weight_surface=0.0)
+_DATA_ONLY = dict(weight_pde=0.0, weight_surface=0.0,
+    source_scaling=ResidualScalingConfig())
 
 
 def test_pipeline_runs():
@@ -84,7 +163,13 @@ def test_checkpoint_save_and_resume(tmp_path):
     # the saved epoch must be the last multiple of checkpoint_every (or final epoch)
     ck = torch.load(str(ckpt), map_location="cpu")
     assert ck["epoch"] == 20
-    assert ck["schema_version"] == 2
+    assert ck["schema_version"] == 3
+    assert ck["geometry_version"] == 2
+
+    saved_training = ck["manifest"]["training"]
+    assert saved_training["source_z_mode"] == cfg.source_z_mode
+    assert saved_training["terrain_top_height"] == cfg.terrain_top_height
+    assert saved_training["fe_surface_reference_z"] == cfg.fe_surface_reference_z
     assert ck["manifest"]["model"]["latent_dim"] == LATENT_DIM
     assert ck["manifest"]["model"]["config"]["hidden_width"] == 16
     assert ck["manifest"]["training"]["seed"] == cfg.seed
@@ -93,6 +178,26 @@ def test_checkpoint_save_and_resume(tmp_path):
     assert events[0]["event"] == "run_start"
     assert any(e["event"] == "step" and e["gradient_norm_finite"] for e in events)
     assert events[-1]["event"] == "checkpoint" and events[-1]["epoch"] == 20
+
+    # Changed geometry must not silently resume an existing run.
+    for changed in (
+        {"terrain_top_height": cfg.terrain_top_height + 100.0},
+        {"fe_surface_reference_z": cfg.fe_surface_reference_z + 1.0},
+        {"source_z_mode": "height_above_ground"},
+    ):
+        incompatible = replace(cfg, epochs=21, **changed)
+        with pytest.raises(ValueError, match="settings differ"):
+            train_conditional(model, cases, incompatible)
+
+    # Previous geometry versions must also be rejected.
+    old_path = tmp_path / "old_geometry.pt"
+    torch.save({**ck, "geometry_version": 1}, old_path)
+
+    incompatible = replace(
+        cfg, epochs=21, checkpoint_path=str(old_path)
+    )
+    with pytest.raises(ValueError, match="settings differ"):
+        train_conditional(model, cases, incompatible)
 
     # resume into a FRESH model: weights load from the checkpoint, start epoch advances.
     fresh = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=16))
@@ -141,7 +246,7 @@ def test_collocation_points_independent_of_cases_per_pass(monkeypatch):
         model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=16))
         cfg = ConditionalTrainConfig(epochs=3, batch_cases=4, cases_per_pass=cases_per_pass,
                                      n_collocation=16, device="cpu", log_every=100,
-                                     weight_surface=0.0)
+                                     source_scaling=ResidualScalingConfig(),weight_surface=0.0)
         train_conditional(model, cases, cfg)
         return torch.cat(seen)
 
@@ -274,3 +379,128 @@ def test_average_across_processes_two_real_processes(tmp_path):
              for r in range(2)]
     assert all(p.wait(timeout=120) == 0 for p in procs)
     assert [(tmp_path / f"rank{r}.txt").read_text() for r in range(2)] == ["ok", "ok"]
+
+def test_terrain_observation_coordinates():
+    case, cfg = _geometry_fixture()
+    batch = tc.stack_cases([case], cfg)
+
+    expected = case.interior.clone()
+    expected[:, 2] = torch.tensor([0.129, 0.3585, 0.480, 0.633])
+
+    torch.testing.assert_close(batch.interior, expected)
+    torch.testing.assert_close(batch.initial_coords, expected)
+    torch.testing.assert_close(
+        batch.boundary_coords, expected.repeat(len(FACE_NAMES), 1)
+    )
+
+    # Sampling bounds remain in source-normalized coordinates.
+    torch.testing.assert_close(batch.box_lo[0], case.interior.amin(dim=0))
+    torch.testing.assert_close(batch.box_hi[0], case.interior.amax(dim=0))
+
+def test_terrain_collocation_matches_observations(monkeypatch):
+    case, cfg = _geometry_fixture()
+    batch = tc.stack_cases([case], cfg)
+    model = ConditionalModel(
+        LATENT_DIM,
+        ConditionalModelConfig(hidden_layers=1, hidden_width=8),
+    )
+    seen = {}
+
+    def capture_pde(model, coll, z_rows, config, scaling, fns):
+        seen["coordinates"] = coll.detach().clone()
+        return coll.new_zeros(())
+
+    monkeypatch.setattr(tc, "_pde_loss", capture_pde)
+
+    # This fixture has source-coordinate bounds [0, 1] on every axis.
+    # These samples therefore coincide with its observation locations.
+    tc._batch_losses(
+        model,
+        batch,
+        cfg,
+        unit_coll=case.interior.unsqueeze(0),
+    )
+
+    torch.testing.assert_close(seen["coordinates"], batch.interior)
+
+def test_terrain_surface_reference_height(monkeypatch):
+    case, cfg = _geometry_fixture()
+    batch = tc.stack_cases([case], cfg)
+    model = ConditionalModel(
+        LATENT_DIM,
+        ConditionalModelConfig(hidden_layers=1, hidden_width=8),
+    )
+    seen = {}
+
+    def capture_surface(**kwargs):
+        seen["wall"] = kwargs["coordinates"].detach().clone()
+        seen["reference"] = kwargs["reference_coordinates"].detach().clone()
+        return {"test": kwargs["state"][:, :1] * 0.0}
+
+    monkeypatch.setattr(
+        tc, "no_penetration_z_wall_residuals", capture_surface
+    )
+    tc._surface_loss(
+        model, batch, cfg, cfg.scaling, tc.step_functions(model)
+    )
+
+    # Physical wall heights: 100, 300, 400, 600 m.
+    torch.testing.assert_close(
+        seen["wall"][:, 2],
+        torch.tensor([0.120, 0.320, 0.420, 0.620]),
+    )
+
+    # Physical first-level heights: 109, 307, 406, 604 m.
+    torch.testing.assert_close(
+        seen["reference"][:, 2],
+        torch.tensor([0.129, 0.327, 0.426, 0.624]),
+    )
+
+def test_physical_altitude_is_not_transformed_twice():
+    case, cfg = _geometry_fixture()
+    expected = tc.stack_cases([case], cfg)
+
+    physical_case = replace(
+        case,
+        interior=expected.interior,
+        initial_coords=expected.initial_coords,
+        boundary_coords=expected.boundary_coords.reshape_as(
+            case.boundary_coords
+        ),
+    )
+    physical_cfg = replace(
+        cfg,
+        source_z_mode="physical_altitude",
+        source_scaling=cfg.scaling,
+    )
+    actual = tc.stack_cases([physical_case], physical_cfg)
+
+    torch.testing.assert_close(actual.interior, expected.interior)
+    torch.testing.assert_close(actual.initial_coords, expected.initial_coords)
+    torch.testing.assert_close(actual.boundary_coords, expected.boundary_coords)
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"terrain_top_height": 0.0},
+        {"terrain_top_height": float("nan")},
+        {"terrain_top_height": float("inf")},
+        {"fe_surface_reference_z": 0.0},
+        {"fe_surface_reference_z": float("nan")},
+        {"fe_surface_reference_z": 1000.0},
+        {"source_z_mode": "unknown"},
+    ],
+)
+def test_invalid_terrain_configuration(changes):
+    _, cfg = _geometry_fixture()
+    with pytest.raises(ValueError):
+        replace(cfg, **changes)
+
+
+def test_terrain_must_be_below_compression_height():
+    case, cfg = _geometry_fixture()
+    terrain = case.terrain.clone()
+    terrain[0, 2] = cfg.terrain_top_height
+
+    with pytest.raises(ValueError, match="terrain must be below"):
+        tc.stack_cases([replace(case, terrain=terrain)], cfg)

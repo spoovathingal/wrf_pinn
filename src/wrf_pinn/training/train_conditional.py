@@ -71,10 +71,22 @@ class ConditionalTrainConfig:
     scaling: "ResidualScalingConfig | None" = None
     #: SOURCE normalization: saved NPZ coordinates -> source units.
     source_scaling: "ResidualScalingConfig | None" = None
-    #: reference_plus_terrain: current data, approximate Z = terrain + source z
-    #: height_above_ground:    source z already means height above ground
-    #: physical_altitude:      source z already means physical altitude
-    source_z_mode: str = "reference_plus_terrain"
+
+    #: fe_terrain_following: source z is the stretched reference height,
+    #: before terrain compression.
+    #: reference_plus_terrain: legacy approximation Z = h + source z.
+    #: height_above_ground: source z is actual local height above ground.
+    #: physical_altitude: source z is already physical altitude.
+    source_z_mode: str = "fe_terrain_following"
+    #: FE terrain-compression height, in physical metres.
+    #: 4027.5 is codex inferred value for CSTL dataset.
+    terrain_top_height: float = 4027.5
+
+    #: First FE reference level before terrain compression, in metres.
+    #: Used to locate the surface reference winds and density.
+    #: None retains the existing fixed-AGL reference-height behavior.
+    fe_surface_reference_z: float | None = 10.125386238098145
+
     #: physics for the residuals; carries the q_v unit conversion.
     physics: PhysicsConfig = DEFAULT_PHYSICS
     #: flux (fricVel, htFlux) offset/scale from the recipe, to un-normalize
@@ -111,7 +123,20 @@ class ConditionalTrainConfig:
             raise ValueError("tke_weight must be finite and nonnegative.")
         if not math.isfinite(self.tke_residual_scale) or self.tke_residual_scale <= 0.0:
             raise ValueError("tke_residual_scale must be finite and positive.")
+        valid_modes = ("fe_terrain_following", "reference_plus_terrain",
+        "height_above_ground", "physical_altitude")
+        if self.source_z_mode not in valid_modes:
+            raise ValueError(f"Unsupported source_z_mode: {self.source_z_mode}")
 
+        if (not math.isfinite(self.terrain_top_height) or self.terrain_top_height <= 0.0):
+            raise ValueError("terrain_top_height must be finite and positive.")
+
+        if self.fe_surface_reference_z is not None:
+            if (not math.isfinite(self.fe_surface_reference_z)
+                or not 0.0 < self.fe_surface_reference_z < self.terrain_top_height):
+                raise ValueError(
+                    "fe_surface_reference_z must be finite and between "
+                    "zero and terrain_top_height.")
 
 def _resolve_device(name: str) -> torch.device:
     if name == "auto":
@@ -169,19 +194,33 @@ class CaseBatch:
 
     pin_memory = pin  # what DataLoader(pin_memory=True) calls on custom batch types
 
+def _source_height_to_altitude(z_source, h, cfg):
+    """Convert source height in metres to physical altitude in metres."""
+    if cfg.source_z_mode == "fe_terrain_following":
+        return h + z_source * (1.0 - h / cfg.terrain_top_height)
+
+    if cfg.source_z_mode in ("reference_plus_terrain", "height_above_ground"):
+        return h + z_source
+
+    if cfg.source_z_mode == "physical_altitude":
+        return z_source
+    
+    raise ValueError(f"Unsupported source_z_mode: {cfg.source_z_mode}")
 
 def stack_cases(cases: list[ConditionalCase], cfg: ConditionalTrainConfig) -> CaseBatch:
     """Concatenate torch cases (on one device) into a CaseBatch."""
     """Prepare model coordinates and terrain on CPU."""
     if cfg.source_scaling is None:
         raise ValueError("Set source_scaling from the dataset normalization recipe.")
-    if cfg.source_z_mode not in ("reference_plus_terrain", "height_above_ground", "physical_altitude"):
-        raise ValueError(f"Unsupported source_z_mode: {cfg.source_z_mode}")
     scaling = cfg.scaling if cfg.scaling is not None else DEFAULT_RESIDUAL_SCALING
     source_off, source_scale = _coordinate_affine(cfg.source_scaling, cases[0].interior)
     model_off, model_scale = _coordinate_affine(scaling, cases[0].interior)
 
     grids = [prepare_terrain(c.terrain) for c in cases]
+    if (cfg.source_z_mode == "fe_terrain_following" or cfg.fe_surface_reference_z is not None):
+        for case, (_, _, heights) in zip(cases, grids):
+            if torch.any(heights >= cfg.terrain_top_height):
+                raise ValueError(f"{case.name}: terrain must be below terrain_top_height.")
     cat = lambda values: torch.cat(values, dim=0)
     sizes = lambda values: torch.tensor([len(v) for v in values], dtype=torch.long)
 
@@ -189,7 +228,7 @@ def stack_cases(cases: list[ConditionalCase], cfg: ConditionalTrainConfig) -> Ca
         physical = coords * source_scale + source_off
         if cfg.source_z_mode != "physical_altitude":
             h = terrain_at(physical[:, 0], physical[:, 1], *grid)[0]
-            physical[:, 2] = physical[:, 2] + h
+            physical[:, 2] = _source_height_to_altitude(physical[:, 2], h, cfg)
         return (physical - model_off) / model_scale
 
     interior, initial, boundary, surface, geometry = [], [], [], [], []
@@ -296,7 +335,14 @@ def _surface_loss(model, b: CaseBatch, cfg, scaling, fns: StepFunctions) -> torc
         wall_state, state_jacobian = model(wall, b.z, b.surface_sizes), None
 
     reference = wall.detach().clone()
-    reference[:, 2] = (h[:, 0] + cfg.physics.constants.surface_reference_height - scaling.z.offset) / scaling.z.scale
+    if cfg.fe_surface_reference_z is not None:
+        reference_agl = (cfg.fe_surface_reference_z * (1.0 - h[:, 0] / cfg.terrain_top_height))  # physical AGL at the FE reference level)
+    else:
+        reference_agl = cfg.physics.constants.surface_reference_height
+
+    reference_altitude = h[:, 0] + reference_agl
+    reference[:, 2] = (reference_altitude - scaling.z.offset) / scaling.z.scale
+
     reference_state = fns.forward(reference, b.z, b.surface_sizes)
 
     f_off = _device_constant(tuple(cfg.flux_offset), dev, dt)
@@ -408,7 +454,7 @@ def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
                 upper = torch.maximum(z0, z1)
                 physical[:, :, 2] = (lower + u[:, :, 2] * (upper - lower))
             else:
-                physical[:, :, 2] = physical[:, :, 2] + h
+                physical[:, :, 2] = _source_height_to_altitude(physical[:, :, 2], h, cfg)
 
             coll = ((physical - model_off) / model_scale).reshape(-1, 4)
             pde = _pde_loss(model, coll, b.z, cfg, scaling, fns)
@@ -680,7 +726,7 @@ def _save_checkpoint(model, optimizer, history, epoch, config, manifest=None) ->
     path = Path(config.checkpoint_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    torch.save({"schema_version": 3, "geometry_version": 1, "manifest": manifest,
+    torch.save({"schema_version": 3, "geometry_version": 2, "manifest": manifest,
                 "epoch": epoch, "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(), "history": vars(history)}, tmp)
     tagged = path.with_name(f"{path.stem}_step{epoch:06d}{path.suffix}")
@@ -697,9 +743,10 @@ def _maybe_resume(model, optimizer, history, config, device) -> int:
     ckpt = torch.load(config.checkpoint_path, map_location=device)
     saved = (ckpt.get("manifest") or {}).get("training", {})
     current = asdict(config)
-    keys = ("scaling", "source_scaling", "source_z_mode", "physics", "tke_weight", "tke_residual_scale")
+    keys = ("scaling", "source_scaling", "source_z_mode", "terrain_top_height",
+    "fe_surface_reference_z", "physics", "tke_weight", "tke_residual_scale")
 
-    if (ckpt.get("geometry_version") != 1 or any(saved.get(k) != current[k] for k in keys)):
+    if (ckpt.get("geometry_version") != 2 or any(saved.get(k) != current[k] for k in keys)):
         raise ValueError("Checkpoint geometry/physics/TKE loss settings differ; use a new checkpoint path.")
     
     model.load_state_dict(ckpt["model"])

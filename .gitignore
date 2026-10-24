@@ -7,3 +7,4 @@ build/
 dist/
 *.egg-info/
 
+src/wrf_pinn/config/GenesisPINN.code-workspace

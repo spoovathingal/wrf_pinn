@@ -76,10 +76,21 @@ def main() -> int:
     ap.add_argument(
         "--events", default=None,
         help="Append rank-zero training events to this JSONL file")
-    ap.add_argument(
-        "--source-z-mode",
-        choices=("reference_plus_terrain", "height_above_ground", "physical_altitude"),
-        default="reference_plus_terrain")
+    ap.add_argument("--source-z-mode",
+        choices=("fe_terrain_following", "reference_plus_terrain",
+        "height_above_ground", "physical_altitude"),
+        default="fe_terrain_following",
+        help=(" Meaning of the saved vertical coordinate: "
+            "fe_terrain_following uses reference heights before terrain "
+            "compression; physical_altitude uses already-converted heights"))
+    ap.add_argument("--terrain-top-height",type=float, default=4027.5,
+        help=("FE terrain-compression height H in metres; "
+            "4027.5 is the inferred CSTL value"),
+    )
+    ap.add_argument("--fe-surface-reference-z", type=float, default=10.125386238098145,
+        help=("First FE reference-level height before terrain compression, "
+            "in metres; its local height above ground is z_ref*(1-h/H)"),
+    )
     ap.add_argument(
         "--model-z-max", type=float, default=None,
         help="Physical-height normalization scale; not a model ceiling")
@@ -91,6 +102,11 @@ def main() -> int:
         help="Conservative TKE residual scale [kg m^-1 s^-3]")
     args = ap.parse_args()
 
+    if not 0.0 < args.terrain_top_height < float("inf"):
+        ap.error("--terrain-top-height must be finite and positive")
+    if not (0.0 < args.fe_surface_reference_z < args.terrain_top_height):
+        ap.error("--fe-surface-reference-z must be finite and between "
+            "zero and --terrain-top-height")
     if (args.model_z_max is not None and not 0.0 < args.model_z_max < float("inf")):
         ap.error("--model-z-max must be finite and positive")
     if min(args.epochs, args.batch_cases, args.log_every, args.checkpoint_every) < 1:
@@ -158,13 +174,20 @@ def main() -> int:
             readers=args.readers, loader_workers=args.loader_workers, device=device,
             log_every=args.log_every,
             source_scaling=source_scaling, source_z_mode=args.source_z_mode, scaling=scaling,
+            terrain_top_height=args.terrain_top_height, fe_surface_reference_z=args.fe_surface_reference_z,
             physics=physics, tke_weight=args.tke_weight, tke_residual_scale=args.tke_residual_scale,
             flux_offset=tuple(recipe["flux_offset"]), flux_scale=tuple(s or 1.0 for s in recipe["flux_scale"]),
             profile=args.profile, bf16_data=args.bf16_data,
             compile=args.compile_model, events_path=args.events,
             checkpoint_path=args.checkpoint, checkpoint_every=args.checkpoint_every,
         )
-
+        log.info(
+            "geometry: source_z_mode=%s; H=%.6f m; "
+            "first reference z=%.9f m; "
+            "model z offset=%.6f m; model z scale=%.6f m",
+            cfg.source_z_mode, cfg.terrain_top_height, cfg.fe_surface_reference_z,
+            scaling.z.offset, scaling.z.scale,
+        )
         log.info(
             "device=%s; local cases=%d/%d; latent dim=%d; "
             "batch/GPU=%d; global batch=%d; q_v conversion=%g; mode=%s",
