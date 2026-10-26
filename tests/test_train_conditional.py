@@ -504,3 +504,68 @@ def test_terrain_must_be_below_compression_height():
 
     with pytest.raises(ValueError, match="terrain must be below"):
         tc.stack_cases([replace(case, terrain=terrain)], cfg)
+
+def _write_raw_case_npz(path, seed: int) -> tuple[np.ndarray, np.ndarray]:
+    """_write_case_npz plus the --keep-raw members, laid out as the preprocessor
+    writes them: ini_raw (n_state, nz, nx*ny), bnd_raw (n_faces, n_times, face_len, n_state)."""
+    _write_case_npz(path, seed)
+    case = _make_case(path.stem, seed)
+    rng = np.random.default_rng(seed + 100)
+    nv, nz, nxy = case.initial.shape
+    _, nf, nt, fl = case.boundary.shape
+    ini = rng.standard_normal((nv, nz, nxy)).astype(np.float32)
+    bnd = rng.standard_normal((nf, nt, fl, nv)).astype(np.float32)
+    with np.load(path) as blob:
+        members = dict(blob)
+    np.savez(path, **members, ini_raw=ini, bnd_raw=bnd, initial_grid=np.array([3, 3, nz]))
+    return ini, bnd
+
+
+def test_raw_latent_is_the_raw_fields(tmp_path):
+    from wrf_pinn.data.conditional_case import read_conditional_case
+    ini, bnd = _write_raw_case_npz(tmp_path / "c0.npz", 0)
+    z = read_conditional_case(tmp_path / "c0.npz", "raw").z
+    np.testing.assert_array_equal(z, np.concatenate([bnd.ravel(), ini.ravel()]))
+    assert read_conditional_case(tmp_path / "c0.npz").z.shape[0] < z.shape[0]   # pod default
+
+
+def test_encoder_split_recovers_fields():
+    """split() must hand the convs real grids: initial as (state, z, x, y), each face
+    as (time*state, z, along-face), matching the preprocessor's layouts."""
+    from wrf_pinn.models.conditional import RawEncoder
+    nv, nz, nx, ny, nf, nt, fw = 7, 5, 4, 3, 4, 2, 6
+    rng = np.random.default_rng(0)
+    grid = rng.standard_normal((2, nv, nz, nx, ny)).astype(np.float32)       # per case
+    faces = rng.standard_normal((2, nf, nt, nz, fw, nv)).astype(np.float32)
+    ini_raw = grid.reshape(2, nv, nz, nx * ny)                                # (v, z, x*y), x slow
+    bnd_raw = faces.reshape(2, nf, nt, nz * fw, nv)                           # face rows z-slow
+    z = torch.from_numpy(np.concatenate([bnd_raw.reshape(2, -1), ini_raw.reshape(2, -1)], 1))
+    enc = RawEncoder((nv, nz, nx, ny), (nf, nt, nz * fw, nv), out_dim=8, width=4)
+    ini, bnd = enc.split(z)
+    np.testing.assert_array_equal(ini.numpy(), grid)
+    want = faces.transpose(0, 1, 2, 5, 3, 4).reshape(2 * nf, nt * nv, nz, fw)
+    np.testing.assert_array_equal(bnd.numpy(), want)
+    assert enc(z).shape == (2, 8)
+
+
+@pytest.mark.parametrize("latent", ["raw", "encoder"])
+def test_raw_and_encoder_latents_train(tmp_path, latent):
+    from wrf_pinn.data.conditional_case import read_conditional_case
+    from wrf_pinn.models.conditional import RawEncoder
+    paths = []
+    for i in range(6):
+        _write_raw_case_npz(tmp_path / f"c{i}.npz", i)
+        paths.append(str(tmp_path / f"c{i}.npz"))
+    torch.manual_seed(0)
+    z_dim = read_conditional_case(paths[0], "raw").z.shape[0]
+    encoder = None
+    if latent == "encoder":
+        with np.load(paths[0]) as b:
+            encoder = RawEncoder((7, 4, 3, 3), b["bnd_raw"].shape, out_dim=8, width=4)
+    model = ConditionalModel(z_dim, ConditionalModelConfig(hidden_layers=2, hidden_width=32), encoder)
+    cfg = ConditionalTrainConfig(epochs=60, batch_cases=4, cases_per_pass=2, device="cpu",
+                                 log_every=100, latent="raw", **_DATA_ONLY)
+    before = [p.detach().clone() for p in (encoder or model).parameters()]
+    hist = train_conditional(model, config=cfg, case_paths=paths)
+    assert hist.total[-1] < hist.total[0]
+    assert any(not torch.equal(a, p) for a, p in zip(before, (encoder or model).parameters()))

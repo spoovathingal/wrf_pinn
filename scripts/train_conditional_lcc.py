@@ -12,13 +12,14 @@ from pathlib import Path
 import sys
 import time
 
+import numpy as np
 import torch
 import torch.distributed as dist
 
 from wrf_pinn.config.physics import DEFAULT_PHYSICS
 from wrf_pinn.config.scaling import ResidualScalingConfig, VariableScale
 from wrf_pinn.data.conditional_case import read_conditional_case
-from wrf_pinn.models.conditional import ConditionalModel, ConditionalModelConfig
+from wrf_pinn.models.conditional import ConditionalModel, ConditionalModelConfig, RawEncoder
 from wrf_pinn.training.train_conditional import (
     ConditionalTrainConfig, train_conditional,
 )
@@ -107,6 +108,10 @@ def main() -> int:
     ap.add_argument(
         "--tke-residual-scale", type=float, default=1.0,
         help="Conservative TKE residual scale [kg m^-1 s^-3]")
+    ap.add_argument(
+        "--latent", choices=("pod", "raw", "encoder"), default="pod",
+        help="z: POD coeffs; the full raw fields; or the raw fields through a learned encoder")
+    ap.add_argument("--encoder-dim", type=int, default=256, help="encoder latent size")
     args = ap.parse_args()
 
     if not 0.0 < args.terrain_top_height < float("inf"):
@@ -169,13 +174,21 @@ def main() -> int:
             )
 
         # All ranks construct an identical model.
-        z_dim = read_conditional_case(all_paths[0]).z.shape[0]
+        read_latent = "pod" if args.latent == "pod" else "raw"
+        z_dim = read_conditional_case(all_paths[0], read_latent).z.shape[0]
+        encoder = None
+        if args.latent == "encoder":
+            with np.load(all_paths[0]) as blob:
+                nx, ny, nz = (int(v) for v in blob["initial_grid"])
+                nv = blob["ini_raw"].shape[0]
+                bnd_shape = blob["bnd_raw"].shape
+            encoder = RawEncoder((nv, nz, nx, ny), bnd_shape, args.encoder_dim)
 
         # Each rank loads only its own portion of the dataset.
         paths = all_paths[rank::world]
         batch_cases = min(args.batch_cases, len(all_paths) // world)
 
-        model = ConditionalModel(z_dim, ConditionalModelConfig())
+        model = ConditionalModel(z_dim, ConditionalModelConfig(), encoder)
         cfg = ConditionalTrainConfig(
             epochs=args.epochs, batch_cases=batch_cases, cases_per_pass=args.cases_per_pass,
             readers=args.readers, loader_workers=args.loader_workers, device=device,
@@ -189,6 +202,7 @@ def main() -> int:
             profile=args.profile, bf16_data=args.bf16_data,
             compile=args.compile_model, events_path=args.events,
             checkpoint_path=args.checkpoint, checkpoint_every=args.checkpoint_every,
+            latent=read_latent,
         )
         log.info(
             "geometry: source_z_mode=%s; H=%.6f m; "
@@ -200,12 +214,13 @@ def main() -> int:
         log.info(
             "device=%s; local cases=%d/%d; latent dim=%d; "
             "batch/GPU=%d; global batch=%d; q_v conversion=%g; mode=%s; "
-            "lr=%g->%s; boundary weight=%g; tke weight=%g",
+            "lr=%g->%s; boundary weight=%g; tke weight=%g; latent=%s; params=%d",
             device, len(paths), len(all_paths), z_dim,
             batch_cases, batch_cases * world,
             args.q_v_to_kg_per_kg,
             "lazy" if args.lazy else "resident",
             args.lr, args.lr_min, args.boundary_weight, args.tke_weight,
+            args.latent, sum(p.numel() for p in model.parameters()),
         )
 
         if args.lazy:
@@ -214,7 +229,7 @@ def main() -> int:
             )
         else:
             t0 = time.time()
-            cases = [read_conditional_case(path) for path in paths]
+            cases = [read_conditional_case(path, read_latent) for path in paths]
 
             if any(case.z.shape[0] != z_dim for case in cases):
                 raise ValueError(

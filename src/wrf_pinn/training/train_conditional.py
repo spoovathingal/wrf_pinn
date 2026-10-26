@@ -7,7 +7,7 @@ import math
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field, fields, asdict
+from dataclasses import dataclass, field, fields, asdict, replace
 from functools import partial
 from functools import lru_cache
 from pathlib import Path
@@ -120,6 +120,8 @@ class ConditionalTrainConfig:
     compile: bool = False
     #: Optional JSONL optimization events; checkpoint provenance is always saved.
     events_path: "str | None" = None
+    #: conditioning z read from each case: 'pod' coeffs or 'raw' fields (read_conditional_case).
+    latent: str = "pod"
     def __post_init__(self) -> None:
         if not math.isfinite(self.tke_weight) or self.tke_weight < 0.0:
             raise ValueError("tke_weight must be finite and nonnegative.")
@@ -410,6 +412,8 @@ def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
     expanded to one row per point."""
     n_obs = len(STATE_VARS)
     k = b.k
+    if getattr(model, "encoder", None) is not None:   # encode once; every loss shares it
+        b = replace(b, z=model.encode(b.z))
     fns = fns if fns is not None else step_functions(model)
     # derivative-free forwards, optionally in bf16; results back to float32 for the losses
     plain = lambda coords, sizes: _forward_maybe_bf16(
@@ -504,14 +508,14 @@ def _average_across_processes(params: list[nn.Parameter], losses: torch.Tensor,
 class _CaseFiles(torch.utils.data.Dataset):
     """One case per index, read in a DataLoader worker process."""
 
-    def __init__(self, paths: "list[str | Path]") -> None:
-        self.paths = list(paths)
+    def __init__(self, paths: "list[str | Path]", latent: str = "pod") -> None:
+        self.paths, self.latent = list(paths), latent
 
     def __len__(self) -> int:
         return len(self.paths)
 
     def __getitem__(self, i: int) -> ConditionalCase:
-        return read_conditional_case(self.paths[i]).as_torch(device="cpu")
+        return read_conditional_case(self.paths[i], self.latent).as_torch(device="cpu")
 
 
 class _StepDraws(torch.utils.data.Sampler):
@@ -583,7 +587,7 @@ def train_conditional(
     def host_batch(idx: list[int]) -> list[CaseBatch]:
         """Build a step's passes on the host (runs on the prefetch thread)."""
         if case_paths is not None:
-            load = lambda i: read_conditional_case(case_paths[i]).as_torch(device="cpu")
+            load = lambda i: read_conditional_case(case_paths[i], config.latent).as_torch(device="cpu")
             picked = list(readers.map(load, idx))
         else:
             picked = [cases[i] for i in idx]
@@ -612,7 +616,7 @@ def train_conditional(
     n_steps = config.epochs - start_epoch + 1
     if case_paths is not None and config.loader_workers > 0:
         loader = torch.utils.data.DataLoader(
-            _CaseFiles(case_paths), batch_sampler=_StepDraws(n_cases, k, config.seed + rank, n_steps),
+            _CaseFiles(case_paths, config.latent), batch_sampler=_StepDraws(n_cases, k, config.seed + rank, n_steps),
             num_workers=config.loader_workers, collate_fn=partial(_collate_passes, per_pass=per_pass, cfg=config),
             pin_memory=cuda, prefetch_factor=2, persistent_workers=False)
         batches = iter(loader)

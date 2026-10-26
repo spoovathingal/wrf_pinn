@@ -80,8 +80,9 @@ _CASE_MEMBERS: tuple[str, ...] = (
 )
 
 
-def read_conditional_case(npz_path: str | Path) -> ConditionalCase:
-    """Load one POD-encoded .npz case; decode initial/boundary, mask NaN targets."""
+def read_conditional_case(npz_path: str | Path, latent: str = "pod") -> ConditionalCase:
+    """Load one POD-encoded .npz case; decode initial/boundary, mask NaN targets.
+    latent picks z: 'pod' (POD coeffs) or 'raw' (the full raw fields, see latent_vector)."""
     path = Path(npz_path)
     if not path.exists():
         raise FileNotFoundError(f"Conditional case not found: {path}.")
@@ -93,7 +94,7 @@ def read_conditional_case(npz_path: str | Path) -> ConditionalCase:
         members = {k: blob[k].astype(np.float32) for k in _CASE_MEMBERS}
         bnd = decode_boundary(blob)
         ini = decode_initial(blob)
-        members["z"] = latent_vector(blob)
+        members["z"] = latent_vector(blob, latent)
 
     members["boundary"] = np.stack([bnd[v] for v in STATE_VARS], axis=0).astype(np.float32)
     members["initial"] = np.stack([ini[v] for v in STATE_VARS], axis=0).astype(np.float32)
@@ -140,9 +141,16 @@ def decode_initial(blob) -> dict:
     return out
 
 
-def latent_vector(blob) -> np.ndarray:
+def latent_vector(blob, latent: str = "pod") -> np.ndarray:
     """Concatenate the case's POD coeffs into the conditioning latent z. Order is
-    fixed (boundary faces then initial, by STATE_VARS) so z is consistent across cases."""
+    fixed (boundary faces then initial, by STATE_VARS) so z is consistent across cases.
+    latent='raw': the normalized raw fields instead, bnd_raw (n_faces, n_times,
+    face_len, n_state) then ini_raw (n_state, nz, nx*ny), flattened (needs --keep-raw)."""
+    if latent == "raw":
+        return np.concatenate([blob["bnd_raw"].reshape(-1),
+                               blob["ini_raw"].reshape(-1)]).astype(np.float32)
+    if latent != "pod":
+        raise ValueError(f"latent must be 'pod' or 'raw', got {latent!r}.")
     nf = sum(1 for k in blob.files if k.startswith(f"bnd_modes_{STATE_VARS[0]}_"))
     parts = []
     for var in STATE_VARS:
