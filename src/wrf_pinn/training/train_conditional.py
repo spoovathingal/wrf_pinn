@@ -328,7 +328,7 @@ def _surface_loss(model, b: CaseBatch, cfg, scaling, fns: StepFunctions) -> torc
     wall = torch.stack( (surf[:, 0], surf[:, 1], z_floor, surf[:, 2]), dim=1)
     if _taylor_supported(model):  # wall gradients from one first-order forward pass
         jet = fns.taylor(model.net, wall, b.z, scaling.coordinate_scales(), second=False,
-                         sizes=b.surface_sizes)
+                         sizes=b.surface_sizes, output_config=model.config)
         wall_state, state_jacobian = jet.v, jet.d
     else:
         wall = wall.requires_grad_(True)
@@ -372,7 +372,7 @@ def _pde_loss(model, coll: torch.Tensor, z: torch.Tensor, cfg, scaling,
     to nested autograd."""
     if _taylor_supported(model):
         res = fns.pde_residuals(model.net, coll, z, physics=cfg.physics, scaling=scaling,
-                                sizes=cfg.n_collocation)
+                                sizes=cfg.n_collocation, output_config=model.config)
     else:
         coll = coll.requires_grad_(True)
         res = cartesian_zero_forcing_residuals(coll, model(coll, z, cfg.n_collocation),
@@ -557,6 +557,18 @@ def train_conditional(
     profiler hooks; it must not touch the model."""
     if not cases and not case_paths:
         raise ValueError("train_conditional needs cases or case_paths.")
+
+    model_config = getattr(model, "config", None)
+    if getattr(model_config, "tke_output_mode", "linear") == "softplus":
+        scaling = config.scaling or DEFAULT_RESIDUAL_SCALING
+        if (
+            model_config.tke_offset != scaling.e_sgs.offset
+            or model_config.tke_scale != scaling.e_sgs.scale
+        ):
+            raise ValueError(
+                "Softplus TKE normalization must match config.scaling.e_sgs "
+                "(or DEFAULT_RESIDUAL_SCALING when scaling is None)."
+            )
 
     rank, world = _world()
     device = _resolve_device(config.device)
@@ -748,7 +760,29 @@ def _maybe_resume(model, optimizer, history, config, device) -> int:
 
     if (ckpt.get("geometry_version") != 2 or any(saved.get(k) != current[k] for k in keys)):
         raise ValueError("Checkpoint geometry/physics/TKE loss settings differ; use a new checkpoint path.")
-    
+
+    saved_model = (
+        ((ckpt.get("manifest") or {}).get("model") or {}).get("config")
+        or {}
+    )
+    model_config = getattr(model, "config", None)
+
+    # Checkpoints created before the positivity update used linear output.
+    saved_mode = saved_model.get("tke_output_mode", "linear")
+    current_mode = getattr(model_config, "tke_output_mode", "linear")
+
+    if saved_mode != current_mode:
+        raise ValueError("Checkpoint TKE output mode differs; use a new checkpoint path.")
+
+    if current_mode == "softplus":
+        output_keys = ("tke_offset", "tke_scale", "tke_floor", "tke_softplus_scale")
+        if any(
+            saved_model.get(key) != getattr(model_config, key)
+            for key in output_keys
+        ):
+            raise ValueError("Checkpoint TKE output transform settings differ; "
+                "use a new checkpoint path.")
+
     model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
     for name, vals in ckpt["history"].items():

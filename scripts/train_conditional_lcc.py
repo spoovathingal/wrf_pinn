@@ -100,6 +100,15 @@ def main() -> int:
     ap.add_argument(
         "--tke-residual-scale", type=float, default=1.0,
         help="Conservative TKE residual scale [kg m^-1 s^-3]")
+    ap.add_argument(
+        "--tke-output-mode",
+        choices=("linear", "softplus"),
+        default="softplus",
+        help=(
+            "TKE output transform: softplus enforces positive physical TKE; "
+            "linear retains legacy behavior"
+        ),
+    )
     args = ap.parse_args()
 
     if not 0.0 < args.terrain_top_height < float("inf"):
@@ -168,7 +177,12 @@ def main() -> int:
         paths = all_paths[rank::world]
         batch_cases = min(args.batch_cases, len(all_paths) // world)
 
-        model = ConditionalModel(z_dim, ConditionalModelConfig())
+        model_config = ConditionalModelConfig(
+            tke_output_mode=args.tke_output_mode,
+            tke_offset=scaling.e_sgs.offset,
+            tke_scale=scaling.e_sgs.scale,
+        )
+        model = ConditionalModel(z_dim, model_config)
         cfg = ConditionalTrainConfig(
             epochs=args.epochs, batch_cases=batch_cases, cases_per_pass=args.cases_per_pass,
             readers=args.readers, loader_workers=args.loader_workers, device=device,
@@ -197,6 +211,16 @@ def main() -> int:
             "lazy" if args.lazy else "resident",
         )
 
+        log.info(
+            "TKE output: mode=%s; offset=%g; scale=%g; floor=%g; "
+            "softplus scale=%g; initial value=%g [physical TKE: m^2/s^2]",
+            model_config.tke_output_mode,
+            model_config.tke_offset,
+            model_config.tke_scale,
+            model_config.tke_floor,
+            model_config.tke_softplus_scale,
+            model_config.tke_initial_value,
+        )
         if args.lazy:
             hist = train_conditional(
                 model, config=cfg, case_paths=paths,

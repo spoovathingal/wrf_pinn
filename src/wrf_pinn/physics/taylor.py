@@ -31,7 +31,12 @@ from functools import lru_cache
 import torch
 from torch import nn
 
-from wrf_pinn.models.conditional import first_layer
+from wrf_pinn.models.conditional import (
+    ConditionalModelConfig,
+    TKE_INDEX,
+    first_layer,
+    transform_state_output,
+)
 
 #: spatial second-derivative channels, in order (xx, yy, zz, xy, xz, yz)
 PAIRS: tuple[tuple[int, int], ...] = ((0, 0), (1, 1), (2, 2), (0, 1), (0, 2), (1, 2))
@@ -202,10 +207,79 @@ def _scale_column(scales: tuple[float, ...], device: torch.device,
     per-call host-to-device copy makes the CPU wait for the GPU."""
     return torch.tensor(scales, dtype=dtype, device=device)[:, None]
 
+def transform_state_jet(
+    raw: Jet,
+    output_config: ConditionalModelConfig | None,
+) -> Jet:
+    """Apply the model's output transform to values and coordinate derivatives."""
+    if output_config is None or output_config.tke_output_mode == "linear":
+        return raw
+
+    values = transform_state_output(raw.v, output_config)
+    sl = slice(TKE_INDEX, TKE_INDEX + 1)
+    a = raw.v[:, sl].to(values.dtype)
+    derivatives = raw.d.to(values.dtype)
+
+    # Match F.softplus(beta=1.0, threshold=20.0) in conditional.py,
+    # including its linear branch for inputs greater than 20.
+    below_threshold = a < 20.0
+
+    # At exactly 20, PyTorch retains the nonlinear first-derivative value
+    # but uses zero for its second derivative. Keep that value constant
+    # on this boundary so parameter differentiation agrees as well.
+    sigmoid_argument = torch.where(
+        below_threshold, a, torch.full_like(a, 20.0)
+    )
+    sigmoid = torch.sigmoid(sigmoid_argument)
+
+    ratio = output_config.tke_softplus_scale / output_config.tke_scale
+    first = ratio * torch.where(
+        a > 20.0, torch.ones_like(a), sigmoid
+    )
+    second = ratio * torch.where(
+        below_threshold, sigmoid * (1.0 - sigmoid), torch.zeros_like(a)
+    )
+
+    # First derivatives: d[f(a)]/dx_i = f'(a) * da/dx_i.
+    tke_d = first * derivatives[..., sl]
+    transformed_d = torch.cat(
+        (
+            derivatives[..., :TKE_INDEX],
+            tke_d,
+            derivatives[..., TKE_INDEX + 1:],
+        ),
+        dim=-1,
+    )
+
+    # Spatial second derivatives:
+    # d2[f(a)]/dx_i dx_j = f'(a) * a_ij + f''(a) * a_i * a_j.
+    transformed_h = None
+    if raw.h is not None:
+        hessian = raw.h.to(values.dtype)
+        products = torch.stack(
+            [
+                derivatives[i, :, sl] * derivatives[j, :, sl]
+                for i, j in PAIRS
+            ],
+            dim=0,
+        )
+        tke_h = first * hessian[..., sl] + second * products
+        transformed_h = torch.cat(
+            (
+                hessian[..., :TKE_INDEX],
+                tke_h,
+                hessian[..., TKE_INDEX + 1:],
+            ),
+            dim=-1,
+        )
+
+    return Jet(values, transformed_d, transformed_h)
 
 def taylor_forward(net: nn.Sequential, coordinates: torch.Tensor, z_rows: torch.Tensor,
                    coordinate_scales: Sequence[float], second: bool = True,
-                   sizes: "torch.Tensor | int | None" = None) -> Jet:
+                   sizes: "torch.Tensor | int | None" = None,
+                   *,
+                   output_config: ConditionalModelConfig | None = None) -> Jet:
     """Network outputs with first (x, y, z, t) and spatial second derivatives.
 
     ``net`` is a Sequential of Linear layers with Tanh between them, fed
@@ -250,4 +324,4 @@ def taylor_forward(net: nn.Sequential, coordinates: torch.Tensor, z_rows: torch.
         v = out[0] + lin.bias
         d = out[1:1 + n_coord]
         h = out[1 + n_coord:] if second else None
-    return Jet(v, d, h)
+    return transform_state_jet(Jet(v, d, h), output_config)

@@ -25,7 +25,7 @@ import torch
 from wrf_pinn.config.physics import DEFAULT_PHYSICS, PhysicsConfig
 from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING, ResidualScalingConfig
 from wrf_pinn.physics.taylor import Jet, coordinate_jet, taylor_forward, where
-
+from wrf_pinn.models.conditional import ConditionalModelConfig
 
 TensorDict = dict[str, torch.Tensor]
 
@@ -579,6 +579,8 @@ def cartesian_zero_forcing_residuals_taylor(
     physics: PhysicsConfig = DEFAULT_PHYSICS,
     scaling: ResidualScalingConfig = DEFAULT_RESIDUAL_SCALING,
     sizes: "torch.Tensor | int | None" = None,
+    *,
+    output_config: ConditionalModelConfig | None = None,
 ) -> TensorDict:
     """The residuals of ``cartesian_zero_forcing_residuals``, without nested autograd.
 
@@ -597,7 +599,8 @@ def cartesian_zero_forcing_residuals_taylor(
     if coordinates.ndim != 2 or coordinates.shape[1] != 4:
         raise ValueError("coordinates must have shape (n_points, 4).")
 
-    out = taylor_forward(net, coordinates, z_rows, scaling.coordinate_scales(), sizes=sizes)
+    out = taylor_forward(net, coordinates, z_rows, scaling.coordinate_scales(), sizes=sizes,
+                            output_config=output_config)
     if out.v.shape[1] < physics.state_dim:
         raise ValueError(
             "state has too few columns for the configured active variables; "
