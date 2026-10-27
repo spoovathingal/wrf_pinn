@@ -19,7 +19,7 @@ import torch.distributed as dist
 from wrf_pinn.config.physics import DEFAULT_PHYSICS
 from wrf_pinn.config.scaling import ResidualScalingConfig, VariableScale
 from wrf_pinn.data.conditional_case import read_conditional_case
-from wrf_pinn.models.conditional import ConditionalModel, ConditionalModelConfig, RawEncoder
+from wrf_pinn.models.conditional import ConditionalModel, ConditionalModelConfig, RawEncoder, RawProjection
 from wrf_pinn.training.train_conditional import (
     ConditionalTrainConfig, train_conditional,
 )
@@ -110,7 +110,7 @@ def main() -> int:
         help="Conservative TKE residual scale [kg m^-1 s^-3]")
     ap.add_argument(
         "--latent", choices=("pod", "raw", "encoder"), default="pod",
-        help="z: POD coeffs; the full raw fields; or the raw fields through a learned encoder")
+        help="z: POD coeffs; the full raw fields through one linear layer; or through a learned conv encoder")
     ap.add_argument("--encoder-dim", type=int, default=256, help="encoder latent size")
     args = ap.parse_args()
 
@@ -183,6 +183,8 @@ def main() -> int:
                 nv = blob["ini_raw"].shape[0]
                 bnd_shape = blob["bnd_raw"].shape
             encoder = RawEncoder((nv, nz, nx, ny), bnd_shape, args.encoder_dim)
+        elif args.latent == "raw":
+            encoder = RawProjection(z_dim, args.encoder_dim)
 
         # Each rank loads only its own portion of the dataset.
         paths = all_paths[rank::world]

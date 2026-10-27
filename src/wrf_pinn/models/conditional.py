@@ -60,22 +60,33 @@ class RawEncoder(nn.Module):
         return self.head(torch.cat([self.ini(ini), self.bnd(bnd).reshape(z.shape[0], -1)], dim=1))
 
 
+class RawProjection(nn.Linear):
+    """Raw z (flattened, as RawEncoder takes it) -> latent through one linear layer."""
+
+    def __init__(self, in_dim: int, out_dim: int = 256) -> None:
+        super().__init__(in_dim, out_dim)
+        self.out_dim = out_dim
+
+
 class ConditionalModel(nn.Module):
     """Solution network: [coords | z] -> state. z is supplied per case. With an
-    encoder, callers pass encode(z) (the training step does this once per pass)."""
+    encoder, callers pass encode(z) (the training step does this once per pass).
+    The encoder output is LayerNormed so a wide raw input cannot saturate the first
+    tanh layer (unnormalized, Adam grew it to ~100-1000 and the output went constant)."""
 
     def __init__(self, latent_dim: int,
                  config: ConditionalModelConfig = ConditionalModelConfig(),
-                 encoder: "RawEncoder | None" = None) -> None:
+                 encoder: "RawEncoder | RawProjection | None" = None) -> None:
         super().__init__()
         self.config = config
         self.encoder = encoder
         width = encoder.out_dim if encoder is not None else latent_dim
+        self.latent_norm = nn.LayerNorm(width) if encoder is not None else None
         self.net = self._build(config.coord_dim + width, config)
 
     def encode(self, z: torch.Tensor) -> torch.Tensor:
-        """The case latent the net sees: encoder(z), or z itself."""
-        return z if self.encoder is None else self.encoder(z)
+        """The case latent the net sees: LayerNorm(encoder(z)), or z itself."""
+        return z if self.encoder is None else self.latent_norm(self.encoder(z))
 
     @staticmethod
     def _build(in_features: int, config: ConditionalModelConfig) -> nn.Sequential:
