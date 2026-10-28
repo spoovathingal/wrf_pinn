@@ -111,6 +111,9 @@ def main() -> int:
     ap.add_argument(
         "--latent", choices=("pod", "raw", "encoder"), default="pod",
         help="z: POD coeffs; the full raw fields through one linear layer; or through a learned conv encoder")
+    ap.add_argument(
+        "--predict-change", action="store_true",
+        help="state = initial field + (t - t0)/T * network (needs --keep-raw cases)")
     ap.add_argument("--encoder-dim", type=int, default=256, help="encoder latent size")
     args = ap.parse_args()
 
@@ -204,7 +207,7 @@ def main() -> int:
             profile=args.profile, bf16_data=args.bf16_data,
             compile=args.compile_model, events_path=args.events,
             checkpoint_path=args.checkpoint, checkpoint_every=args.checkpoint_every,
-            latent=read_latent,
+            latent=read_latent, predict_change=args.predict_change,
         )
         log.info(
             "geometry: source_z_mode=%s; H=%.6f m; "

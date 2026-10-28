@@ -26,7 +26,7 @@ from wrf_pinn.physics.residuals_pde import (
     cartesian_zero_forcing_residuals, cartesian_zero_forcing_residuals_taylor,
 )
 from wrf_pinn.physics.residuals_boundary import no_penetration_z_wall_residuals
-from wrf_pinn.physics.taylor import taylor_forward
+from wrf_pinn.physics.taylor import Jet, taylor_forward
 from wrf_pinn.training.provenance import run_manifest, write_event
 
 #: the five losses of the conditional PINN, in order.
@@ -122,6 +122,10 @@ class ConditionalTrainConfig:
     events_path: "str | None" = None
     #: conditioning z read from each case: 'pod' coeffs or 'raw' fields (read_conditional_case).
     latent: str = "pod"
+    #: predict the change from the initial field: state = initial + (t - t0)/T * network.
+    #: The initial field and its derivatives come from each case's ini_raw on the grid,
+    #: so PDE points sit on grid nodes (at random times). Off: the network is the state.
+    predict_change: bool = False
     def __post_init__(self) -> None:
         if not math.isfinite(self.tke_weight) or self.tke_weight < 0.0:
             raise ValueError("tke_weight must be finite and nonnegative.")
@@ -184,6 +188,20 @@ class CaseBatch:
     initial_sizes: torch.Tensor
     boundary_sizes: torch.Tensor
     surface_sizes: torch.Tensor
+    # predict_change only (empty otherwise): initial field at the grid nodes, its spatial
+    # first (3) and second (6, PAIRS order) derivatives, node model coords (x, y, z), each
+    # point set's node index, and per case t0 and window length in model-normalized time.
+    base_v: torch.Tensor
+    base_d: torch.Tensor
+    base_h: torch.Tensor
+    node_coords: torch.Tensor
+    node_sizes: torch.Tensor
+    interior_node: torch.Tensor
+    initial_node: torch.Tensor
+    boundary_node: torch.Tensor
+    surface_node: torch.Tensor
+    t0: torch.Tensor
+    span: torch.Tensor
 
     @property
     def k(self) -> int:
@@ -210,6 +228,81 @@ def _source_height_to_altitude(z_source, h, cfg):
         return z_source
     
     raise ValueError(f"Unsupported source_z_mode: {cfg.source_z_mode}")
+
+def _node_index(points: torch.Tensor, axes: list[torch.Tensor]) -> torch.Tensor:
+    """Flat index (first axis slowest) of the grid node at each point; ``points`` are
+    (n, len(axes)) source-normalized coords that must sit on the node ``axes``."""
+    idx = torch.zeros(points.shape[0], dtype=torch.long)
+    for a, ax in enumerate(axes):
+        i = torch.searchsorted((ax[1:] + ax[:-1]) / 2, points[:, a].contiguous())
+        if (ax[i] - points[:, a]).abs().max() > 1e-4 * (ax[-1] - ax[0]):
+            raise ValueError("predict_change: points are not on the case grid.")
+        idx = idx * len(ax) + i
+    return idx
+
+
+def _grid_derivatives(f: torch.Tensor, X: torch.Tensor, Y: torch.Tensor, Z: torch.Tensor
+                      ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Spatial first (3, ...) and second (6, ..., PAIRS order) derivatives of grid fields
+    f (nx, ny, nz, c) by central differences, in physical coordinates of a terrain-following
+    grid: node (i, j, k) sits at X(i), Y(j), Z(i, j, k)."""
+    g = lambda a, d: torch.gradient(a, dim=d)[0]
+    xi, yj = g(X, 0)[..., None], g(Y, 1)[..., None]
+    zi, zj, zk = (g(Z, d)[..., None] for d in range(3))
+
+    def grad(a):
+        az = g(a, 2) / zk
+        return (g(a, 0) - zi * az) / xi, (g(a, 1) - zj * az) / yj, az
+
+    fx, fy, fz = grad(f)
+    (fxx, fxy, fxz), (_, fyy, fyz), (_, _, fzz) = grad(fx), grad(fy), grad(fz)
+    return torch.stack([fx, fy, fz]), torch.stack([fxx, fyy, fzz, fxy, fxz, fyz])
+
+
+def _with_initial(net: Jet, s: torch.Tensor, ds: torch.Tensor, v0: torch.Tensor,
+                  d0: torch.Tensor, h0: "torch.Tensor | None" = None) -> Jet:
+    """Jet of initial + s * net with s = (t - t0)/T: the initial field is steady, so d/dt
+    is s * dnet/dt + ds/dt * net. ``s``, ``ds`` are (n, 1); v0 (n, c), d0 (3, n, c), h0 (6, n, c)."""
+    d = torch.cat([d0 + s * net.d[:3], (s * net.d[3] + ds * net.v)[None]])
+    return Jet(v0 + s * net.v, d, None if net.h is None else h0 + s * net.h)
+
+
+def _initial_grids(cases, initial, interior, model_off, model_scale) -> dict:
+    """The predict_change members of a CaseBatch (see CaseBatch). ``initial``/``interior``
+    are the cases' model-normalized initial and interior coords."""
+    out = {k: [] for k in ("base_v", "base_d", "base_h", "node_coords", "interior_node",
+                           "initial_node", "boundary_node", "surface_node", "t0", "span")}
+    n_seen = 0
+    for c, ini, inner in zip(cases, initial, interior):
+        if c.initial_raw is None:
+            raise ValueError(f"{c.name}: predict_change needs ini_raw (a --keep-raw case).")
+        src = c.initial_coords
+        axes = [torch.unique(src[:, a]) for a in range(3)]
+        nx, ny, nz = (len(a) for a in axes)
+        if not torch.equal(_node_index(src[:, :3], axes), torch.arange(len(src))):
+            raise ValueError(f"{c.name}: initial points are not the grid in (x, y, z) order.")
+        n_state = c.initial_raw.shape[0]
+        f = c.initial_raw.permute(2, 1, 0).reshape(nx, ny, nz, n_state)
+        phys = (ini[:, :3] * model_scale[:3] + model_off[:3]).reshape(nx, ny, nz, 3)
+        d, h = _grid_derivatives(f, phys[..., 0], phys[..., 1], phys[..., 2])
+        out["base_v"].append(f.reshape(-1, n_state))
+        out["base_d"].append(d.reshape(3, -1, n_state))
+        out["base_h"].append(h.reshape(6, -1, n_state))
+        out["node_coords"].append(ini[:, :3])
+        out["interior_node"].append(_node_index(c.interior[:, :3], axes) + n_seen)
+        out["initial_node"].append(torch.arange(len(src)) + n_seen)
+        out["boundary_node"].append(_node_index(c.boundary_coords.reshape(-1, 4)[:, :3], axes) + n_seen)
+        surface_xy = c.surface.reshape(-1, c.surface.shape[-1])[:, :2]
+        out["surface_node"].append(_node_index(surface_xy, axes[:2]) * nz + n_seen)
+        out["t0"].append(ini[0, 3])
+        out["span"].append(inner[:, 3].max() - ini[0, 3])
+        n_seen += len(src)
+    batch = {k: torch.cat(v, dim=1 if k in ("base_d", "base_h") else 0) for k, v in out.items()
+             if k not in ("t0", "span")}
+    batch["t0"], batch["span"] = torch.stack(out["t0"]), torch.stack(out["span"])
+    batch["node_sizes"] = torch.tensor([len(c.initial_coords) for c in cases], dtype=torch.long)
+    return batch
+
 
 def stack_cases(cases: list[ConditionalCase], cfg: ConditionalTrainConfig) -> CaseBatch:
     """Concatenate torch cases (on one device) into a CaseBatch."""
@@ -262,11 +355,21 @@ def stack_cases(cases: list[ConditionalCase], cfg: ConditionalTrainConfig) -> Ca
             if terrain_at(xx, yy, *grid)[0].max() >= hi[2]:
                 raise ValueError(f"{c.name}: physical case top must be above terrain.")
 
+    if cfg.predict_change:
+        change = _initial_grids(cases, initial, interior, model_off, model_scale)
+    else:
+        none = torch.zeros(0)
+        change = dict(base_v=none, base_d=none, base_h=none, node_coords=none,
+                      node_sizes=none.long(), interior_node=none.long(), initial_node=none.long(),
+                      boundary_node=none.long(), surface_node=none.long(), t0=none, span=none)
     return CaseBatch(
+        **change,
         z=torch.stack([c.z for c in cases]),
         interior=cat(interior),
         targets=cat([c.targets for c in cases]), target_mask=cat([c.target_mask for c in cases]),
-        initial_coords=cat(initial), initial_targets=cat([_initial_targets(c) for c in cases]),
+        # predict_change: the exact initial field (its prediction at t0), not the POD decode
+        initial_coords=cat(initial), initial_targets=cat([_initial_targets(
+            replace(c, initial=c.initial_raw) if cfg.predict_change else c) for c in cases]),
         boundary_coords=cat(boundary), boundary_targets=cat([_boundary_targets(c) for c in cases]),
         surface=cat(surface), terrain_x=torch.stack([g[0] for g in grids]),
         terrain_y=torch.stack([g[1] for g in grids]), terrain_h=torch.stack([g[2] for g in grids]),
@@ -333,6 +436,15 @@ def _surface_loss(model, b: CaseBatch, cfg, scaling, fns: StepFunctions) -> torc
     if _taylor_supported(model):  # wall gradients from one first-order forward pass
         jet = fns.taylor(model.net, wall, b.z, scaling.coordinate_scales(), second=False,
                          sizes=b.surface_sizes)
+        if cfg.predict_change:   # initial field at the ground: extend down from the first level
+            k0 = b.surface_node
+            dz = h[:, 0] - (b.node_coords[k0, 2] * scaling.z.scale + scaling.z.offset)
+            s = _ramp(b, wall, b.surface_sizes)
+            seg = torch.repeat_interleave(torch.arange(b.k, device=dev), b.surface_sizes,
+                                          output_size=wall.shape[0])
+            ds = (1.0 / (b.span[seg] * scaling.coordinate_scales()[3]))[:, None]
+            jet = _with_initial(jet, s, ds, b.base_v[k0] + dz[:, None] * b.base_d[2, k0],
+                                b.base_d[:, k0])
         wall_state, state_jacobian = jet.v, jet.d
     else:
         wall = wall.requires_grad_(True)
@@ -348,6 +460,11 @@ def _surface_loss(model, b: CaseBatch, cfg, scaling, fns: StepFunctions) -> torc
     reference[:, 2] = (reference_altitude - scaling.z.offset) / scaling.z.scale
 
     reference_state = fns.forward(reference, b.z, b.surface_sizes)
+    if cfg.predict_change:       # the reference level is the first grid level
+        k0 = b.surface_node
+        if (reference[:, 2] - b.node_coords[k0, 2]).abs().max() > 1e-4:
+            raise ValueError("predict_change: surface reference level is not the first grid level.")
+        reference_state = b.base_v[k0] + _ramp(b, reference, b.surface_sizes) * reference_state
 
     f_off = _device_constant(tuple(cfg.flux_offset), dev, dt)
     f_scale = _device_constant(tuple(cfg.flux_scale), dev, dt)
@@ -367,16 +484,16 @@ def _surface_loss(model, b: CaseBatch, cfg, scaling, fns: StepFunctions) -> torc
 
 
 def _pde_loss(model, coll: torch.Tensor, z: torch.Tensor, cfg, scaling,
-              fns: StepFunctions) -> torch.Tensor:
+              fns: StepFunctions, out: "Jet | None" = None) -> torch.Tensor:
     """Mean squared PDE residual over equal-sized per-case collocation sets.
 
     ``z`` holds one latent row per case; each case owns ``cfg.n_collocation``
     consecutive rows of ``coll``. A tanh ConditionalModel takes the forward-Taylor
     path (derivatives carried through one forward pass); anything else falls back
-    to nested autograd."""
+    to nested autograd. ``out``: the state jet, when the caller built it (predict_change)."""
     if _taylor_supported(model):
         res = fns.pde_residuals(model.net, coll, z, physics=cfg.physics, scaling=scaling,
-                                sizes=cfg.n_collocation)
+                                sizes=cfg.n_collocation, out=out)
     else:
         coll = coll.requires_grad_(True)
         res = cartesian_zero_forcing_residuals(coll, model(coll, z, cfg.n_collocation),
@@ -400,6 +517,32 @@ def _forward_maybe_bf16(forward: Callable, coords: torch.Tensor, z: torch.Tensor
     return out.float()
 
 
+def _ramp(b: CaseBatch, coords: torch.Tensor, sizes: torch.Tensor) -> torch.Tensor:
+    """(t - t0) / T per point, (n, 1), in each case's window (predict_change)."""
+    seg = torch.repeat_interleave(torch.arange(b.k, device=coords.device), sizes,
+                                  output_size=coords.shape[0])
+    return ((coords[:, 3] - b.t0[seg]) / b.span[seg])[:, None]
+
+
+def _pde_loss_on_nodes(model, b: CaseBatch, u: torch.Tensor, cfg, scaling,
+                       fns: StepFunctions) -> torch.Tensor:
+    """PDE loss of initial + ramp * network (predict_change) at grid nodes, where the
+    initial field's derivatives are known. ``u`` (k, n_collocation, 4) uniform draws:
+    column 0 picks each point's node, column 3 its time in the window."""
+    k, n = u.shape[:2]
+    first = torch.cumsum(b.node_sizes, 0) - b.node_sizes
+    node = (first[:, None] + (u[..., 0] * b.node_sizes[:, None]).long()
+            .clamp_max(b.node_sizes[:, None] - 1)).reshape(-1)
+    s = u[..., 3].reshape(-1, 1)                                  # ramp = the time draw
+    t = b.t0[:, None] + u[..., 3] * b.span[:, None]
+    coll = torch.cat([b.node_coords[node], t.reshape(-1, 1)], dim=1)
+    scales = scaling.coordinate_scales()
+    ds = (1.0 / (b.span * scales[3]))[:, None].expand(k, n).reshape(-1, 1)
+    net = fns.taylor(model.net, coll, b.z, scales, sizes=cfg.n_collocation)
+    out = _with_initial(net, s, ds, b.base_v[node], b.base_d[:, node], b.base_h[:, node])
+    return _pde_loss(model, coll, b.z, cfg, scaling, fns, out=out)
+
+
 def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
                   unit_coll: "torch.Tensor | None" = None,
                   fns: "StepFunctions | None" = None) -> dict[str, torch.Tensor]:
@@ -418,9 +561,16 @@ def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
     # derivative-free forwards, optionally in bf16; results back to float32 for the losses
     plain = lambda coords, sizes: _forward_maybe_bf16(
         fns.forward, coords, b.z, sizes, cfg.bf16_data)[:, :n_obs]
+    if cfg.predict_change:
+        if not _taylor_supported(model):
+            raise ValueError("predict_change needs a tanh model (forward-Taylor derivatives).")
+        state = lambda coords, sizes, node: (
+            b.base_v[node] + _ramp(b, coords, sizes) * plain(coords, sizes))
+    else:
+        state = lambda coords, sizes, node: plain(coords, sizes)
 
     with record_function("loss/data"):
-        pred = plain(b.interior, b.interior_sizes)
+        pred = state(b.interior, b.interior_sizes, b.interior_node)
         err2 = (((pred - b.targets) * b.target_mask) ** 2).sum(dim=1)
         # output_size keeps repeat_interleave from reading the GPU sizes (a sync)
         seg = torch.repeat_interleave(torch.arange(k, device=pred.device), b.interior_sizes,
@@ -430,12 +580,12 @@ def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
         data = (sse / n_meas.clamp_min(1.0)).mean()
 
     with record_function("loss/initial"):
-        ic = plain(b.initial_coords, b.initial_sizes)
+        ic = state(b.initial_coords, b.initial_sizes, b.initial_node)
         initial = (_per_case_mean(((ic - b.initial_targets) ** 2).sum(dim=1), b.initial_sizes, k)
                    / n_obs).mean()
 
     with record_function("loss/flow_boundary"):
-        bc = plain(b.boundary_coords, b.boundary_sizes)
+        bc = state(b.boundary_coords, b.boundary_sizes, b.boundary_node)
         flow = (_per_case_mean(((bc - b.boundary_targets) ** 2).sum(dim=1), b.boundary_sizes, k)
                 / n_obs).mean()
 
@@ -446,24 +596,27 @@ def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
         with record_function("loss/pde"):
             u = unit_coll if unit_coll is not None else torch.rand(
                 (k, cfg.n_collocation, b.box_lo.shape[1]), device=pred.device, dtype=pred.dtype)
-            source_off, source_scale = _coordinate_affine(cfg.source_scaling, u)
-            model_off, model_scale = _coordinate_affine(scaling, u)
-
-            sampled = (b.box_lo[:, None] + u * (b.box_hi - b.box_lo)[:, None])
-            physical = sampled * source_scale + source_off
-            h = terrain_at(physical[:, :, 0], physical[:, :, 1], b.terrain_x, b.terrain_y, b.terrain_h,)[0]
-
-            if cfg.source_z_mode == "physical_altitude":
-                z0 = b.box_lo[:, 2:3] * source_scale[2] + source_off[2]
-                z1 = b.box_hi[:, 2:3] * source_scale[2] + source_off[2]
-                lower = torch.maximum(torch.minimum(z0, z1), h)
-                upper = torch.maximum(z0, z1)
-                physical[:, :, 2] = (lower + u[:, :, 2] * (upper - lower))
+            if cfg.predict_change:
+                pde = _pde_loss_on_nodes(model, b, u, cfg, scaling, fns)
             else:
-                physical[:, :, 2] = _source_height_to_altitude(physical[:, :, 2], h, cfg)
+                source_off, source_scale = _coordinate_affine(cfg.source_scaling, u)
+                model_off, model_scale = _coordinate_affine(scaling, u)
 
-            coll = ((physical - model_off) / model_scale).reshape(-1, 4)
-            pde = _pde_loss(model, coll, b.z, cfg, scaling, fns)
+                sampled = (b.box_lo[:, None] + u * (b.box_hi - b.box_lo)[:, None])
+                physical = sampled * source_scale + source_off
+                h = terrain_at(physical[:, :, 0], physical[:, :, 1], b.terrain_x, b.terrain_y, b.terrain_h,)[0]
+
+                if cfg.source_z_mode == "physical_altitude":
+                    z0 = b.box_lo[:, 2:3] * source_scale[2] + source_off[2]
+                    z1 = b.box_hi[:, 2:3] * source_scale[2] + source_off[2]
+                    lower = torch.maximum(torch.minimum(z0, z1), h)
+                    upper = torch.maximum(z0, z1)
+                    physical[:, :, 2] = (lower + u[:, :, 2] * (upper - lower))
+                else:
+                    physical[:, :, 2] = _source_height_to_altitude(physical[:, :, 2], h, cfg)
+
+                coll = ((physical - model_off) / model_scale).reshape(-1, 4)
+                pde = _pde_loss(model, coll, b.z, cfg, scaling, fns)
     else:
         pde = zero
 
@@ -762,7 +915,7 @@ def _maybe_resume(model, optimizer, history, config, device) -> int:
     saved = (ckpt.get("manifest") or {}).get("training", {})
     current = asdict(config)
     keys = ("scaling", "source_scaling", "source_z_mode", "terrain_top_height",
-    "fe_surface_reference_z", "physics", "tke_weight", "tke_residual_scale")
+    "fe_surface_reference_z", "physics", "tke_weight", "tke_residual_scale", "predict_change")
 
     if (ckpt.get("geometry_version") != 2 or any(saved.get(k) != current[k] for k in keys)):
         raise ValueError("Checkpoint geometry/physics/TKE loss settings differ; use a new checkpoint path.")

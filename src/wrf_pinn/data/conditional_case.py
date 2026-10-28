@@ -36,6 +36,7 @@ class ConditionalCase:
     targets: object             # (n_pts, n_state): matched interior state
     target_mask: object         # (n_pts, n_state): 1 where measured
     times: object               # (n_times,): window snapshot times
+    initial_raw: object = None  # (n_state, nz, nx*ny): exact initial field (--keep-raw cases)
     state_vars: tuple[str, ...] = STATE_VARS
     coord_names: tuple[str, ...] = COORD_NAMES
     face_names: tuple[str, ...] = FACE_NAMES
@@ -66,6 +67,7 @@ class ConditionalCase:
             targets=t(self.targets),
             target_mask=t(self.target_mask),
             times=t(self.times),
+            initial_raw=None if self.initial_raw is None else t(self.initial_raw),
             state_vars=self.state_vars,
             coord_names=self.coord_names,
             face_names=self.face_names,
@@ -95,6 +97,8 @@ def read_conditional_case(npz_path: str | Path, latent: str = "pod") -> Conditio
         bnd = decode_boundary(blob)
         ini = decode_initial(blob)
         members["z"] = latent_vector(blob, latent)
+        if "ini_raw" in blob.files:
+            members["initial_raw"] = blob["ini_raw"].astype(np.float32)
 
     members["boundary"] = np.stack([bnd[v] for v in STATE_VARS], axis=0).astype(np.float32)
     members["initial"] = np.stack([ini[v] for v in STATE_VARS], axis=0).astype(np.float32)
