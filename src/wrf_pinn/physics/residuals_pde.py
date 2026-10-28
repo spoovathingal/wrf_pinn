@@ -281,10 +281,41 @@ def _brunt_vaisala_squared(theta: torch.Tensor, theta_z: torch.Tensor, physics: 
 
     return (physics.constants.gravity * theta_z / theta_safe)
 
-def _sgs_mixing_length(n_squared: torch.Tensor, e_sgs: torch.Tensor, physics: PhysicsConfig) -> torch.Tensor:
-    """Return the SGS mixing length for stable and unstable flow."""
+def _sgs_delta(physics, like, filter_width):
+    """Resolve the configured width without silently reverting to uniform."""
+    if physics.sgs_filter_width_mode == "uniform":
+        if filter_width is not None:
+            raise ValueError("Do not supply filter_width when SGS width mode is uniform.")
+        return physics.uniform_filter_width
 
-    delta = physics.uniform_filter_width            # plain floats: no device copy, no sync
+    if physics.sgs_filter_width_mode != "fe_cell_volume":
+        raise ValueError("Unsupported SGS filter-width mode.")
+
+    if filter_width is None:
+        raise ValueError("fe_cell_volume requires a local filter_width from grid_geometry.")
+    is_jet = isinstance(like, Jet)
+    if isinstance(filter_width, Jet) != is_jet:
+        raise TypeError(
+            "Local filter_width must be a Jet for Taylor or a Tensor for autograd.")
+    width = filter_width.v if is_jet else filter_width
+    values = like.v if is_jet else like
+
+    if not isinstance(width, torch.Tensor):
+        raise TypeError("Local filter_width must contain a Tensor.")
+    if width.shape != values.shape:
+        raise ValueError("Local filter_width must match the scalar field shape.")
+    if width.dtype != values.dtype or width.device != values.device:
+        raise ValueError("Local filter_width must match field dtype and device.")
+    if is_jet and filter_width.d.shape != like.d.shape:
+        raise ValueError("Local filter_width must match the field's Jet derivative shape.")
+
+    return filter_width
+
+def _sgs_mixing_length(n_squared: torch.Tensor, e_sgs: torch.Tensor, physics: PhysicsConfig,
+                        *, filter_width=None):
+    """Return the SGS mixing length, preserving local-width derivatives."""
+
+    delta = _sgs_delta(physics, e_sgs, filter_width)          # plain floats: no device copy, no sync
     minimum_length = physics.minimum_mixing_length
 
     numerical_floor = torch.finfo(e_sgs.dtype).tiny
@@ -293,11 +324,12 @@ def _sgs_mixing_length(n_squared: torch.Tensor, e_sgs: torch.Tensor, physics: Ph
     # torch.where evaluates both branches, so N^2 must be clamped before
     # taking its square root even where the unstable branch is selected.
     stable_n = n_squared.clamp_min(numerical_floor).sqrt()
-
     stable_candidate = (physics.stable_mixing_length_coefficient * sqrt_e_sgs / stable_n)
 
     # = max(min(candidate, delta), minimum_length), since minimum_length <= delta
-    stable_length = stable_candidate.clamp_max(delta).clamp_min(minimum_length)
+    stable_length = where(
+        stable_candidate <= delta, stable_candidate, delta,
+    ).clamp_min(minimum_length)
 
     return where(n_squared > 0.0, stable_length, delta)
 
@@ -306,28 +338,29 @@ def _diagnostic_sgs_coefficients(
     theta_z: torch.Tensor,
     e_sgs: torch.Tensor,
     physics: PhysicsConfig,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    *,
+    filter_width=None,
+):
     """Diagnose N^2, mixing length, K_m, and scalar diffusivity."""
+    delta = _sgs_delta(physics, e_sgs, filter_width)
     n_squared = _brunt_vaisala_squared(theta, theta_z, physics)
-    mixing_length = _sgs_mixing_length(n_squared, e_sgs, physics)
+    mixing_length = _sgs_mixing_length(n_squared, e_sgs, physics, filter_width=filter_width)
 
     numerical_floor = torch.finfo(e_sgs.dtype).tiny
     sqrt_e_sgs = (e_sgs.clamp_min(0.0) + numerical_floor).sqrt()
 
-    k_m = (physics.sgs_mixing_coefficient * mixing_length * sqrt_e_sgs)
-
-    delta = physics.uniform_filter_width
-
+    k_m = physics.sgs_mixing_coefficient * mixing_length * sqrt_e_sgs
     k_scalar = k_m * (1.0 + 2.0 * mixing_length / delta)
 
     return (n_squared, mixing_length, k_m, k_scalar)
 
-def _sgs_tke_dissipation(rho_d: torch.Tensor, e_sgs: torch.Tensor, 
-    mixing_length: torch.Tensor, physics: PhysicsConfig) -> torch.Tensor:
+def _sgs_tke_dissipation(rho_d, e_sgs, mixing_length, physics,
+                        *, filter_width=None):
     """Positive dissipation magnitude, using physical tensor values."""
+    delta = _sgs_delta(physics, e_sgs, filter_width)
     a_ck = physics.tke_dissipation_mixing_factor * physics.sgs_mixing_coefficient
     c_e = a_ck + (physics.tke_dissipation_coefficient - a_ck) *(
-        mixing_length / physics.uniform_filter_width)
+        mixing_length / delta)
 
     e_positive = e_sgs.clamp_min(0.0)
     return rho_d * c_e * e_positive.pow(1.5) / mixing_length
@@ -337,6 +370,8 @@ def cartesian_zero_forcing_residuals(
     state: torch.Tensor,
     physics: PhysicsConfig = DEFAULT_PHYSICS,
     scaling: ResidualScalingConfig = DEFAULT_RESIDUAL_SCALING,
+    *,
+    filter_width: torch.Tensor | None = None,
 ) -> TensorDict:
     """Compute reduced moist Cartesian continuity and momentum residuals.
 
@@ -400,7 +435,7 @@ def cartesian_zero_forcing_residuals(
 
     # Diagnose the SGS coefficients from local theta_z and e_sgs.
     _n_squared, _mixing_length, k_m, k_scalar = _diagnostic_sgs_coefficients(theta,
-        theta_z, e_sgs, physics)
+        theta_z, e_sgs, physics, filter_width=filter_width)
 
     # The current first-pass model uses the same SGS diffusivity for
     # potential temperature and water vapor.
@@ -549,7 +584,8 @@ def cartesian_zero_forcing_residuals(
         tau_xx * u_x + tau_yy * v_y + tau_zz * w_z
         + tau_xy * (u_y + v_x) + tau_xz * (u_z + w_x) + tau_yz * (v_z + w_y) )
     
-    tke_dissipation = _sgs_tke_dissipation(rho_d, e_sgs, _mixing_length, physics)
+    tke_dissipation = _sgs_tke_dissipation(rho_d, e_sgs, _mixing_length, physics,
+                    filter_width=filter_width)
     
     tke_transport = physics.tke_transport_coefficient * sum(
         _physical_gradient(
@@ -581,6 +617,7 @@ def cartesian_zero_forcing_residuals_taylor(
     sizes: "torch.Tensor | int | None" = None,
     *,
     output_config: ConditionalModelConfig | None = None,
+    filter_width: Jet | None = None,
 ) -> TensorDict:
     """The residuals of ``cartesian_zero_forcing_residuals``, without nested autograd.
 
@@ -624,7 +661,7 @@ def cartesian_zero_forcing_residuals_taylor(
     # Diagnose the SGS coefficients from local theta_z and e_sgs (jets in x, y, z,
     # so their gradients carry theta's second derivatives).
     _n_squared, _mixing_length, k_m, k_scalar = _diagnostic_sgs_coefficients(
-        theta, theta.deriv(2), e_sgs, physics)
+        theta, theta.deriv(2), e_sgs, physics, filter_width=filter_width)
     k_theta = k_scalar
     k_q_v = k_scalar
 
@@ -720,7 +757,8 @@ def cartesian_zero_forcing_residuals_taylor(
         tau_xx.v * u_x.v + tau_yy.v * v_y.v + tau_zz.v * w_z.v
         + tau_xy.v * (u_y.v + v_x.v) + tau_xz.v * (u_z.v + w_x.v) + tau_yz.v * (v_z.v + w_y.v)
     )
-    tke_dissipation = _sgs_tke_dissipation(rho_d.v, e_sgs.v, _mixing_length.v, physics)
+    tke_dissipation = _sgs_tke_dissipation(rho_d.v, e_sgs.v, _mixing_length.v, physics,
+    filter_width=(None if filter_width is None else filter_width.v))
     tke_transport = physics.tke_transport_coefficient * sum(
         (rho_d * k_m * e_sgs.deriv(j)).d[j] for j in range(3)
     )

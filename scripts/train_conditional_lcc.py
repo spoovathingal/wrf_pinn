@@ -35,6 +35,15 @@ def _scaling_from_recipe(recipe: dict) -> ResidualScalingConfig:
         for name, offset, scale in zip(names, offsets, scales)
     })
 
+def _load_sgs_reference_z(path: Path) -> tuple[float, ...]:
+    """Read native, stretched FE reference heights in physical metres."""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or not isinstance(
+        payload.get("reference_z_m"), list):
+
+        raise ValueError("SGS profile JSON must contain a 'reference_z_m' list.")
+    # PhysicsConfig validates finiteness, ordering and endpoint spacing.
+    return tuple(float(z) for z in payload["reference_z_m"])
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -109,6 +118,19 @@ def main() -> int:
             "linear retains legacy behavior"
         ),
     )
+    ap.add_argument("--sgs-filter-width-mode", choices=("uniform", "fe_cell_volume"),
+        default="fe_cell_volume",
+        help="SGS width: fixed legacy value or native FE cell-volume scale",
+    )
+    ap.add_argument("--sgs-reference-z", type=Path,
+        help="JSON with native reference heights in reference_z_m",
+    )
+    ap.add_argument("--sgs-dx", type=float, default=DEFAULT_PHYSICS.sgs_dx,
+        help="Native FE x spacing in metres, before subsampling",
+    )
+    ap.add_argument("--sgs-dy", type=float, default=DEFAULT_PHYSICS.sgs_dy,
+        help="Native FE y spacing in metres, before subsampling",
+    )
     args = ap.parse_args()
 
     if not 0.0 < args.terrain_top_height < float("inf"):
@@ -123,6 +145,29 @@ def main() -> int:
             "epochs, batch-cases, log-every and checkpoint-every must be positive")
     if args.n_cases is not None and args.n_cases < 1:
         ap.error("n-cases must be positive")
+
+    if args.sgs_filter_width_mode == "fe_cell_volume":
+        if args.sgs_reference_z is None:
+            ap.error("--sgs-reference-z is required for fe_cell_volume")
+    elif args.sgs_reference_z is not None:
+        ap.error("--sgs-reference-z is only used with fe_cell_volume")
+
+    try:
+        reference_z = (_load_sgs_reference_z(args.sgs_reference_z)
+            if args.sgs_filter_width_mode == "fe_cell_volume"
+            else ())
+
+        physics = replace(
+            DEFAULT_PHYSICS, q_v_to_kg_per_kg=args.q_v_to_kg_per_kg,
+            sgs_filter_width_mode=args.sgs_filter_width_mode,
+            sgs_dx=args.sgs_dx, sgs_dy=args.sgs_dy, sgs_reference_z=reference_z)
+    
+    except (OSError, ValueError, TypeError, OverflowError) as exc:
+        ap.error(f"Invalid SGS configuration: {exc}")
+
+    if (physics.sgs_filter_width_mode == "fe_cell_volume"
+        and physics.sgs_reference_z[-1] > args.terrain_top_height):
+        ap.error("SGS reference heights must not exceed --terrain-top-height")
 
     distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
     rank, world = 0, 1
@@ -158,7 +203,6 @@ def main() -> int:
             scaling = replace(source_scaling, z=VariableScale(offset=0.0, scale=args.model_z_max))
         # Preprocessing preserves FastEddy qv in g/kg.
         # Convert to kg/kg inside the physics calculations.
-        physics = replace(DEFAULT_PHYSICS, q_v_to_kg_per_kg=args.q_v_to_kg_per_kg)
 
         all_paths = sorted((args.cases_dir / "train").glob("*.npz"))
         if args.n_cases is not None:
@@ -221,6 +265,17 @@ def main() -> int:
             model_config.tke_softplus_scale,
             model_config.tke_initial_value,
         )
+        if physics.sgs_filter_width_mode == "fe_cell_volume":
+            log.info(
+                "SGS width: mode=%s; native dx=%g m; native dy=%g m; "
+                "reference levels=%d; reference z=%g..%g m; edges=%s",
+                physics.sgs_filter_width_mode,
+                physics.sgs_dx, physics.sgs_dy, len(physics.sgs_reference_z),
+                physics.sgs_reference_z[0], physics.sgs_reference_z[-1],
+                physics.sgs_vertical_edge_policy)
+        else:
+            log.info("SGS width: mode=uniform; Delta=%g m", physics.uniform_filter_width)
+
         if args.lazy:
             hist = train_conditional(
                 model, config=cfg, case_paths=paths,

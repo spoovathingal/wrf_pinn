@@ -26,9 +26,9 @@ from wrf_pinn.physics.residuals_pde import (
     cartesian_zero_forcing_residuals, cartesian_zero_forcing_residuals_taylor,
 )
 from wrf_pinn.physics.residuals_boundary import no_penetration_z_wall_residuals
-from wrf_pinn.physics.taylor import taylor_forward
+from wrf_pinn.physics.taylor import coordinate_jet, taylor_forward
 from wrf_pinn.training.provenance import run_manifest, write_event
-
+from wrf_pinn.physics.grid_geometry import sgs_filter_width, terrain_height_jet
 #: the five losses of the conditional PINN, in order.
 LOSS_NAMES: tuple[str, ...] = ("data", "initial", "flow_boundary", "pde", "surface")
 
@@ -207,6 +207,58 @@ def _source_height_to_altitude(z_source, h, cfg):
     
     raise ValueError(f"Unsupported source_z_mode: {cfg.source_z_mode}")
 
+def _validate_local_sgs_bounds(case, grid, surface_h, cfg, source_off, source_scale):
+    """Validate a case's SGS query domain on CPU before GPU training."""
+    if cfg.physics.sgs_filter_width_mode != "fe_cell_volume":
+        return
+
+    physical = case.interior * source_scale + source_off
+    lo, hi = physical.amin(dim=0), physical.amax(dim=0)
+    xs, ys, _ = grid
+
+    # Include terrain-cell corners inside the PDE rectangle and
+    # intersections with its edges. Bilinear terrain extrema occur here.
+    xs = torch.unique(torch.cat((
+        xs[(xs >= lo[0]) & (xs <= hi[0])],
+        lo[0:1],
+        hi[0:1],
+    )))
+    ys = torch.unique(torch.cat((
+        ys[(ys >= lo[1]) & (ys <= hi[1])],
+        lo[1:2],
+        hi[1:2],
+    )))
+    xx, yy = torch.meshgrid(xs, ys, indexing="ij")
+    heights = terrain_at(xx, yy, *grid)[0]
+
+    h_bounds = torch.stack(
+        (heights.min(), heights.max())
+    )[:, None].expand(2, 2)
+
+    source_z = torch.stack(
+        (lo[2], hi[2])
+    )[None, :].expand(2, 2)
+
+    altitude = _source_height_to_altitude(source_z, h_bounds, cfg)
+    if cfg.source_z_mode == "physical_altitude":
+        # Match the sampler's clipping of its lower boundary.
+        altitude = torch.maximum(altitude, h_bounds)
+
+    tolerance = 16.0 * torch.finfo(altitude.dtype).eps * cfg.terrain_top_height
+
+    if bool((altitude < h_bounds - tolerance).any()):
+        raise ValueError(f"{case.name}: PDE sampling would extend below terrain.")
+
+    try:
+        sgs_filter_width(altitude.reshape(-1, 1), h_bounds.reshape(-1, 1),
+            cfg.physics, cfg.terrain_top_height)
+
+        # Surface closure extends the first cell's spacing down to Z=h.
+        wall_h = surface_h.reshape(-1, 1)
+        sgs_filter_width(wall_h, wall_h, cfg.physics, cfg.terrain_top_height)
+    except ValueError as exc:
+        raise ValueError(f"{case.name}: invalid SGS geometry: {exc}") from exc
+
 def stack_cases(cases: list[ConditionalCase], cfg: ConditionalTrainConfig) -> CaseBatch:
     """Concatenate torch cases (on one device) into a CaseBatch."""
     """Prepare model coordinates and terrain on CPU."""
@@ -241,6 +293,7 @@ def stack_cases(cases: list[ConditionalCase], cfg: ConditionalTrainConfig) -> Ca
         rows = c.surface.reshape(-1, c.surface.shape[-1])
         physical_xyt = (rows[:, :3] * source_scale[[0, 1, 3]] + source_off[[0, 1, 3]])
         h, hx, hy = terrain_at(physical_xyt[:, 0], physical_xyt[:, 1], *grid)
+        _validate_local_sgs_bounds(c, grid, h, cfg, source_off, source_scale)
         model_xyt = (physical_xyt - model_off[[0, 1, 3]]) / model_scale[[0, 1, 3]]
 
         surface.append( torch.cat( (model_xyt, rows[:, 3:]) , dim=1) )
@@ -344,6 +397,10 @@ def _surface_loss(model, b: CaseBatch, cfg, scaling, fns: StepFunctions) -> torc
     reference[:, 2] = (reference_altitude - scaling.z.offset) / scaling.z.scale
 
     reference_state = fns.forward(reference, b.z, b.surface_sizes)
+    filter_width = None
+    if cfg.physics.sgs_filter_width_mode == "fe_cell_volume":
+        filter_width = sgs_filter_width(h, h, cfg.physics, cfg.terrain_top_height,
+            check_values=False)
 
     f_off = _device_constant(tuple(cfg.flux_offset), dev, dt)
     f_scale = _device_constant(tuple(cfg.flux_scale), dev, dt)
@@ -356,27 +413,67 @@ def _surface_loss(model, b: CaseBatch, cfg, scaling, fns: StepFunctions) -> torc
         surface_stress_scale=cfg.surface_stress_scale,
         surface_heat_flux_scale=cfg.surface_heat_flux_scale,
         state_jacobian=state_jacobian, check_values=False,
-        terrain_height=h, terrain_slopes=b.surface_geometry[:, 1:3])  # wall rows are built at z=0 above
+        terrain_height=h, terrain_slopes=b.surface_geometry[:, 1:3],
+        filter_width=filter_width)  # wall rows are built at z=0 above
     per_eq = torch.stack([_per_case_mean(r.square().reshape(-1), b.surface_sizes, b.k)
                           for r in res.values()])                    # (n_eq, k)
     return per_eq.mean(dim=0).mean()
 
 
-def _pde_loss(model, coll: torch.Tensor, z: torch.Tensor, cfg, scaling,
-              fns: StepFunctions) -> torch.Tensor:
+def _pde_loss(model, coll: torch.Tensor, z: torch.Tensor, cfg, scaling, fns: StepFunctions,
+                *, 
+                terrain_batch: CaseBatch | None = None) -> torch.Tensor:
     """Mean squared PDE residual over equal-sized per-case collocation sets.
 
     ``z`` holds one latent row per case; each case owns ``cfg.n_collocation``
     consecutive rows of ``coll``. A tanh ConditionalModel takes the forward-Taylor
     path (derivatives carried through one forward pass); anything else falls back
     to nested autograd."""
-    if _taylor_supported(model):
-        res = fns.pde_residuals(model.net, coll, z, physics=cfg.physics, scaling=scaling,
-                                sizes=cfg.n_collocation, output_config=model.config)
-    else:
+    use_taylor = _taylor_supported(model)
+    if not use_taylor:
+        # This must happen BEFORE rebuilding terrain and local width.
         coll = coll.requires_grad_(True)
+
+    filter_width = None
+
+    if cfg.physics.sgs_filter_width_mode == "fe_cell_volume":
+        if terrain_batch is None:
+            raise ValueError("Local SGS width requires terrain_batch.")
+
+        if ( coll.shape[0] != terrain_batch.k * cfg.n_collocation
+            or z.shape[0] != terrain_batch.k
+        ):
+            raise ValueError("Collocation rows must be grouped by terrain case.")
+
+        offsets, scales = _coordinate_affine(scaling, coll)
+        physical = (coll * scales + offsets).reshape(terrain_batch.k, cfg.n_collocation, 4)
+
+        h, hx, hy = terrain_at(physical[:, :, 0], physical[:, :, 1],
+            terrain_batch.terrain_x, terrain_batch.terrain_y, terrain_batch.terrain_h)
+
+        altitude = physical[:, :, 2].reshape(-1, 1)
+        height = h.reshape(-1, 1)
+
+        if use_taylor:
+            slopes = torch.stack((hx, hy), dim=-1).reshape(-1, 2)
+            altitude = coordinate_jet(altitude, axis=2)
+            height = terrain_height_jet(height, slopes)
+
+        filter_width = sgs_filter_width(altitude, height,
+                    cfg.physics, cfg.terrain_top_height,
+            # stack_cases validated this domain on CPU.
+            check_values=False,
+        )
+
+    if use_taylor:
+        res = fns.pde_residuals(model.net, coll, z,
+            physics=cfg.physics, scaling=scaling, sizes=cfg.n_collocation,
+            output_config=model.config, filter_width=filter_width)
+
+    else:
         res = cartesian_zero_forcing_residuals(coll, model(coll, z, cfg.n_collocation),
-                                               physics=cfg.physics, scaling=scaling)
+            physics=cfg.physics, scaling=scaling, filter_width=filter_width)
+
     base_terms = [
         residual.square().mean() for name, residual in res.items() if name != "sgs_tke"
     ]
@@ -457,7 +554,10 @@ def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
                 physical[:, :, 2] = _source_height_to_altitude(physical[:, :, 2], h, cfg)
 
             coll = ((physical - model_off) / model_scale).reshape(-1, 4)
-            pde = _pde_loss(model, coll, b.z, cfg, scaling, fns)
+            if cfg.physics.sgs_filter_width_mode == "fe_cell_volume":
+                pde = _pde_loss(model, coll, b.z, cfg, scaling, fns, terrain_batch=b)
+            else:
+                pde = _pde_loss(model, coll, b.z, cfg, scaling, fns)
     else:
         pde = zero
 
@@ -747,14 +847,30 @@ def _save_checkpoint(model, optimizer, history, epoch, config, manifest=None) ->
     write_event(config.events_path, {"event": "checkpoint", "epoch": epoch, "path": str(path)})
     print(f"checkpoint @ epoch {epoch} -> {path} (+ {tagged.name})", file=sys.stderr, flush=True)
 
+def _physics_resume_settings(settings):
+    """Compare active SGS settings; older checkpoints used uniform width."""
+    settings = dict(settings or {})
+    mode = settings.setdefault("sgs_filter_width_mode", "uniform")
+
+    if mode == "uniform":
+        # These settings have no effect in uniform mode.
+        for key in ("sgs_dx", "sgs_dy",
+            "sgs_reference_z", "sgs_vertical_edge_policy"):
+            settings.pop(key, None)
+
+    elif "sgs_reference_z" in settings:
+        settings["sgs_reference_z"] = tuple(settings["sgs_reference_z"])
+    return settings
 
 def _maybe_resume(model, optimizer, history, config, device) -> int:
     """Load a checkpoint if present; return the epoch to start from (1 if none)."""
     if not config.checkpoint_path or not Path(config.checkpoint_path).is_file():
         return 1
     ckpt = torch.load(config.checkpoint_path, map_location=device)
-    saved = (ckpt.get("manifest") or {}).get("training", {})
+    saved = dict( (ckpt.get("manifest") or {}).get("training") or {} )
     current = asdict(config)
+    saved["physics"] = _physics_resume_settings(saved.get("physics"))
+    current["physics"] = _physics_resume_settings(current["physics"])
     keys = ("scaling", "source_scaling", "source_z_mode", "terrain_top_height",
     "fe_surface_reference_z", "physics", "tke_weight", "tke_residual_scale")
 

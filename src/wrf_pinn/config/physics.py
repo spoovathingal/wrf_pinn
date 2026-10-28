@@ -133,9 +133,26 @@ class PhysicsConfig:
     # (1e-3 when the data is g/kg, as FastEddy writes it).
     q_v_to_kg_per_kg: float = 1.0
 
-    # Temporary uniform SGS filter width; replace with local cell-volume
-    # scale when variable dz is implemented.
-    uniform_filter_width: float = 15.0  # m
+    # "uniform" preserves the previous closure. The driver will explicitly
+    # select "fe_cell_volume" once all residual paths support local widths.
+    sgs_filter_width_mode: Literal["uniform", "fe_cell_volume"] = "uniform"
+    uniform_filter_width: float = 15.0  # m; used only in uniform mode
+
+    # Native FE horizontal grid spacing in metres, not tile/subsample spacing.
+    sgs_dx: float = 15.0115
+    sgs_dy: float = 15.0115
+
+    # Native reference-level centre heights in metres, before terrain
+    # compression. These already include vertical stretching.
+    # The driver will populate this from zPos and save the values in checkpoints.
+    sgs_reference_z: tuple[float, ...] = ()
+
+    # Interior spacing: (z[k+1] - z[k-1]) / 2.
+    # Bottom: z[1] - z[0], consistent with linear extension below the first level.
+    # Cropped top: (3*z[-1] - 4*z[-2] + z[-3]) / 2, an approximation.
+    sgs_vertical_edge_policy: Literal[
+        "linear_bottom_quadratic_top"
+    ] = "linear_bottom_quadratic_top"
 
     # FastEddy diagnostic SGS closure.
     sgs_mixing_coefficient: float = 0.10          # c_k
@@ -147,6 +164,49 @@ class PhysicsConfig:
     tke_dissipation_mixing_factor: float = 1.9  # a
     # T = c_T * div(rho_d * K_m * grad(e_sgs))
     tke_transport_coefficient: float = 2.0  # c_T
+
+    def __post_init__(self) -> None:
+        if self.sgs_filter_width_mode not in ("uniform", "fe_cell_volume"):
+            raise ValueError(
+                "sgs_filter_width_mode must be 'uniform' or 'fe_cell_volume'."
+            )
+
+        for name in ("uniform_filter_width", "sgs_dx", "sgs_dy"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive.")
+
+        if self.sgs_vertical_edge_policy != "linear_bottom_quadratic_top":
+            raise ValueError("Unsupported sgs_vertical_edge_policy.")
+
+        # Keep the frozen config immutable/hashable even if loaded from a list.
+        reference_z = tuple(float(z) for z in self.sgs_reference_z)
+        object.__setattr__(self, "sgs_reference_z", reference_z)
+
+        if self.sgs_filter_width_mode == "fe_cell_volume" and not reference_z:
+            raise ValueError(
+                "fe_cell_volume requires native reference heights in sgs_reference_z."
+            )
+
+        if reference_z:
+            if len(reference_z) < 3:
+                raise ValueError("sgs_reference_z must contain at least 3 levels.")
+
+            if any(not math.isfinite(z) or z < 0.0 for z in reference_z):
+                raise ValueError(
+                    "sgs_reference_z must contain finite, nonnegative heights."
+                )
+
+            if any(b <= a for a, b in zip(reference_z, reference_z[1:])):
+                raise ValueError("sgs_reference_z must be strictly increasing.")
+
+            top_spacing = (3.0 * reference_z[-1] - 4.0 * reference_z[-2]
+                + reference_z[-3]) / 2.0
+
+            if not math.isfinite(top_spacing) or top_spacing <= 0.0:
+                raise ValueError(
+                    "Estimated top reference spacing must be finite and positive."
+                )
 
     @property
     def state_dim(self) -> int:

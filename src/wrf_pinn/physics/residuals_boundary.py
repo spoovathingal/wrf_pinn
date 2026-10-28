@@ -198,25 +198,30 @@ def no_penetration_z_wall_residuals(
     check_values: bool = True,
     terrain_height: "torch.Tensor | None" = None,
     terrain_slopes: "torch.Tensor | None" = None,
+    filter_width: "torch.Tensor | None" = None,
 ) -> dict[str, torch.Tensor]:
-    """Return no-penetration and neutral surface stress residuals.
+    """Return terrain no-penetration, surface stress, and heat-flux residuals.
 
-    ``coordinates`` and ``state`` describe the physical wall at z=0.
-    ``reference_coordinates`` and ``reference_state`` describe paired points
-    at the first off-wall reference height z=z1.
+    coordinates and state describe points on the physical terrain surface.
+    reference_coordinates and reference_state describe paired points at
+    the first off-wall reference height.
 
-    fric_vel [m/s] and ht_flux [K m/s] must be physical (N, 1) tensors,
-    aligned with every row of coordinates. Surface losses use bottom rows.
-    Flat z=0 geometry is retained until the terrain update.
+    fric_vel [m/s] and ht_flux [K m/s] are physical (N, 1) tensors.
+    terrain_height is physical elevation [m]; terrain_slopes contains
+    physical (dh/dx, dh/dy).
 
-    ``state_jacobian`` (n_coord, N, n_state), if given, holds d(state)/d(physical
-    coordinate) of the normalized state at the wall points (e.g. ``taylor_forward``'s
-    ``d``); the wall gradients are read from it instead of taken with autograd, so
-    ``coordinates`` need not require grad.
+    filter_width is a physical (N, 1) tensor [m], required in
+    fe_cell_volume mode. It uses the first native cell's vertical spacing,
+    compressed by terrain and extended down to the surface.
+    Pass None in uniform-width mode.
 
-    ``check_values=False`` skips the checks that read GPU values (finite, nonnegative
-    fluxes; the z=0 mask), each of which makes the CPU wait for the GPU. The caller
-    then guarantees valid fluxes and that every row is at z=0.
+    state_jacobian, when supplied, contains derivatives of normalized
+    state with respect to physical coordinates, with shape
+    (n_coord, N, n_state). Otherwise, derivatives use autograd.
+
+    check_values=False skips value checks and surface-point masking.
+    The caller then guarantees valid inputs and that every row lies
+    on the supplied terrain surface.
     """
     bottom_mask = _validate_no_penetration_z_wall_inputs(
         coordinates=coordinates, state=state,
@@ -275,7 +280,7 @@ def no_penetration_z_wall_residuals(
     theta_z = grad_theta[:, 2:3]
     # Diagnose wall K_m using the same closure as the interior PDE.
     _, _, k_m_wall, k_theta_wall = _diagnostic_sgs_coefficients(
-        theta=theta_wall, theta_z=theta_z, e_sgs=e_sgs_wall, physics=physics)
+        theta=theta_wall, theta_z=theta_z, e_sgs=e_sgs_wall, physics=physics, filter_width=filter_width)
     # Ordinary SGS stress evaluated on the fluid side of the wall.
     tau_xz_wall = rho_wall * k_m_wall * (u_z + w_x)
     tau_yz_wall = rho_wall * k_m_wall * (v_z + w_y)
