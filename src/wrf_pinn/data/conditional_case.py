@@ -75,11 +75,20 @@ class ConditionalCase:
 
 
 #: Non-POD members written by the generator and read back directly. The initial
-#: and boundary fields are reconstructed from their per-subdomain POD pieces.
+#: and boundary fields are reconstructed from their per-subdomain POD pieces;
+#: ``interior`` is rebuilt (``interior_from_grid``) when a case omits it.
 _CASE_MEMBERS: tuple[str, ...] = (
-    "initial_coords", "boundary_coords", "surface", "terrain", "interior",
+    "initial_coords", "boundary_coords", "surface", "terrain",
     "targets", "times",
 )
+
+
+def interior_from_grid(initial_coords: np.ndarray, boundary_coords: np.ndarray) -> np.ndarray:
+    """Interior query coords: the initial grid at each lead time (lead-major, initial
+    point order), the leads' times taken from the boundary coords' snapshot times."""
+    t = boundary_coords[0, 1:, 0, 3]
+    xyz = np.tile(initial_coords[:, :3], (len(t), 1))
+    return np.concatenate([xyz, np.repeat(t, len(initial_coords))[:, None]], 1).astype(np.float32)
 
 
 def read_conditional_case(npz_path: str | Path, latent: str = "pod") -> ConditionalCase:
@@ -94,6 +103,9 @@ def read_conditional_case(npz_path: str | Path, latent: str = "pod") -> Conditio
         if missing:
             raise ValueError(f"Case {path} missing members: {missing}.")
         members = {k: blob[k].astype(np.float32) for k in _CASE_MEMBERS}
+        members["interior"] = (blob["interior"].astype(np.float32) if "interior" in blob.files
+                               else interior_from_grid(members["initial_coords"],
+                                                       members["boundary_coords"]))
         bnd = decode_boundary(blob)
         ini = decode_initial(blob)
         members["z"] = latent_vector(blob, latent)
