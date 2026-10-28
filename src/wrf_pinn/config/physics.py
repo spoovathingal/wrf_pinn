@@ -13,7 +13,7 @@ from typing import Literal
 CoordinateSystem = Literal["local_cartesian"]
 PhysicsVariable = Literal["u", "v", "w", "theta", "p_prime", "q_v", "e_sgs"]
 ResidualName = Literal["mass", "x_momentum", "y_momentum", "z_momentum",
-                       "potential_temperature","water_vapor", "sgs_tke"]
+                       "potential_temperature","water_vapor"]
 
 @dataclass(frozen=True)
 class PhysicalConstants:
@@ -93,15 +93,13 @@ class PhysicalConstants:
 
 @dataclass(frozen=True)
 class PhysicsConfig:
-    """Configuration for the dry neutral boundary layer model.
+    """Configuration for reduced moist Cartesian equations with SGS closure.
 
-    Assumptions:
-    - local Cartesian coordinates
-    - zero external forcing
-    - dry atmospheric thermodynamics
-    - varying momentum eddy viscosity
-    - density is derived from theta and p_prime
-    - active state is u, v, w, theta, p_prime, k_m
+    Seven fields are predicted, including positive SGS TKE. Six PDE residuals
+    constrain mass, momentum, potential temperature, and water vapor.
+
+    TKE enters the diagnostic SGS stresses and diffusivities, but has no
+    separate transport-equation residual.
     """
 
     coordinate_system: CoordinateSystem = "local_cartesian"
@@ -114,7 +112,6 @@ class PhysicsConfig:
         "z_momentum",
         "potential_temperature",
         "water_vapor",
-        "sgs_tke",
     )
     include_coriolis: bool = False
     include_gravity: bool = True
@@ -133,45 +130,42 @@ class PhysicsConfig:
     # (1e-3 when the data is g/kg, as FastEddy writes it).
     q_v_to_kg_per_kg: float = 1.0
 
-    # "uniform" preserves the previous closure. The driver will explicitly
-    # select "fe_cell_volume" once all residual paths support local widths.
-    sgs_filter_width_mode: Literal["uniform", "fe_cell_volume"] = "uniform"
-    uniform_filter_width: float = 15.0  # m; used only in uniform mode
+
 
     # Native FE horizontal grid spacing in metres, not tile/subsample spacing.
     sgs_dx: float = 15.0115
     sgs_dy: float = 15.0115
 
     # Native reference-level centre heights in metres, before terrain
-    # compression. These already include vertical stretching.
-    # The driver will populate this from zPos and save the values in checkpoints.
-    sgs_reference_z: tuple[float, ...] = ()
+    # compression. These already include vertical stretching. from FE_CSTL_subset_400800.nc
+    sgs_reference_z: tuple[float, ...] = (10.125386238098145, 30.385427474975586,
+        50.67327880859375, 71.00747680664062, 91.40655517578125, 111.8890609741211,
+        132.47354125976562, 153.1785125732422, 174.02252197265625, 195.02410888671875,
+        216.20181274414062, 237.57418823242188, 259.1597595214844, 280.97705078125,
+        303.04461669921875, 325.3809814453125, 348.0047302246094, 370.9343566894531,
+        394.1883850097656, 417.7854309082031, 441.7439270019531, 466.0824890136719,
+        490.81964111328125, 515.9739379882812, 541.5638427734375, 567.6079711914062,
+        594.1248779296875, 621.1329956054688, 648.6509399414062, 676.697265625,
+        705.2904663085938, 734.4491577148438, 764.1917114257812, 794.536865234375,
+        825.5030517578125, 857.1087646484375, 889.3726806640625, 922.313232421875,
+        955.948974609375, 990.2984619140625, 1025.3802490234375, 1061.2127685546875,
+        1097.814697265625, 1135.20458984375, 1173.40087890625, 1212.422119140625,
+        1252.286865234375, 1293.013671875, 1334.62109375, 1377.127685546875,
+        1420.5518798828125,)
 
-    # Interior spacing: (z[k+1] - z[k-1]) / 2.
-    # Bottom: z[1] - z[0], consistent with linear extension below the first level.
+    # Record the spacing rule in checkpoints. The cropped-top rule is approximate.
+    # Interior spacing: (z[k+1] - z[k-1]) / 2. Bottom: z[1] - z[0],
     # Cropped top: (3*z[-1] - 4*z[-2] + z[-3]) / 2, an approximation.
     sgs_vertical_edge_policy: Literal[
-        "linear_bottom_quadratic_top"
-    ] = "linear_bottom_quadratic_top"
+        "linear_bottom_quadratic_top"] = "linear_bottom_quadratic_top"
 
     # FastEddy diagnostic SGS closure.
     sgs_mixing_coefficient: float = 0.10          # c_k
     stable_mixing_length_coefficient: float = 0.76
     minimum_mixing_length: float = 0.01           # m
-    # Prognostic SGS TKE dissipation:
-    # c_e = a*c_k + (c0 - a*c_k)*(l_sgs/Delta)
-    tke_dissipation_coefficient: float = 0.93  # c0
-    tke_dissipation_mixing_factor: float = 1.9  # a
-    # T = c_T * div(rho_d * K_m * grad(e_sgs))
-    tke_transport_coefficient: float = 2.0  # c_T
 
     def __post_init__(self) -> None:
-        if self.sgs_filter_width_mode not in ("uniform", "fe_cell_volume"):
-            raise ValueError(
-                "sgs_filter_width_mode must be 'uniform' or 'fe_cell_volume'."
-            )
-
-        for name in ("uniform_filter_width", "sgs_dx", "sgs_dy"):
+        for name in ("sgs_dx", "sgs_dy"):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive.")
@@ -183,51 +177,41 @@ class PhysicsConfig:
         reference_z = tuple(float(z) for z in self.sgs_reference_z)
         object.__setattr__(self, "sgs_reference_z", reference_z)
 
-        if self.sgs_filter_width_mode == "fe_cell_volume" and not reference_z:
+        if len(reference_z) < 3:
+            raise ValueError("sgs_reference_z must contain at least 3 levels.")
+
+        if any(not math.isfinite(z) or z < 0.0 for z in reference_z):
             raise ValueError(
-                "fe_cell_volume requires native reference heights in sgs_reference_z."
+                "sgs_reference_z must contain finite, nonnegative heights."
             )
 
-        if reference_z:
-            if len(reference_z) < 3:
-                raise ValueError("sgs_reference_z must contain at least 3 levels.")
+        if any(b <= a for a, b in zip(reference_z, reference_z[1:])):
+            raise ValueError("sgs_reference_z must be strictly increasing.")
 
-            if any(not math.isfinite(z) or z < 0.0 for z in reference_z):
-                raise ValueError(
-                    "sgs_reference_z must contain finite, nonnegative heights."
-                )
+        top_spacing = (3.0 * reference_z[-1] - 4.0 * reference_z[-2]
+            + reference_z[-3]) / 2.0
 
-            if any(b <= a for a, b in zip(reference_z, reference_z[1:])):
-                raise ValueError("sgs_reference_z must be strictly increasing.")
-
-            top_spacing = (3.0 * reference_z[-1] - 4.0 * reference_z[-2]
-                + reference_z[-3]) / 2.0
-
-            if not math.isfinite(top_spacing) or top_spacing <= 0.0:
-                raise ValueError(
-                    "Estimated top reference spacing must be finite and positive."
-                )
+        if not math.isfinite(top_spacing) or top_spacing <= 0.0:
+            raise ValueError(
+                "Estimated top reference spacing must be finite and positive."
+            )
 
     @property
     def state_dim(self) -> int:
-        """Number of active prognostic variables required by this physics config."""
-
+        """Number of predicted state variables, including SGS TKE"""
         return len(self.active_variables)
 
     @property
     def residual_dim(self) -> int:
         """Number of residual equations produced by this physics config."""
-
         return len(self.residuals)
 
     def variable_index(self, name: PhysicsVariable) -> int:
         """Return the active-state column index for a physics variable."""
-
         return self.active_variables.index(name)
 
     def residual_index(self, name: ResidualName) -> int:
         """Return the residual column index for a residual equation."""
-
         return self.residuals.index(name)
 
 

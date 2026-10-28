@@ -24,7 +24,8 @@ from wrf_pinn.training.train_conditional import (
 )
 
 log = logging.getLogger("train_conditional_lcc")
-
+# Physical-altitude normalization for the network, in metres; not a ceiling.
+MODEL_Z_SCALE_METRES = 3000.0
 
 def _scaling_from_recipe(recipe: dict) -> ResidualScalingConfig:
     names = recipe["coord_names"] + recipe["state_vars"]
@@ -34,16 +35,6 @@ def _scaling_from_recipe(recipe: dict) -> ResidualScalingConfig:
         name: VariableScale(offset=offset, scale=scale or 1.0)
         for name, offset, scale in zip(names, offsets, scales)
     })
-
-def _load_sgs_reference_z(path: Path) -> tuple[float, ...]:
-    """Read native, stretched FE reference heights in physical metres."""
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict) or not isinstance(
-        payload.get("reference_z_m"), list):
-
-        raise ValueError("SGS profile JSON must contain a 'reference_z_m' list.")
-    # PhysicsConfig validates finiteness, ordering and endpoint spacing.
-    return tuple(float(z) for z in payload["reference_z_m"])
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -85,89 +76,18 @@ def main() -> int:
     ap.add_argument(
         "--events", default=None,
         help="Append rank-zero training events to this JSONL file")
-    ap.add_argument("--source-z-mode",
-        choices=("fe_terrain_following", "reference_plus_terrain",
-        "height_above_ground", "physical_altitude"),
-        default="fe_terrain_following",
-        help=(" Meaning of the saved vertical coordinate: "
-            "fe_terrain_following uses reference heights before terrain "
-            "compression; physical_altitude uses already-converted heights"))
-    ap.add_argument("--terrain-top-height",type=float, default=4027.5,
-        help=("FE terrain-compression height H in metres; "
-            "4027.5 is the inferred CSTL value"),
-    )
-    ap.add_argument("--fe-surface-reference-z", type=float, default=10.125386238098145,
-        help=("First FE reference-level height before terrain compression, "
-            "in metres; its local height above ground is z_ref*(1-h/H)"),
-    )
-    ap.add_argument(
-        "--model-z-max", type=float, default=None,
-        help="Physical-height normalization scale; not a model ceiling")
-    ap.add_argument(
-        "--tke-weight", type=float, default=1.0,
-        help="Relative SGS TKE weight within the PDE loss; 0 disables this term")
-    ap.add_argument(
-        "--tke-residual-scale", type=float, default=1.0,
-        help="Conservative TKE residual scale [kg m^-1 s^-3]")
-    ap.add_argument(
-        "--tke-output-mode",
-        choices=("linear", "softplus"),
-        default="softplus",
-        help=(
-            "TKE output transform: softplus enforces positive physical TKE; "
-            "linear retains legacy behavior"
-        ),
-    )
-    ap.add_argument("--sgs-filter-width-mode", choices=("uniform", "fe_cell_volume"),
-        default="fe_cell_volume",
-        help="SGS width: fixed legacy value or native FE cell-volume scale",
-    )
-    ap.add_argument("--sgs-reference-z", type=Path,
-        help="JSON with native reference heights in reference_z_m",
-    )
-    ap.add_argument("--sgs-dx", type=float, default=DEFAULT_PHYSICS.sgs_dx,
-        help="Native FE x spacing in metres, before subsampling",
-    )
-    ap.add_argument("--sgs-dy", type=float, default=DEFAULT_PHYSICS.sgs_dy,
-        help="Native FE y spacing in metres, before subsampling",
-    )
+
     args = ap.parse_args()
 
-    if not 0.0 < args.terrain_top_height < float("inf"):
-        ap.error("--terrain-top-height must be finite and positive")
-    if not (0.0 < args.fe_surface_reference_z < args.terrain_top_height):
-        ap.error("--fe-surface-reference-z must be finite and between "
-            "zero and --terrain-top-height")
-    if (args.model_z_max is not None and not 0.0 < args.model_z_max < float("inf")):
-        ap.error("--model-z-max must be finite and positive")
     if min(args.epochs, args.batch_cases, args.log_every, args.checkpoint_every) < 1:
         ap.error(
-            "epochs, batch-cases, log-every and checkpoint-every must be positive")
+            "epochs, batch-cases, log-every and checkpoint-every must be positive"
+        )
+
     if args.n_cases is not None and args.n_cases < 1:
         ap.error("n-cases must be positive")
 
-    if args.sgs_filter_width_mode == "fe_cell_volume":
-        if args.sgs_reference_z is None:
-            ap.error("--sgs-reference-z is required for fe_cell_volume")
-    elif args.sgs_reference_z is not None:
-        ap.error("--sgs-reference-z is only used with fe_cell_volume")
-
-    try:
-        reference_z = (_load_sgs_reference_z(args.sgs_reference_z)
-            if args.sgs_filter_width_mode == "fe_cell_volume"
-            else ())
-
-        physics = replace(
-            DEFAULT_PHYSICS, q_v_to_kg_per_kg=args.q_v_to_kg_per_kg,
-            sgs_filter_width_mode=args.sgs_filter_width_mode,
-            sgs_dx=args.sgs_dx, sgs_dy=args.sgs_dy, sgs_reference_z=reference_z)
-    
-    except (OSError, ValueError, TypeError, OverflowError) as exc:
-        ap.error(f"Invalid SGS configuration: {exc}")
-
-    if (physics.sgs_filter_width_mode == "fe_cell_volume"
-        and physics.sgs_reference_z[-1] > args.terrain_top_height):
-        ap.error("SGS reference heights must not exceed --terrain-top-height")
+    physics = replace(DEFAULT_PHYSICS, q_v_to_kg_per_kg=args.q_v_to_kg_per_kg)
 
     distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
     rank, world = 0, 1
@@ -198,9 +118,8 @@ def main() -> int:
         )["normalization"]
 
         source_scaling = _scaling_from_recipe(recipe)
-        scaling = source_scaling
-        if args.model_z_max is not None:
-            scaling = replace(source_scaling, z=VariableScale(offset=0.0, scale=args.model_z_max))
+        scaling = replace(source_scaling,
+                            z=VariableScale(offset=0.0, scale=MODEL_Z_SCALE_METRES))
         # Preprocessing preserves FastEddy qv in g/kg.
         # Convert to kg/kg inside the physics calculations.
 
@@ -222,59 +141,56 @@ def main() -> int:
         batch_cases = min(args.batch_cases, len(all_paths) // world)
 
         model_config = ConditionalModelConfig(
-            tke_output_mode=args.tke_output_mode,
-            tke_offset=scaling.e_sgs.offset,
-            tke_scale=scaling.e_sgs.scale,
-        )
+            tke_offset=scaling.e_sgs.offset, tke_scale=scaling.e_sgs.scale)
+
         model = ConditionalModel(z_dim, model_config)
         cfg = ConditionalTrainConfig(
-            epochs=args.epochs, batch_cases=batch_cases, cases_per_pass=args.cases_per_pass,
-            readers=args.readers, loader_workers=args.loader_workers, device=device,
+            epochs=args.epochs, batch_cases=batch_cases,
+            cases_per_pass=args.cases_per_pass, readers=args.readers,
+            loader_workers=args.loader_workers, device=device,
             log_every=args.log_every,
-            source_scaling=source_scaling, source_z_mode=args.source_z_mode, scaling=scaling,
-            terrain_top_height=args.terrain_top_height, fe_surface_reference_z=args.fe_surface_reference_z,
-            physics=physics, tke_weight=args.tke_weight, tke_residual_scale=args.tke_residual_scale,
-            flux_offset=tuple(recipe["flux_offset"]), flux_scale=tuple(s or 1.0 for s in recipe["flux_scale"]),
+            source_scaling=source_scaling,
+            scaling=scaling, physics=physics,
+            flux_offset=tuple(recipe["flux_offset"]),
+            flux_scale=tuple(s or 1.0 for s in recipe["flux_scale"]),
             profile=args.profile, bf16_data=args.bf16_data,
             compile=args.compile_model, events_path=args.events,
             checkpoint_path=args.checkpoint, checkpoint_every=args.checkpoint_every,
         )
+
         log.info(
-            "geometry: source_z_mode=%s; H=%.6f m; "
-            "first reference z=%.9f m; "
+            "geometry: FE terrain-following; H=%.6f m;  first reference z=%.9f m; "
             "model z offset=%.6f m; model z scale=%.6f m",
-            cfg.source_z_mode, cfg.terrain_top_height, cfg.fe_surface_reference_z,
+            cfg.terrain_top_height, cfg.fe_surface_reference_z,
             scaling.z.offset, scaling.z.scale,
         )
+
         log.info(
             "device=%s; local cases=%d/%d; latent dim=%d; "
             "batch/GPU=%d; global batch=%d; q_v conversion=%g; mode=%s",
-            device, len(paths), len(all_paths), z_dim,
-            batch_cases, batch_cases * world,
-            args.q_v_to_kg_per_kg,
+            device,len(paths), len(all_paths),
+            z_dim, batch_cases, batch_cases * world, args.q_v_to_kg_per_kg,
             "lazy" if args.lazy else "resident",
         )
 
         log.info(
-            "TKE output: mode=%s; offset=%g; scale=%g; floor=%g; "
+            "TKE output: softplus; offset=%g; scale=%g; floor=%g; "
             "softplus scale=%g; initial value=%g [physical TKE: m^2/s^2]",
-            model_config.tke_output_mode,
-            model_config.tke_offset,
-            model_config.tke_scale,
-            model_config.tke_floor,
-            model_config.tke_softplus_scale,
+            model_config.tke_offset, model_config.tke_scale,
+            model_config.tke_floor, model_config.tke_softplus_scale,
             model_config.tke_initial_value,
         )
-        if physics.sgs_filter_width_mode == "fe_cell_volume":
-            log.info(
-                "SGS width: mode=%s; native dx=%g m; native dy=%g m; "
-                "reference levels=%d; reference z=%g..%g m; edges=%s",
-                physics.sgs_filter_width_mode,
-                physics.sgs_dx, physics.sgs_dy, len(physics.sgs_reference_z),
-                physics.sgs_reference_z[0], physics.sgs_reference_z[-1],
-                physics.sgs_vertical_edge_policy)
-        else:
-            log.info("SGS width: mode=uniform; Delta=%g m", physics.uniform_filter_width)
+
+        log.info(
+            "SGS width: FE cell volume; native dx=%g m; native dy=%g m; "
+            "reference levels=%d; reference z=%g..%g m; edges=%s",
+            physics.sgs_dx, physics.sgs_dy, len(physics.sgs_reference_z),
+            physics.sgs_reference_z[0], physics.sgs_reference_z[-1],
+            physics.sgs_vertical_edge_policy,
+        )
+
+        log.info("PDE: %d residuals; TKE transport equation disabled",
+            physics.residual_dim)
 
         if args.lazy:
             hist = train_conditional(

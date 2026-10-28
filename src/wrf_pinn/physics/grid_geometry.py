@@ -85,6 +85,13 @@ def sgs_filter_width(
 
     check_values=True performs device-to-host checks. Training may use
     False only after validating its terrain and vertical bounds.
+
+    Always uses the terrain-compressed FE cell volume:
+        compression = 1 - terrain_height / terrain_top_height
+        Delta = (sgs_dx * sgs_dy * compression * dz_reference) ** (1/3)
+
+    Reference heights come from physics.sgs_reference_z, embedded in the
+    package configuration. This function does not read an external file.
     """
     is_jet = isinstance(altitude, Jet)
     if is_jet != isinstance(terrain_height, Jet):
@@ -96,28 +103,14 @@ def sgs_filter_width(
     h = terrain_height.v if is_jet else terrain_height
 
     if z.ndim != 2 or z.shape[1] != 1 or h.shape != z.shape:
-        raise ValueError(
-            "Altitude and terrain height must have shape (N, 1)."
-        )
+        raise ValueError("Altitude and terrain height must have shape (N, 1).")
     if (
         not z.is_floating_point()
         or z.dtype != h.dtype
         or z.device != h.device
     ):
-        raise ValueError(
-            "Heights must share a floating-point dtype and device."
-        )
+        raise ValueError("Heights must share a floating-point dtype and device.")
 
-    if physics.sgs_filter_width_mode == "uniform":
-        value = torch.full_like(z, physics.uniform_filter_width)
-        return (
-            Jet(value, torch.zeros_like(altitude.d))
-            if is_jet
-            else value
-        )
-
-    if physics.sgs_filter_width_mode != "fe_cell_volume":
-        raise ValueError("Unsupported SGS filter-width mode.")
     if (
         not math.isfinite(terrain_top_height)
         or terrain_top_height <= 0.0

@@ -22,7 +22,7 @@ from dataclasses import replace
 
 from wrf_pinn.config.scaling import ResidualScalingConfig, VariableScale
 import wrf_pinn.training.train_conditional as tc
-
+from wrf_pinn.config.physics import DEFAULT_PHYSICS
 LATENT_DIM = 8
 
 
@@ -114,7 +114,7 @@ def _geometry_fixture():
     cfg = ConditionalTrainConfig(
         source_scaling=source,
         scaling=model_scaling,
-        source_z_mode="fe_terrain_following",
+        physics=replace(DEFAULT_PHYSICS, sgs_reference_z=(10.0, 55.0, 100.0)),
         terrain_top_height=1000.0,
         fe_surface_reference_z=10.0,
         n_collocation=4,
@@ -163,11 +163,10 @@ def test_checkpoint_save_and_resume(tmp_path):
     # the saved epoch must be the last multiple of checkpoint_every (or final epoch)
     ck = torch.load(str(ckpt), map_location="cpu")
     assert ck["epoch"] == 20
-    assert ck["schema_version"] == 3
+    assert ck["schema_version"] == 4
     assert ck["geometry_version"] == 2
 
     saved_training = ck["manifest"]["training"]
-    assert saved_training["source_z_mode"] == cfg.source_z_mode
     assert saved_training["terrain_top_height"] == cfg.terrain_top_height
     assert saved_training["fe_surface_reference_z"] == cfg.fe_surface_reference_z
     assert ck["manifest"]["model"]["latent_dim"] == LATENT_DIM
@@ -183,10 +182,10 @@ def test_checkpoint_save_and_resume(tmp_path):
     for changed in (
         {"terrain_top_height": cfg.terrain_top_height + 100.0},
         {"fe_surface_reference_z": cfg.fe_surface_reference_z + 1.0},
-        {"source_z_mode": "height_above_ground"},
+        {"physics": replace(cfg.physics, sgs_dx=cfg.physics.sgs_dx + 1.0)},
     ):
         incompatible = replace(cfg, epochs=21, **changed)
-        with pytest.raises(ValueError, match="settings differ"):
+        with pytest.raises(ValueError, match="physics differ"):
             train_conditional(model, cases, incompatible)
 
     # Previous geometry versions must also be rejected.
@@ -196,7 +195,7 @@ def test_checkpoint_save_and_resume(tmp_path):
     incompatible = replace(
         cfg, epochs=21, checkpoint_path=str(old_path)
     )
-    with pytest.raises(ValueError, match="settings differ"):
+    with pytest.raises(ValueError, match="different formulation"):
         train_conditional(model, cases, incompatible)
 
     # resume into a FRESH model: weights load from the checkpoint, start epoch advances.
@@ -237,7 +236,7 @@ def test_collocation_points_independent_of_cases_per_pass(monkeypatch):
     def collocation(cases_per_pass: int) -> torch.Tensor:
         seen = []
 
-        def fake_pde(model, coll, z_rows, cfg, scaling, fns=None):  # random data NaNs the real PDE
+        def fake_pde(model, coll, z_rows, cfg, scaling, fns=None, *, terrain_batch):  # random data NaNs the real PDE
             seen.append(coll.detach().clone())
             return (model(coll, z_rows, cfg.n_collocation) * 0.0).sum()  # z per case
 
@@ -406,7 +405,7 @@ def test_terrain_collocation_matches_observations(monkeypatch):
     )
     seen = {}
 
-    def capture_pde(model, coll, z_rows, config, scaling, fns):
+    def capture_pde(model, coll, z_rows, config, scaling, fns, *, terrain_batch):
         seen["coordinates"] = coll.detach().clone()
         return coll.new_zeros(())
 
@@ -456,39 +455,16 @@ def test_terrain_surface_reference_height(monkeypatch):
         torch.tensor([0.129, 0.327, 0.426, 0.624]),
     )
 
-def test_physical_altitude_is_not_transformed_twice():
-    case, cfg = _geometry_fixture()
-    expected = tc.stack_cases([case], cfg)
-
-    physical_case = replace(
-        case,
-        interior=expected.interior,
-        initial_coords=expected.initial_coords,
-        boundary_coords=expected.boundary_coords.reshape_as(
-            case.boundary_coords
-        ),
-    )
-    physical_cfg = replace(
-        cfg,
-        source_z_mode="physical_altitude",
-        source_scaling=cfg.scaling,
-    )
-    actual = tc.stack_cases([physical_case], physical_cfg)
-
-    torch.testing.assert_close(actual.interior, expected.interior)
-    torch.testing.assert_close(actual.initial_coords, expected.initial_coords)
-    torch.testing.assert_close(actual.boundary_coords, expected.boundary_coords)
-
 @pytest.mark.parametrize(
     "changes",
     [
         {"terrain_top_height": 0.0},
+        {"terrain_top_height": 90.0},
         {"terrain_top_height": float("nan")},
         {"terrain_top_height": float("inf")},
         {"fe_surface_reference_z": 0.0},
         {"fe_surface_reference_z": float("nan")},
         {"fe_surface_reference_z": 1000.0},
-        {"source_z_mode": "unknown"},
     ],
 )
 def test_invalid_terrain_configuration(changes):

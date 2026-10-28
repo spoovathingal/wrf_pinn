@@ -1,6 +1,6 @@
 """Residual equations for the simplified Cartesian WRF PINN model.
 
-This module implements the dry neutral boundary layer system described in
+This module implements the reduced moist system with diagnostic SGS closure described in
 ``wrf_pinn.config.physics``:
 
 - local Cartesian coordinates
@@ -13,10 +13,12 @@ expected in coordinate order (x, y, z, t), and state outputs are expected in
 physics-variable order (u, v, w, theta, p_prime, q_v, e_sgs). Coordinates and state outputs may be
 normalized; residual scaling maps them back to physical units before the PDE
 terms are assembled.
+Seven state variables are predicted, but only six PDE residuals are returned.
+SGS TKE enters stresses and diffusivities without a separate transport residual.
 """
 
 from __future__ import annotations
-import math
+
 from collections.abc import Mapping
 from functools import lru_cache
 
@@ -209,7 +211,7 @@ def _validate_physics_config(physics: PhysicsConfig) -> None:
     if physics.active_variables != ("u", "v", "w", "theta", "p_prime", "q_v", "e_sgs"):
         raise ValueError("Residuals currently require active variables u, v, w, theta, p_prime, q_v, e_sgs")
 
-    expected_residuals = ("mass", "x_momentum", "y_momentum", "z_momentum", "potential_temperature", "water_vapor", "sgs_tke")
+    expected_residuals = ("mass", "x_momentum", "y_momentum", "z_momentum", "potential_temperature", "water_vapor")
     if physics.residuals != expected_residuals:
         raise ValueError(f"Residuals require equations {expected_residuals}.")
 
@@ -281,22 +283,17 @@ def _brunt_vaisala_squared(theta: torch.Tensor, theta_z: torch.Tensor, physics: 
 
     return (physics.constants.gravity * theta_z / theta_safe)
 
-def _sgs_delta(physics, like, filter_width):
-    """Resolve the configured width without silently reverting to uniform."""
-    if physics.sgs_filter_width_mode == "uniform":
-        if filter_width is not None:
-            raise ValueError("Do not supply filter_width when SGS width mode is uniform.")
-        return physics.uniform_filter_width
-
-    if physics.sgs_filter_width_mode != "fe_cell_volume":
-        raise ValueError("Unsupported SGS filter-width mode.")
-
+def _sgs_delta(like, filter_width):
+    """Validate and return the required local SGS filter width."""
     if filter_width is None:
-        raise ValueError("fe_cell_volume requires a local filter_width from grid_geometry.")
+        raise ValueError("A local filter_width from grid_geometry is required.")
+
     is_jet = isinstance(like, Jet)
     if isinstance(filter_width, Jet) != is_jet:
         raise TypeError(
-            "Local filter_width must be a Jet for Taylor or a Tensor for autograd.")
+            "Local filter_width must be a Jet for Taylor or a Tensor for autograd."
+        )
+
     width = filter_width.v if is_jet else filter_width
     values = like.v if is_jet else like
 
@@ -312,10 +309,10 @@ def _sgs_delta(physics, like, filter_width):
     return filter_width
 
 def _sgs_mixing_length(n_squared: torch.Tensor, e_sgs: torch.Tensor, physics: PhysicsConfig,
-                        *, filter_width=None):
+                        *, filter_width):
     """Return the SGS mixing length, preserving local-width derivatives."""
 
-    delta = _sgs_delta(physics, e_sgs, filter_width)          # plain floats: no device copy, no sync
+    delta = _sgs_delta(e_sgs, filter_width)
     minimum_length = physics.minimum_mixing_length
 
     numerical_floor = torch.finfo(e_sgs.dtype).tiny
@@ -339,10 +336,10 @@ def _diagnostic_sgs_coefficients(
     e_sgs: torch.Tensor,
     physics: PhysicsConfig,
     *,
-    filter_width=None,
+    filter_width,
 ):
     """Diagnose N^2, mixing length, K_m, and scalar diffusivity."""
-    delta = _sgs_delta(physics, e_sgs, filter_width)
+    delta = _sgs_delta(e_sgs, filter_width)
     n_squared = _brunt_vaisala_squared(theta, theta_z, physics)
     mixing_length = _sgs_mixing_length(n_squared, e_sgs, physics, filter_width=filter_width)
 
@@ -354,26 +351,15 @@ def _diagnostic_sgs_coefficients(
 
     return (n_squared, mixing_length, k_m, k_scalar)
 
-def _sgs_tke_dissipation(rho_d, e_sgs, mixing_length, physics,
-                        *, filter_width=None):
-    """Positive dissipation magnitude, using physical tensor values."""
-    delta = _sgs_delta(physics, e_sgs, filter_width)
-    a_ck = physics.tke_dissipation_mixing_factor * physics.sgs_mixing_coefficient
-    c_e = a_ck + (physics.tke_dissipation_coefficient - a_ck) *(
-        mixing_length / delta)
-
-    e_positive = e_sgs.clamp_min(0.0)
-    return rho_d * c_e * e_positive.pow(1.5) / mixing_length
-
 def cartesian_zero_forcing_residuals(
     coordinates: torch.Tensor,
     state: torch.Tensor,
     physics: PhysicsConfig = DEFAULT_PHYSICS,
     scaling: ResidualScalingConfig = DEFAULT_RESIDUAL_SCALING,
     *,
-    filter_width: torch.Tensor | None = None,
+    filter_width: torch.Tensor,
 ) -> TensorDict:
-    """Compute reduced moist Cartesian continuity and momentum residuals.
+    """Compute six moist Cartesian residuals with TKE-dependent SGS closure.
 
     Parameters
     ----------
@@ -394,8 +380,8 @@ def cartesian_zero_forcing_residuals(
     Returns
     -------
     dict[str, torch.Tensor]
-        Residual tensors keyed by ``mass``, ``x_momentum``, ``y_momentum``,
-        ``z_momentum``, ''potential_temperature'', and "water vapor" Each tensor has shape ``(n_points, 1)``.
+        Residual tensors keyed by ``mass``, ``x_momentum``, ``y_momentum``, ``z_momentum``,
+        ''potential_temperature'', and "water vapor" Each tensor has shape ``(n_points, 1)``.
     """
 
     _validate_physics_config(physics)
@@ -434,7 +420,7 @@ def cartesian_zero_forcing_residuals(
     p_prime_x, p_prime_y, p_prime_z, _p_prime_t = grad_p_prime.split(1, dim=1)
 
     # Diagnose the SGS coefficients from local theta_z and e_sgs.
-    _n_squared, _mixing_length, k_m, k_scalar = _diagnostic_sgs_coefficients(theta,
+    _, _, k_m, k_scalar = _diagnostic_sgs_coefficients(theta,
         theta_z, e_sgs, physics, filter_width=filter_width)
 
     # The current first-pass model uses the same SGS diffusivity for
@@ -568,35 +554,6 @@ def cartesian_zero_forcing_residuals(
         + tau_q_v_x_x + tau_q_v_y_y + tau_q_v_z_z
     )
 
-    # Conservative SGS TKE budget in physical units.
-    grad_e_sgs = _physical_gradient(e_sgs, coordinates, scaling)
-    ge = (e_sgs, grad_e_sgs)
-    tke_storage = _product_gradient(rho, ge)[:, 3:4]
-    tke_advection = (
-        _product_gradient(rho, gu, ge)[:, 0:1]
-        + _product_gradient(rho, gv, ge)[:, 1:2]
-        + _product_gradient(rho, gw, ge)[:, 2:3]
-    )
-
-    # B = -rho_d * K_theta * N^2.
-    tke_buoyancy = -rho_d * k_theta * _n_squared
-    tke_shear = -(
-        tau_xx * u_x + tau_yy * v_y + tau_zz * w_z
-        + tau_xy * (u_y + v_x) + tau_xz * (u_z + w_x) + tau_yz * (v_z + w_y) )
-    
-    tke_dissipation = _sgs_tke_dissipation(rho_d, e_sgs, _mixing_length, physics,
-                    filter_width=filter_width)
-    
-    tke_transport = physics.tke_transport_coefficient * sum(
-        _physical_gradient(
-            rho_d * k_m * grad_e_sgs[:, j:j + 1], coordinates, scaling
-        )[:, j:j + 1] for j in range(3)
-    )
-    sgs_tke = (
-        tke_storage + tke_advection
-        - tke_buoyancy - tke_shear + tke_dissipation - tke_transport
-    )
-
     return {
         "mass": mass,
         "x_momentum": x_momentum,
@@ -604,7 +561,6 @@ def cartesian_zero_forcing_residuals(
         "z_momentum": z_momentum,
         "potential_temperature": potential_temperature,
         "water_vapor": water_vapor,
-        "sgs_tke": sgs_tke,
     }
 
 
@@ -616,8 +572,8 @@ def cartesian_zero_forcing_residuals_taylor(
     scaling: ResidualScalingConfig = DEFAULT_RESIDUAL_SCALING,
     sizes: "torch.Tensor | int | None" = None,
     *,
-    output_config: ConditionalModelConfig | None = None,
-    filter_width: Jet | None = None,
+    output_config: ConditionalModelConfig,
+    filter_width: Jet,
 ) -> TensorDict:
     """The residuals of ``cartesian_zero_forcing_residuals``, without nested autograd.
 
@@ -745,29 +701,6 @@ def cartesian_zero_forcing_residuals_taylor(
         + tau_q_v_x_x + tau_q_v_y_y + tau_q_v_z_z
     )
 
-    # Keep the original energy Jet for conservative and diffusion derivatives.
-    rho_d_e = rho_d * e_sgs
-    tke_storage = rho_d_e.d[3]
-    tke_advection = sum(
-        (rho_d_e * velocity).d[j] for j, velocity in enumerate((u, v, w))
-    )
-
-    tke_buoyancy = -rho_d.v * k_theta.v * _n_squared.v
-    tke_shear = -(
-        tau_xx.v * u_x.v + tau_yy.v * v_y.v + tau_zz.v * w_z.v
-        + tau_xy.v * (u_y.v + v_x.v) + tau_xz.v * (u_z.v + w_x.v) + tau_yz.v * (v_z.v + w_y.v)
-    )
-    tke_dissipation = _sgs_tke_dissipation(rho_d.v, e_sgs.v, _mixing_length.v, physics,
-    filter_width=(None if filter_width is None else filter_width.v))
-    tke_transport = physics.tke_transport_coefficient * sum(
-        (rho_d * k_m * e_sgs.deriv(j)).d[j] for j in range(3)
-    )
-
-    sgs_tke = (
-        tke_storage + tke_advection
-        - tke_buoyancy - tke_shear + tke_dissipation - tke_transport
-    )
-
     return {
         "mass": mass,
         "x_momentum": x_momentum,
@@ -775,5 +708,4 @@ def cartesian_zero_forcing_residuals_taylor(
         "z_momentum": z_momentum,
         "potential_temperature": potential_temperature,
         "water_vapor": water_vapor,
-        "sgs_tke": sgs_tke,
     }

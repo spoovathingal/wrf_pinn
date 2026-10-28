@@ -135,11 +135,15 @@ def _validate_no_penetration_z_wall_inputs(coordinates: torch.Tensor, state: tor
                                            reference_coordinates: torch.Tensor, reference_state: torch.Tensor, 
                                            physics: PhysicsConfig, scaling: ResidualScalingConfig,
                                            surface_stress_scale: float,
+                                           *,
                                            check_values: bool = True,
-                                           terrain_height: "torch.Tensor | None" = None,
-                                           terrain_slopes: "torch.Tensor | None" = None) -> "torch.Tensor | None":
-    """Validate surface-boundary inputs and return the bottom-point mask (None when
-    ``check_values`` is off: every row is taken to be at z=0)."""
+                                           terrain_height: torch.Tensor,
+                                           terrain_slopes: torch.Tensor,
+                                           ) -> "torch.Tensor | None":
+    """Validate surface inputs and return the bottom-point mask.
+    With check_values=False, return None: the caller guarantees that every
+    row lies on the supplied terrain surface, Z = h(x, y).
+    """
     _validate_state(state)
     _validate_state(reference_state)
     if coordinates.ndim != 2 or coordinates.shape[1] != 4:
@@ -163,18 +167,21 @@ def _validate_no_penetration_z_wall_inputs(coordinates: torch.Tensor, state: tor
     if not math.isfinite(surface_stress_scale) or surface_stress_scale <= 0.0:
         raise ValueError("surface_stress_scale must be finite and positive.")
 
-    for name, value, width in (("terrain_height", terrain_height, 1), ("terrain_slopes", terrain_slopes, 2)):
-        if value is not None:
-            if value.shape != (coordinates.shape[0], width):
-                raise ValueError(f"{name} must have shape (num_wall_points, {width}).")
-            if check_values and not torch.isfinite(value).all():
-                raise ValueError(f"{name} must contain only finite values.")
-    
+    for name, value, width in (
+        ("terrain_height", terrain_height, 1), ("terrain_slopes", terrain_slopes, 2),
+    ):
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"{name} must be a Tensor.")
+        if value.shape != (coordinates.shape[0], width):
+            raise ValueError(f"{name} must have shape (num_wall_points, {width}).")
+        if check_values and not torch.isfinite(value).all():
+            raise ValueError(f"{name} must contain only finite values.")
+
     if not check_values:
         return None
 
     z_physical = scaling.z.offset + scaling.z.scale * coordinates[:, 2:3]
-    h = 0.0 if terrain_height is None else terrain_height.to(coordinates)
+    h = terrain_height.to(coordinates)
 
     # Allow float32 roundoff when reconstructing physical height.
     tolerance = max(1.0e-5,
@@ -196,9 +203,8 @@ def no_penetration_z_wall_residuals(
     surface_heat_flux_scale: float = 1.0,
     state_jacobian: "torch.Tensor | None" = None,
     check_values: bool = True,
-    terrain_height: "torch.Tensor | None" = None,
-    terrain_slopes: "torch.Tensor | None" = None,
-    filter_width: "torch.Tensor | None" = None,
+    terrain_height: torch.Tensor, terrain_slopes: torch.Tensor,
+    filter_width: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
     """Return terrain no-penetration, surface stress, and heat-flux residuals.
 
@@ -210,10 +216,13 @@ def no_penetration_z_wall_residuals(
     terrain_height is physical elevation [m]; terrain_slopes contains
     physical (dh/dx, dh/dy).
 
-    filter_width is a physical (N, 1) tensor [m], required in
-    fe_cell_volume mode. It uses the first native cell's vertical spacing,
-    compressed by terrain and extended down to the surface.
-    Pass None in uniform-width mode.
+    terrain_height and terrain_slopes are required, including for flat
+    terrain, where the corresponding elevations/slopes can be zero.
+
+    filter_width is a required physical (N, 1) tensor [m]. It uses the
+    first native cell's vertical spacing, compressed by terrain and
+    extended down to the surface. Supply the values from grid_geometry.
+    A Tensor is used for both the autograd and Taylor boundary paths.
 
     state_jacobian, when supplied, contains derivatives of normalized
     state with respect to physical coordinates, with shape
@@ -293,12 +302,11 @@ def no_penetration_z_wall_residuals(
     # Potential-temperature SGS flux equals the supplied surface flux.
     tau_theta_wall = -rho_wall * k_theta_wall * theta_z
     tau_theta_surface = rho_1 * ht_flux
-    normal_velocity = w_wall
-    if terrain_slopes is not None:
-        slopes = terrain_slopes.to(state)
-        hx = slopes[:, 0:1]
-        hy = slopes[:, 1:2]
-        normal_velocity = (w_wall - u_wall * hx - v_wall * hy) / torch.sqrt(1.0 + hx.square() + hy.square())
+
+    slopes = terrain_slopes.to(state)
+    hx = slopes[:, 0:1]
+    hy = slopes[:, 1:2]
+    normal_velocity = (w_wall - u_wall * hx - v_wall * hy) / torch.sqrt(1.0 + hx.square() + hy.square())
     bottom = (lambda r: r) if bottom_mask is None else (lambda r: r[bottom_mask])
     return {
         "no_penetration_w": normal_velocity / scaling.w.scale, # z = 0 and z = z_max

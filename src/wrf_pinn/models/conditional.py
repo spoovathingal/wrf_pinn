@@ -22,22 +22,15 @@ class ConditionalModelConfig:
     hidden_layers: int = 4
     activation: str = "tanh"
 
-    # Keep legacy checkpoint interpretation explicit. The training driver will
-    # select "softplus" for new runs once the Taylor path supports it.
-    tke_output_mode: str = "linear"
-
     # Dataset normalization: e_physical = tke_offset + tke_scale * e_normalized.
     tke_offset: float = 0.0
     tke_scale: float = 1.0
-
     # Physical units: m^2/s^2.
     tke_floor: float = 1.0e-10
     tke_softplus_scale: float = 1.0
     tke_initial_value: float = 0.01
-    def __post_init__(self) -> None:
-        if self.tke_output_mode not in ("linear", "softplus"):
-            raise ValueError("tke_output_mode must be 'linear' or 'softplus'.")
 
+    def __post_init__(self) -> None:
         for name in (
             "tke_offset", "tke_scale", "tke_floor",
             "tke_softplus_scale", "tke_initial_value",
@@ -61,7 +54,7 @@ class ConditionalModelConfig:
         if not math.isfinite(initial_argument) or initial_argument <= 0.0:
             raise ValueError("Initial TKE/Softplus scale ratio is invalid.")
 
-        if self.tke_output_mode == "softplus" and self.state_dim <= TKE_INDEX:
+        if self.state_dim <= TKE_INDEX:
             raise ValueError("state_dim must include the e_sgs output.")
 
 def transform_state_output(
@@ -69,9 +62,6 @@ def transform_state_output(
     config: ConditionalModelConfig,
 ) -> torch.Tensor:
     """Convert raw outputs to normalized state, enforcing physical TKE positivity."""
-    if config.tke_output_mode == "linear":
-        return raw_state
-
     # Keep the affine conversion and Softplus at least float32, including when
     # the derivative-free network forwards use bf16 autocast.
     if raw_state.dtype in (torch.float16, torch.bfloat16):
@@ -79,18 +69,13 @@ def transform_state_output(
 
     raw_tke = raw_state[:, TKE_INDEX:TKE_INDEX + 1]
     physical_tke = (
-        config.tke_floor
-        + config.tke_softplus_scale
-        * F.softplus(raw_tke, beta=1.0, threshold=20.0)
+        config.tke_floor +
+        config.tke_softplus_scale * F.softplus(raw_tke, beta=1.0, threshold=20.0)
     )
     normalized_tke = (physical_tke - config.tke_offset) / config.tke_scale
 
     return torch.cat(
-        (
-            raw_state[:, :TKE_INDEX],
-            normalized_tke,
-            raw_state[:, TKE_INDEX + 1:],
-        ),
+        (raw_state[:, :TKE_INDEX], normalized_tke, raw_state[:, TKE_INDEX + 1:]),
         dim=1,
     )
 
@@ -104,19 +89,16 @@ class ConditionalModel(nn.Module):
         self.config = config
         self.net = self._build(config.coord_dim + latent_dim, config)
 
-        if config.tke_output_mode == "softplus":
-            # Calibrate the bias to a small physical energy. Random output
-            # weights remain, so the initial field varies around this target.
-            target = (
-                (config.tke_initial_value - config.tke_floor)
-                / config.tke_softplus_scale
-            )
-            bias = (
-                target if target > 20.0
-                else target + math.log(-math.expm1(-target))
-            )
-            with torch.no_grad():
-                self.net[-1].bias[TKE_INDEX] = bias
+        # Calibrate the bias to a small physical energy. Random output
+        # weights remain, so the initial field varies around this target.
+        target = (
+            (config.tke_initial_value - config.tke_floor) / config.tke_softplus_scale
+        )
+        bias = ( target if target > 20.0
+            else target + math.log(-math.expm1(-target)))
+
+        with torch.no_grad():
+            self.net[-1].bias[TKE_INDEX] = bias
 
     @staticmethod
     def _build(in_features: int, config: ConditionalModelConfig) -> nn.Sequential:

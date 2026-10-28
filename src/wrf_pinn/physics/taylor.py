@@ -208,12 +208,13 @@ def _scale_column(scales: tuple[float, ...], device: torch.device,
     return torch.tensor(scales, dtype=dtype, device=device)[:, None]
 
 def transform_state_jet(
-    raw: Jet,
-    output_config: ConditionalModelConfig | None,
+    raw: Jet, output_config: ConditionalModelConfig,
 ) -> Jet:
     """Apply the model's output transform to values and coordinate derivatives."""
-    if output_config is None or output_config.tke_output_mode == "linear":
-        return raw
+    if output_config is None:
+        raise ValueError(
+            "Pass model.config; Taylor derivatives require the model's TKE normalization."
+        )
 
     values = transform_state_output(raw.v, output_config)
     sl = slice(TKE_INDEX, TKE_INDEX + 1)
@@ -279,7 +280,7 @@ def taylor_forward(net: nn.Sequential, coordinates: torch.Tensor, z_rows: torch.
                    coordinate_scales: Sequence[float], second: bool = True,
                    sizes: "torch.Tensor | int | None" = None,
                    *,
-                   output_config: ConditionalModelConfig | None = None) -> Jet:
+                   output_config: ConditionalModelConfig) -> Jet:
     """Network outputs with first (x, y, z, t) and spatial second derivatives.
 
     ``net`` is a Sequential of Linear layers with Tanh between them, fed
@@ -289,7 +290,11 @@ def taylor_forward(net: nn.Sequential, coordinates: torch.Tensor, z_rows: torch.
     derivatives only (5 channels instead of 11; the result has ``h=None``).
     With ``sizes``, ``z_rows`` is one latent row per case (see
     ``ConditionalModel.forward``) and is multiplied through the first layer once per
-    case; it carries no coordinate derivatives either way."""
+    case; it carries no coordinate derivatives either way.
+    ``output_config`` must be the corresponding ``model.config``. The returned
+    values include the model's TKE Softplus transformation, and its derivatives
+    include the same transformation through the chain rule.
+    """
     layers = list(net)
     if not (isinstance(layers[0], nn.Linear) and isinstance(layers[-1], nn.Linear)
             and all(isinstance(m, nn.Tanh) for m in layers[1::2])
