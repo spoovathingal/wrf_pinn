@@ -103,6 +103,9 @@ def main() -> int:
         "--boundary-weight", type=float, default=1.0,
         help="weight of the flow-boundary (side faces) loss")
     ap.add_argument(
+        "--pde-weight", type=float, default=1.0,
+        help="weight of the PDE loss (e.g. ~2e-6 with --predict-change, whose PDE starts ~3e5x its data loss)")
+    ap.add_argument(
         "--tke-weight", type=float, default=1.0,
         help="Relative SGS TKE weight within the PDE loss; 0 disables this term")
     ap.add_argument(
@@ -199,7 +202,7 @@ def main() -> int:
             readers=args.readers, loader_workers=args.loader_workers, device=device,
             log_every=args.log_every,
             learning_rate=args.lr, learning_rate_min=args.lr_min,
-            weight_flow_boundary=args.boundary_weight,
+            weight_flow_boundary=args.boundary_weight, weight_pde=args.pde_weight,
             source_scaling=source_scaling, source_z_mode=args.source_z_mode, scaling=scaling,
             terrain_top_height=args.terrain_top_height, fe_surface_reference_z=args.fe_surface_reference_z,
             physics=physics, tke_weight=args.tke_weight, tke_residual_scale=args.tke_residual_scale,
@@ -219,12 +222,12 @@ def main() -> int:
         log.info(
             "device=%s; local cases=%d/%d; latent dim=%d; "
             "batch/GPU=%d; global batch=%d; q_v conversion=%g; mode=%s; "
-            "lr=%g->%s; boundary weight=%g; tke weight=%g; latent=%s; params=%d",
+            "lr=%g->%s; boundary weight=%g; pde weight=%g; tke weight=%g; latent=%s; params=%d",
             device, len(paths), len(all_paths), z_dim,
             batch_cases, batch_cases * world,
             args.q_v_to_kg_per_kg,
             "lazy" if args.lazy else "resident",
-            args.lr, args.lr_min, args.boundary_weight, args.tke_weight,
+            args.lr, args.lr_min, args.boundary_weight, args.pde_weight, args.tke_weight,
             args.latent, sum(p.numel() for p in model.parameters()),
         )
 
