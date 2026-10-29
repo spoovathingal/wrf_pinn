@@ -547,6 +547,18 @@ def test_encoder_split_recovers_fields():
     np.testing.assert_array_equal(bnd.numpy(), want)
     assert enc(z).shape == (2, 8)
 
+    # input stats standardize every (variable, level) of both parts; old state dicts still load
+    mean, std = torch.rand(nv, nz), torch.rand(nv, nz) + 0.5
+    old = {k: v for k, v in enc.state_dict().items() if not k.startswith("in_")}
+    enc.set_input_stats(mean, std)
+    ini, bnd = enc.split(z)
+    m, s = mean.numpy()[None, :, :, None, None], std.numpy()[None, :, :, None, None]
+    np.testing.assert_allclose(ini.numpy(), (grid - m) / s, rtol=1e-5, atol=1e-6)
+    want_std = ((faces.transpose(0, 1, 2, 5, 3, 4) - m[:, None, ..., 0]) / s[:, None, ..., 0])
+    np.testing.assert_allclose(bnd.numpy(), want_std.reshape(2 * nf, nt * nv, nz, fw), rtol=1e-5, atol=1e-6)
+    enc.load_state_dict(old)
+    np.testing.assert_array_equal(enc.split(z)[0].numpy(), grid)
+
 
 @pytest.mark.parametrize("latent", ["raw", "encoder"])
 def test_raw_and_encoder_latents_train(tmp_path, latent):

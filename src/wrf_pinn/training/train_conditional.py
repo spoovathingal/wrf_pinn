@@ -729,6 +729,22 @@ def train_conditional(
     if world > 1:  # every process starts from rank 0's weights
         for p in model.parameters():
             dist.broadcast(p.data, src=0)
+    # Collapse check on log steps: share of saturated first-tanh units, and the latent's spread
+    # across this step's cases relative to its size (near 0: every case looks the same).
+    watch = {"on": False, "sat": [], "lat": []}
+
+    def _saturation(module, inputs, out):
+        if watch["on"]:
+            watch["sat"].append((out.detach().abs() > 0.99).float().mean())
+
+    def _latent(module, inputs, out):
+        if watch["on"]:
+            watch["lat"].append(out.detach())
+    net = getattr(model, "net", None)
+    if isinstance(net, nn.Sequential) and len(net) > 1 and isinstance(net[1], nn.Tanh):
+        net[1].register_forward_hook(_saturation)
+    if getattr(model, "latent_norm", None) is not None:
+        model.latent_norm.register_forward_hook(_latent)
     # Resident cases live in HOST memory; only the per-step batch is moved to the GPU.
     if cases is not None:
         cases = [c.as_torch(device="cpu") for c in cases]
@@ -794,6 +810,7 @@ def train_conditional(
         for group in optimizer.param_groups:
             group["lr"] = lr
         optimizer.zero_grad()
+        watch["on"] = rank == 0 and (epoch == 1 or epoch == config.epochs or epoch % config.log_every == 0)
         # Gradient accumulation: each pass's loss is weighted by its share of the
         # batch, so the summed gradients equal one pass over all k cases.
         losses = torch.zeros(1 + len(weights), device=device)
@@ -863,6 +880,15 @@ def train_conditional(
                   f"lr={lr:.2e} {s_step:.2f}s/step wait={wait_window / steps_window * 1e3:.0f}ms/step "
                   f"elapsed={(now - t_start) / 3600:.2f}h eta={eta_h:.2f}h{mem}",
                   file=sys.stderr, flush=True)
+            if watch["sat"] or watch["lat"]:
+                msg = f"  collapse check: first tanh saturated {torch.stack(watch['sat']).mean():.3f}" if watch["sat"] else "  collapse check:"
+                if len(watch["lat"]) > 0:
+                    L = torch.cat(watch["lat"])
+                    if L.shape[0] > 1:
+                        msg += (f", latent spread across {L.shape[0]} cases "
+                                f"{((L - L.mean(0)).norm(dim=1).mean() / L.norm(dim=1).mean()):.4f}")
+                print(msg, file=sys.stderr, flush=True)
+            watch["sat"].clear(); watch["lat"].clear()
             if prof is not None:
                 tot = sum(prof.values()) or 1.0
                 print(f"  profile/epoch(avg over {epoch}): "

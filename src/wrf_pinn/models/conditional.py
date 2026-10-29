@@ -25,7 +25,9 @@ class ConditionalModelConfig:
 class RawEncoder(nn.Module):
     """Raw z (bnd_raw then ini_raw, flattened per case) -> latent. 3-D convs over the
     initial field (n_state, nz, nx, ny); 2-D convs over each side face, with times x
-    state as channels (n_times*n_state, nz, face width); one linear head on both."""
+    state as channels (n_times*n_state, nz, face width); one linear head on both.
+    Inputs are first standardized per state variable and level (``in_mean``, ``in_std``,
+    set by ``set_input_stats``; 0 and 1 until then, and for checkpoints saved before them)."""
 
     def __init__(self, ini_shape: tuple[int, int, int, int],
                  bnd_shape: tuple[int, int, int, int], out_dim: int = 256,
@@ -33,6 +35,8 @@ class RawEncoder(nn.Module):
         super().__init__()
         self.ini_shape, self.bnd_shape, self.out_dim = tuple(ini_shape), tuple(bnd_shape), out_dim
         nv, nz, nx, ny = ini_shape
+        self.register_buffer("in_mean", torch.zeros(nv, nz))
+        self.register_buffer("in_std", torch.ones(nv, nz))
         nf, nt, fl, _ = bnd_shape
         self.n_bnd = nf * nt * fl * nv
         conv = lambda C, cin: nn.Sequential(
@@ -51,9 +55,21 @@ class RawEncoder(nn.Module):
         k = z.shape[0]
         nf, nt, fl, nv = self.bnd_shape
         nz = self.ini_shape[1]
-        bnd = (z[:, :self.n_bnd].reshape(k, nf, nt, nz, fl // nz, nv)
-               .permute(0, 1, 2, 5, 3, 4).reshape(k * nf, nt * nv, nz, fl // nz))
-        return z[:, self.n_bnd:].reshape(k, *self.ini_shape), bnd
+        m, s = self.in_mean[..., None], self.in_std[..., None]                    # (nv, nz, 1)
+        bnd = ((z[:, :self.n_bnd].reshape(k, nf, nt, nz, fl // nz, nv).permute(0, 1, 2, 5, 3, 4) - m) / s
+               ).reshape(k * nf, nt * nv, nz, fl // nz)
+        ini = (z[:, self.n_bnd:].reshape(k, *self.ini_shape) - m[..., None]) / s[..., None]
+        return ini, bnd
+
+    def set_input_stats(self, mean: torch.Tensor, std: torch.Tensor) -> None:
+        """Per (state variable, level) mean and spread of the raw fields, (n_state, nz)."""
+        self.in_mean.copy_(mean)
+        self.in_std.copy_(std.clamp_min(1e-6))
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        for name, fill in (("in_mean", torch.zeros_like), ("in_std", torch.ones_like)):
+            state_dict.setdefault(prefix + name, fill(getattr(self, name)))
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         ini, bnd = self.split(z)

@@ -37,6 +37,17 @@ def _scaling_from_recipe(recipe: dict) -> ResidualScalingConfig:
     })
 
 
+def _raw_input_stats(paths: list[Path], n: int = 256) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mean and spread per (state variable, level) of the raw initial field over n training
+    cases spread evenly through the sorted list (the same on every rank)."""
+    pick = paths[::max(1, len(paths) // n)][:n]
+    ini = np.stack([np.load(p)["ini_raw"].astype(np.float64) for p in pick])    # (n, nv, nz, nxy)
+    mean, std = ini.mean(axis=(0, 3)), ini.std(axis=(0, 3))
+    log.info("encoder input stats from %d cases: std per variable (level mean) %s",
+             len(pick), np.array2string(std.mean(1), precision=4))
+    return torch.as_tensor(mean, dtype=torch.float32), torch.as_tensor(std, dtype=torch.float32)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("cases_dir", type=Path)
@@ -189,6 +200,7 @@ def main() -> int:
                 nv = blob["ini_raw"].shape[0]
                 bnd_shape = blob["bnd_raw"].shape
             encoder = RawEncoder((nv, nz, nx, ny), bnd_shape, args.encoder_dim)
+            encoder.set_input_stats(*_raw_input_stats(all_paths))
         elif args.latent == "raw":
             encoder = RawProjection(z_dim, args.encoder_dim)
 
