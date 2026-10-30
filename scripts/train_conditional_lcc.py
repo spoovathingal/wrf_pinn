@@ -48,6 +48,17 @@ def _raw_input_stats(paths: list[Path], n: int = 256) -> tuple[torch.Tensor, tor
     return torch.as_tensor(mean, dtype=torch.float32), torch.as_tensor(std, dtype=torch.float32)
 
 
+def _terrain_stats(paths: list[Path], n: int = 256) -> tuple[float, float, float]:
+    """Mean and spread of subdomain-mean ground height, and spread of height about each
+    subdomain's mean (m), over the same n training cases as _raw_input_stats."""
+    pick = paths[::max(1, len(paths) // n)][:n]
+    h = np.stack([np.load(p)["terrain"][:, 2].astype(np.float64) for p in pick])     # (n, nx*ny)
+    mean = h.mean(axis=1)
+    stats = float(mean.mean()), float(mean.std()), float((h - mean[:, None]).std())
+    log.info("terrain stats from %d cases: subdomain mean %.0f +- %.0f m, shape spread %.1f m", len(pick), *stats)
+    return stats
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("cases_dir", type=Path)
@@ -129,6 +140,8 @@ def main() -> int:
         "--predict-change", action="store_true",
         help="state = initial field + (t - t0)/T * network (needs --keep-raw cases)")
     ap.add_argument("--encoder-dim", type=int, default=256, help="encoder latent size")
+    ap.add_argument("--terrain-input", action="store_true",
+                    help="the encoder also reads each subdomain's ground height map (--latent encoder)")
     args = ap.parse_args()
 
     if not 0.0 < args.terrain_top_height < float("inf"):
@@ -191,7 +204,9 @@ def main() -> int:
             )
 
         # All ranks construct an identical model.
-        read_latent = "pod" if args.latent == "pod" else "raw"
+        if args.terrain_input and args.latent != "encoder":
+            raise ValueError("--terrain-input needs --latent encoder")
+        read_latent = "pod" if args.latent == "pod" else "raw_terrain" if args.terrain_input else "raw"
         z_dim = read_conditional_case(all_paths[0], read_latent).z.shape[0]
         encoder = None
         if args.latent == "encoder":
@@ -199,8 +214,10 @@ def main() -> int:
                 nx, ny, nz = (int(v) for v in blob["initial_grid"])
                 nv = blob["ini_raw"].shape[0]
                 bnd_shape = blob["bnd_raw"].shape
-            encoder = RawEncoder((nv, nz, nx, ny), bnd_shape, args.encoder_dim)
+            encoder = RawEncoder((nv, nz, nx, ny), bnd_shape, args.encoder_dim, terrain=args.terrain_input)
             encoder.set_input_stats(*_raw_input_stats(all_paths))
+            if args.terrain_input:
+                encoder.set_terrain_stats(*_terrain_stats(all_paths))
         elif args.latent == "raw":
             encoder = RawProjection(z_dim, args.encoder_dim)
 

@@ -157,16 +157,25 @@ def decode_initial(blob) -> dict:
     return out
 
 
+def terrain_grid(terrain) -> np.ndarray:
+    """Terrain rows (x, y, elevation) -> elevations (nx*ny,), x slow like ini_raw."""
+    t = np.asarray(terrain, dtype=np.float64)
+    return t[np.lexsort((t[:, 1], t[:, 0])), 2]
+
+
 def latent_vector(blob, latent: str = "pod") -> np.ndarray:
     """Concatenate the case's POD coeffs into the conditioning latent z. Order is
     fixed (boundary faces then initial, by STATE_VARS) so z is consistent across cases.
     latent='raw': the normalized raw fields instead, bnd_raw (n_faces, n_times,
-    face_len, n_state) then ini_raw (n_state, nz, nx*ny), flattened (needs --keep-raw)."""
-    if latent == "raw":
-        return np.concatenate([blob["bnd_raw"].reshape(-1),
-                               blob["ini_raw"].reshape(-1)]).astype(np.float32)
+    face_len, n_state) then ini_raw (n_state, nz, nx*ny), flattened (needs --keep-raw).
+    latent='raw_terrain': the same, then the ground height (m) on the grid (terrain_grid)."""
+    if latent in ("raw", "raw_terrain"):
+        parts = [blob["bnd_raw"].reshape(-1), blob["ini_raw"].reshape(-1)]
+        if latent == "raw_terrain":
+            parts.append(terrain_grid(blob["terrain"]))
+        return np.concatenate(parts).astype(np.float32)
     if latent != "pod":
-        raise ValueError(f"latent must be 'pod' or 'raw', got {latent!r}.")
+        raise ValueError(f"latent must be 'pod', 'raw' or 'raw_terrain', got {latent!r}.")
     nf = sum(1 for k in blob.files if k.startswith(f"bnd_modes_{STATE_VARS[0]}_"))
     parts = []
     for var in STATE_VARS:

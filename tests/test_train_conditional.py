@@ -581,3 +581,55 @@ def test_raw_and_encoder_latents_train(tmp_path, latent):
     hist = train_conditional(model, config=cfg, case_paths=paths)
     assert hist.total[-1] < hist.total[0]
     assert any(not torch.equal(a, p) for a, p in zip(before, (encoder or model).parameters()))
+
+
+def _add_terrain_grid(path, seed: int) -> np.ndarray:
+    """Replace the case's terrain with a shuffled 3 x 3 grid; returns heights (x, y)."""
+    h = np.random.default_rng(seed + 200).random((3, 3)).astype(np.float32) * 300
+    xs, ys = np.meshgrid(np.arange(3.0), np.arange(3.0), indexing="ij")
+    rows = np.column_stack([xs.ravel(), ys.ravel(), h.ravel()]).astype(np.float32)
+    with np.load(path) as blob:
+        members = dict(blob)
+    members["terrain"] = rows[np.random.default_rng(seed).permutation(9)]
+    np.savez(path, **members)
+    return h
+
+
+def test_terrain_latent_and_encoder_channels(tmp_path):
+    """raw_terrain z ends with the heights x slow; the encoder reads shape and mean channels."""
+    from wrf_pinn.data.conditional_case import read_conditional_case
+    from wrf_pinn.models.conditional import RawEncoder
+    ini, bnd = _write_raw_case_npz(tmp_path / "c0.npz", 0)
+    h = _add_terrain_grid(tmp_path / "c0.npz", 0)
+    z = read_conditional_case(tmp_path / "c0.npz", "raw_terrain").z
+    np.testing.assert_array_equal(z, np.concatenate([bnd.ravel(), ini.ravel(), h.ravel()]))
+    enc = RawEncoder((7, 4, 3, 3), bnd.shape, out_dim=8, width=4, terrain=True)
+    enc.set_terrain_stats(100.0, 50.0, 20.0)
+    ch = enc.split_terrain(torch.from_numpy(z)[None]).numpy()[0]
+    np.testing.assert_allclose(ch[0], (h - h.mean()) / 20.0, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(ch[1], np.full((3, 3), (h.mean() - 100.0) / 50.0), rtol=1e-5)
+    np.testing.assert_array_equal(enc.split(torch.from_numpy(z)[None])[0].numpy()[0], ini.reshape(7, 4, 3, 3))
+    z2 = torch.from_numpy(z)[None].clone()
+    z2[0, -9:] += torch.from_numpy(np.linspace(0, 200, 9, dtype=np.float32))  # a different hill
+    assert not torch.equal(enc(torch.from_numpy(z)[None]), enc(z2))
+
+
+def test_terrain_encoder_trains(tmp_path):
+    from wrf_pinn.data.conditional_case import read_conditional_case
+    from wrf_pinn.models.conditional import RawEncoder
+    paths = []
+    for i in range(6):
+        _write_raw_case_npz(tmp_path / f"c{i}.npz", i)
+        _add_terrain_grid(tmp_path / f"c{i}.npz", i)
+        paths.append(str(tmp_path / f"c{i}.npz"))
+    torch.manual_seed(0)
+    z_dim = read_conditional_case(paths[0], "raw_terrain").z.shape[0]
+    with np.load(paths[0]) as b:
+        encoder = RawEncoder((7, 4, 3, 3), b["bnd_raw"].shape, out_dim=8, width=4, terrain=True)
+    model = ConditionalModel(z_dim, ConditionalModelConfig(hidden_layers=2, hidden_width=32), encoder)
+    cfg = ConditionalTrainConfig(epochs=60, batch_cases=4, cases_per_pass=2, device="cpu",
+                                 log_every=100, latent="raw_terrain", **_DATA_ONLY)
+    before = [p.detach().clone() for p in encoder.ter.parameters()]
+    hist = train_conditional(model, config=cfg, case_paths=paths)
+    assert hist.total[-1] < hist.total[0]
+    assert any(not torch.equal(a, p) for a, p in zip(before, encoder.ter.parameters()))

@@ -27,18 +27,23 @@ class RawEncoder(nn.Module):
     initial field (n_state, nz, nx, ny); 2-D convs over each side face, with times x
     state as channels (n_times*n_state, nz, face width); one linear head on both.
     Inputs are first standardized per state variable and level (``in_mean``, ``in_std``,
-    set by ``set_input_stats``; 0 and 1 until then, and for checkpoints saved before them)."""
+    set by ``set_input_stats``; 0 and 1 until then, and for checkpoints saved before them).
+    terrain=True: z ends with the ground height (m) on the grid (nx*ny, x slow), read by
+    2-D convs as two channels: the shape (height minus the subdomain mean, over
+    ``ter_stats[2]``) and the subdomain mean ((mean - ter_stats[0]) / ter_stats[1])."""
 
     def __init__(self, ini_shape: tuple[int, int, int, int],
                  bnd_shape: tuple[int, int, int, int], out_dim: int = 256,
-                 width: int = 32) -> None:
+                 width: int = 32, terrain: bool = False) -> None:
         super().__init__()
         self.ini_shape, self.bnd_shape, self.out_dim = tuple(ini_shape), tuple(bnd_shape), out_dim
+        self.terrain = terrain
         nv, nz, nx, ny = ini_shape
         self.register_buffer("in_mean", torch.zeros(nv, nz))
         self.register_buffer("in_std", torch.ones(nv, nz))
         nf, nt, fl, _ = bnd_shape
         self.n_bnd = nf * nt * fl * nv
+        self.n_ini = nv * nz * nx * ny
         conv = lambda C, cin: nn.Sequential(
             C(cin, width, 3, 2, 1), nn.GELU(), C(width, 2 * width, 3, 2, 1), nn.GELU(),
             C(2 * width, 4 * width, 3, 2, 1), nn.GELU(), nn.Flatten())
@@ -47,7 +52,13 @@ class RawEncoder(nn.Module):
         with torch.no_grad():
             n_ini = self.ini(torch.zeros(1, nv, nz, nx, ny)).shape[1]
             n_face = self.bnd(torch.zeros(1, nt * nv, nz, fl // nz)).shape[1]
-        self.head = nn.Linear(n_ini + nf * n_face, out_dim)
+        n_ter = 0
+        if terrain:
+            self.register_buffer("ter_stats", torch.tensor([0.0, 1.0, 1.0]))
+            self.ter = conv(nn.Conv2d, 2)
+            with torch.no_grad():
+                n_ter = self.ter(torch.zeros(1, 2, nx, ny)).shape[1]
+        self.head = nn.Linear(n_ini + nf * n_face + n_ter, out_dim)
 
     def split(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """z (k, n) -> initial (k, n_state, nz, nx, ny) and faces (k*n_faces,
@@ -58,8 +69,19 @@ class RawEncoder(nn.Module):
         m, s = self.in_mean[..., None], self.in_std[..., None]                    # (nv, nz, 1)
         bnd = ((z[:, :self.n_bnd].reshape(k, nf, nt, nz, fl // nz, nv).permute(0, 1, 2, 5, 3, 4) - m) / s
                ).reshape(k * nf, nt * nv, nz, fl // nz)
-        ini = (z[:, self.n_bnd:].reshape(k, *self.ini_shape) - m[..., None]) / s[..., None]
+        ini = (z[:, self.n_bnd:self.n_bnd + self.n_ini].reshape(k, *self.ini_shape) - m[..., None]) / s[..., None]
         return ini, bnd
+
+    def split_terrain(self, z: torch.Tensor) -> torch.Tensor:
+        """z (k, n) -> terrain channels (k, 2, nx, ny): shape and subdomain mean, standardized."""
+        h = z[:, self.n_bnd + self.n_ini:].reshape(z.shape[0], *self.ini_shape[2:])
+        mean = h.mean(dim=(1, 2), keepdim=True)
+        level = ((mean - self.ter_stats[0]) / self.ter_stats[1]).expand_as(h)
+        return torch.stack([(h - mean) / self.ter_stats[2], level], dim=1)
+
+    def set_terrain_stats(self, mean: float, std: float, shape_std: float) -> None:
+        """Mean and spread of subdomain-mean height, and spread of height about it (m)."""
+        self.ter_stats.copy_(torch.tensor([mean, max(std, 1e-6), max(shape_std, 1e-6)]))
 
     def set_input_stats(self, mean: torch.Tensor, std: torch.Tensor) -> None:
         """Per (state variable, level) mean and spread of the raw fields, (n_state, nz)."""
@@ -73,7 +95,10 @@ class RawEncoder(nn.Module):
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         ini, bnd = self.split(z)
-        return self.head(torch.cat([self.ini(ini), self.bnd(bnd).reshape(z.shape[0], -1)], dim=1))
+        parts = [self.ini(ini), self.bnd(bnd).reshape(z.shape[0], -1)]
+        if self.terrain:
+            parts.append(self.ter(self.split_terrain(z)))
+        return self.head(torch.cat(parts, dim=1))
 
 
 class RawProjection(nn.Linear):
