@@ -11,7 +11,7 @@ import torch
 import math
 
 from wrf_pinn.config.physics import DEFAULT_PHYSICS, PhysicsConfig
-from wrf_pinn.physics.residuals_pde import _diagnose_moist_state, _diagnostic_sgs_coefficients, _physical_gradient
+from wrf_pinn.physics.residuals_pde import _diagnostic_sgs_coefficients, _physical_gradient
 from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING, ResidualScalingConfig
 
 
@@ -110,26 +110,19 @@ def no_slip_wall_residuals(
         "no_slip_w": w/scaling.w.scale,
     }
 
-def _physical_density_from_state(coordinates: torch.Tensor, state: torch.Tensor,
+def _physical_density_from_state(state: torch.Tensor,
                                  physics: PhysicsConfig, scaling: ResidualScalingConfig) -> torch.Tensor:
-    """Calculate physical dry-air density from theta and p-prime."""
+    """Calculate physical dry-air density from model prediction."""
+    if state.shape[1] != physics.state_dim:
+        raise ValueError(
+            f"Expected {physics.state_dim} state columns, including rho_d; "
+            f"got {state.shape[1]}."
+        )
 
-    theta_index = physics.variable_index("theta")
-    p_prime_index = physics.variable_index("p_prime")
-    q_v_index = physics.variable_index("q_v")
+    rho_d_index = physics.variable_index("rho_d")
+    rho_d_normalized = state[:, rho_d_index:rho_d_index + 1]
 
-    theta_normalized = state[:, theta_index : theta_index + 1]
-    p_prime_normalized = state[:, p_prime_index : p_prime_index + 1]
-    q_v_normalized = state[:, q_v_index : q_v_index + 1]
-
-    theta = scaling.theta.offset + scaling.theta.scale * theta_normalized
-    p_prime = scaling.p_prime.offset + scaling.p_prime.scale * p_prime_normalized
-    q_v = scaling.q_v.offset + scaling.q_v.scale * q_v_normalized
-    z = scaling.z.offset + scaling.z.scale * coordinates[:, 2:3]
-
-    _, _, rho_d, _, _, _ = _diagnose_moist_state(theta=theta, p_prime=p_prime, q_v=q_v, z=z, physics=physics)
-
-    return rho_d
+    return scaling.rho_d.offset + scaling.rho_d.scale * rho_d_normalized
 
 def _validate_no_penetration_z_wall_inputs(coordinates: torch.Tensor, state: torch.Tensor,
                                            reference_coordinates: torch.Tensor, reference_state: torch.Tensor, 
@@ -158,11 +151,13 @@ def _validate_no_penetration_z_wall_inputs(coordinates: torch.Tensor, state: tor
     if reference_state.shape[0] != reference_coordinates.shape[0]:
         raise ValueError("reference_state and reference_coordinates must have the same number of rows.")
 
-    if state.shape[1] < physics.state_dim:
-        raise ValueError("state has too few columns for the configured physics variables.")
+    if state.shape[1] != physics.state_dim:
+        raise ValueError(
+            f"state must contain exactly {physics.state_dim} columns, including rho_d.")
 
-    if reference_state.shape[1] < physics.state_dim:
-        raise ValueError("reference_state has too few columns for the configured physics variables.")
+    if reference_state.shape[1] != physics.state_dim:
+        raise ValueError(
+            f"reference_state must contain exactly {physics.state_dim} columns, including rho_d.")
 
     if not math.isfinite(surface_stress_scale) or surface_stress_scale <= 0.0:
         raise ValueError("surface_stress_scale must be finite and positive.")
@@ -269,8 +264,8 @@ def no_penetration_z_wall_residuals(
     u_1 = scaling.u.offset + scaling.u.scale * reference_state[:, u_index : u_index + 1]
     v_1 = scaling.v.offset + scaling.v.scale * reference_state[:, v_index : v_index + 1]
 
-    rho_wall = _physical_density_from_state(coordinates, state, physics, scaling)
-    rho_1 = _physical_density_from_state(reference_coordinates, reference_state, physics, scaling)
+    rho_wall = _physical_density_from_state(state, physics, scaling)
+    rho_1 = _physical_density_from_state(reference_state, physics, scaling)
 
     if state_jacobian is not None:
         grad = lambda name, i: getattr(scaling, name).scale * state_jacobian[:, :, i].T

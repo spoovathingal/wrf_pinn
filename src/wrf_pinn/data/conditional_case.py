@@ -12,7 +12,7 @@ import torch
 import numpy as np
 
 #: Variables carried in the conditioning fields and predicted by the model.
-STATE_VARS: tuple[str, ...] = ("u", "v", "w", "theta", "p_prime", "q_v", "e_sgs")
+STATE_VARS: tuple[str, ...] = ("u", "v", "w", "theta", "p_prime", "q_v", "e_sgs", "rho_d")
 #: Interior sample coordinate columns.
 COORD_NAMES: tuple[str, ...] = ("x", "y", "z", "t")
 #: The four open side faces of a sub-domain, in a fixed order.
@@ -91,6 +91,34 @@ def read_conditional_case(npz_path: str | Path) -> ConditionalCase:
         if missing:
             raise ValueError(f"Case {path} missing members: {missing}.")
         members = {k: blob[k].astype(np.float32) for k in _CASE_MEMBERS}
+        targets = members["targets"]
+
+        if targets.ndim != 2 or targets.shape[1] != len(STATE_VARS):
+            raise ValueError(
+                f"Case {path} targets must have {len(STATE_VARS)} columns "
+                f"in order {STATE_VARS}; got shape {targets.shape}. "
+                "Regenerate the case with dry-air density included."
+            )
+        if targets.shape[0] != members["interior"].shape[0]:
+            raise ValueError(
+                f"Case {path} has different numbers of targets and interior coordinates."
+            )
+
+        required_pod = [
+            f"ini_{part}_{var}" for var in STATE_VARS
+            for part in ("mean", "modes", "coeffs")
+        ]
+        required_pod += [
+            f"bnd_{part}_{var}_{face}" for var in STATE_VARS
+            for face in range(len(FACE_NAMES)) for part in ("mean", "modes", "coeffs")
+        ]
+        missing_pod = [key for key in required_pod if key not in blob.files]
+        if missing_pod:
+            raise ValueError(
+                f"Case {path} is missing required POD arrays: {missing_pod}. "
+                "Regenerate the case with all eight state variables."
+            )
+
         bnd = decode_boundary(blob)
         ini = decode_initial(blob)
         members["z"] = latent_vector(blob)
@@ -165,8 +193,15 @@ class ConditionalMetadata:
     def load(cls, path: str | Path) -> "ConditionalMetadata":
         raw = json.loads(Path(path).read_text())
         schema = raw.get("schema", {})
+        state_vars = tuple(schema.get("state_vars", ()))
+
+        if state_vars != STATE_VARS:
+            raise ValueError(
+                f"Metadata {path} must declare state_vars={STATE_VARS}; "
+                f"got {state_vars}. Regenerate the dataset with rho_d included.")
+
         return cls(
-            state_vars=tuple(schema.get("state_vars", STATE_VARS)),
+            state_vars=state_vars,
             coord_names=tuple(schema.get("coord_names", COORD_NAMES)),
             normalization=raw.get("normalization", {}),
         )

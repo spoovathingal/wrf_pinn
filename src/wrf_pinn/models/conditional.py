@@ -14,6 +14,8 @@ from torch.nn import functional as F
 from wrf_pinn.config.physics import DEFAULT_PHYSICS
 
 TKE_INDEX = DEFAULT_PHYSICS.variable_index("e_sgs")
+RHO_D_INDEX = DEFAULT_PHYSICS.variable_index("rho_d")
+
 @dataclass(frozen=True)
 class ConditionalModelConfig:
     coord_dim: int = 4
@@ -29,55 +31,77 @@ class ConditionalModelConfig:
     tke_floor: float = 1.0e-10
     tke_softplus_scale: float = 1.0
     tke_initial_value: float = 0.01
+    # Dataset normalization:
+    # rho_physical = rho_d_offset + rho_d_scale * rho_normalized.
+    rho_d_offset: float = 0.0
+    rho_d_scale: float = 1.0
+
+    # Physical units: kg/m^3.
+    rho_d_floor: float = 1.0e-6
+    rho_d_softplus_scale: float = 1.0
+    rho_d_initial_value: float = 1.0
 
     def __post_init__(self) -> None:
-        for name in (
-            "tke_offset", "tke_scale", "tke_floor",
-            "tke_softplus_scale", "tke_initial_value",
-        ):
-            if not math.isfinite(getattr(self, name)):
-                raise ValueError(f"{name} must be finite.")
+        if self.state_dim != DEFAULT_PHYSICS.state_dim:
+            raise ValueError(
+                f"state_dim must be {DEFAULT_PHYSICS.state_dim}, "
+                "including the rho_d output."
+            )
 
-        if self.tke_scale <= 0.0:
-            raise ValueError("tke_scale must be positive.")
-        if self.tke_softplus_scale <= 0.0:
-            raise ValueError("tke_softplus_scale must be positive.")
-        if self.tke_floor < 0.0:
-            raise ValueError("tke_floor must be nonnegative.")
-        if self.tke_initial_value <= self.tke_floor:
-            raise ValueError("tke_initial_value must exceed tke_floor.")
+        for prefix in ("tke", "rho_d"):
+            for suffix in ("offset", "scale", "floor","softplus_scale", "initial_value"):
+                name = f"{prefix}_{suffix}"
+                if not math.isfinite(getattr(self, name)):
+                    raise ValueError(f"{name} must be finite.")
 
-        initial_argument = (
-            (self.tke_initial_value - self.tke_floor)
-            / self.tke_softplus_scale
-        )
-        if not math.isfinite(initial_argument) or initial_argument <= 0.0:
-            raise ValueError("Initial TKE/Softplus scale ratio is invalid.")
+            scale = getattr(self, f"{prefix}_scale")
+            floor = getattr(self, f"{prefix}_floor")
+            softplus_scale = getattr(self, f"{prefix}_softplus_scale")
+            initial_value = getattr(self, f"{prefix}_initial_value")
 
-        if self.state_dim <= TKE_INDEX:
-            raise ValueError("state_dim must include the e_sgs output.")
+            if scale <= 0.0:
+                raise ValueError(f"{prefix}_scale must be positive.")
+            if softplus_scale <= 0.0:
+                raise ValueError(f"{prefix}_softplus_scale must be positive.")
+            if floor < 0.0:
+                raise ValueError(f"{prefix}_floor must be nonnegative.")
+            if initial_value <= floor:
+                raise ValueError(f"{prefix}_initial_value must exceed {prefix}_floor.")
 
-def transform_state_output(
-    raw_state: torch.Tensor,
-    config: ConditionalModelConfig,
+            initial_argument = (initial_value - floor) / softplus_scale
+            if not math.isfinite(initial_argument) or initial_argument <= 0.0:
+                raise ValueError(f"Initial {prefix}/Softplus scale ratio is invalid.")
+
+        if self.rho_d_floor <= 0.0:
+            raise ValueError("rho_d_floor must be strictly positive.")
+
+def transform_state_output(raw_state: torch.Tensor,config: ConditionalModelConfig,
 ) -> torch.Tensor:
     """Convert raw outputs to normalized state, enforcing physical TKE positivity."""
     # Keep the affine conversion and Softplus at least float32, including when
     # the derivative-free network forwards use bf16 autocast.
+    if raw_state.ndim != 2 or raw_state.shape[1] != config.state_dim:
+        raise ValueError(f"Expected raw_state shape (n, {config.state_dim}); "
+            f"got {tuple(raw_state.shape)}.")
+
     if raw_state.dtype in (torch.float16, torch.bfloat16):
         raw_state = raw_state.float()
 
-    raw_tke = raw_state[:, TKE_INDEX:TKE_INDEX + 1]
-    physical_tke = (
-        config.tke_floor +
-        config.tke_softplus_scale * F.softplus(raw_tke, beta=1.0, threshold=20.0)
-    )
-    normalized_tke = (physical_tke - config.tke_offset) / config.tke_scale
+    state = raw_state
+    for index, prefix in ((TKE_INDEX, "tke"), (RHO_D_INDEX, "rho_d")):
+        raw = raw_state[:, index:index + 1]
+        physical = (getattr(config, f"{prefix}_floor")
+            + getattr(config, f"{prefix}_softplus_scale")
+            * F.softplus(raw, beta=1.0, threshold=20.0)
+        )
+        normalized = (
+            physical - getattr(config, f"{prefix}_offset")
+        ) / getattr(config, f"{prefix}_scale")
 
-    return torch.cat(
-        (raw_state[:, :TKE_INDEX], normalized_tke, raw_state[:, TKE_INDEX + 1:]),
-        dim=1,
-    )
+        state = torch.cat((state[:, :index], normalized, state[:, index + 1:]),
+            dim=1)
+
+    return state
 
 class ConditionalModel(nn.Module):
     """Solution network: [coords | z] -> state. z is the POD coeffs, supplied per
@@ -89,16 +113,21 @@ class ConditionalModel(nn.Module):
         self.config = config
         self.net = self._build(config.coord_dim + latent_dim, config)
 
-        # Calibrate the bias to a small physical energy. Random output
-        # weights remain, so the initial field varies around this target.
-        target = (
-            (config.tke_initial_value - config.tke_floor) / config.tke_softplus_scale
-        )
-        bias = ( target if target > 20.0
-            else target + math.log(-math.expm1(-target)))
-
+        # Initialize TKE and density near their physical starting values.
+        # Random output weights retain spatial and case-dependent variation.
         with torch.no_grad():
-            self.net[-1].bias[TKE_INDEX] = bias
+            for index, prefix in ((TKE_INDEX, "tke"), (RHO_D_INDEX, "rho_d")):
+                
+                target = (
+                    getattr(config, f"{prefix}_initial_value")
+                    - getattr(config, f"{prefix}_floor")
+                ) / getattr(config, f"{prefix}_softplus_scale")
+
+                bias = (
+                    target if target > 20.0
+                    else target + math.log(-math.expm1(-target))
+                )
+                self.net[-1].bias[index] = bias
 
     @staticmethod
     def _build(in_features: int, config: ConditionalModelConfig) -> nn.Sequential:

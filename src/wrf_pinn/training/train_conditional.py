@@ -63,7 +63,9 @@ class ConditionalTrainConfig:
     n_wall: int = 512             # surface/wall points per case per step
     grad_clip_norm: float = 1.0   # clip grads (PINN PDE gradients can spike)
     #: affine scaling (physical = offset + scale*normalized) for the residuals,
-    #: built from the pre-processor's normalization recipe. Identity if None.
+    #: built from the pre-processor's normalization recipe.
+    #: Model coordinate/state normalization, supplied explicitly for training.
+    #: None is rejected when training or stacking cases.
     scaling: "ResidualScalingConfig | None" = None
     #: SOURCE normalization: saved NPZ coordinates -> source units.
     source_scaling: "ResidualScalingConfig | None" = None
@@ -229,12 +231,53 @@ def _validate_local_sgs_bounds(case, grid, surface_h, cfg, source_off, source_sc
     except ValueError as exc:
         raise ValueError(f"{case.name}: invalid SGS geometry: {exc}") from exc
 
+def _validate_case_state(
+    case: ConditionalCase,
+    scaling: ResidualScalingConfig,
+) -> None:
+    """Require eight state variables and valid density observations."""
+    if tuple(case.state_vars) != STATE_VARS:
+        raise ValueError(f"{case.name}: expected state variables {STATE_VARS}.")
+
+    n_state = len(STATE_VARS)
+
+    if case.targets.shape != (case.interior.shape[0], n_state):
+        raise ValueError(
+            f"{case.name}: targets must have one row per interior point and {n_state} columns.")
+
+    if case.target_mask.shape != case.targets.shape:
+        raise ValueError(f"{case.name}: target_mask must match targets.")
+
+    if case.initial.ndim != 3 or case.initial.shape[0] != n_state:
+        raise ValueError(
+            f"{case.name}: initial must have shape ({n_state}, nz, nx*ny).")
+
+    if case.boundary.ndim != 4 or case.boundary.shape[0] != n_state:
+        raise ValueError(
+            f"{case.name}: boundary must have shape ({n_state}, n_faces, n_times, face_len).")
+
+    i = STATE_VARS.index("rho_d")
+
+    if not bool((case.target_mask[:, i] == 1).all()):
+        raise ValueError(f"{case.name}: every interior target must include measured rho_d.")
+
+    for name, normalized in (
+        ("targets", case.targets[:, i]),
+        ("initial", case.initial[i]),
+        ("boundary", case.boundary[i]),
+    ):
+        physical = (scaling.rho_d.offset + scaling.rho_d.scale * normalized)
+        if not bool((torch.isfinite(physical) & (physical > 0.0)).all()):
+            raise ValueError(f"{case.name}: {name} contains non-finite or nonpositive physical rho_d.")
+
 def stack_cases(cases: list[ConditionalCase], cfg: ConditionalTrainConfig) -> CaseBatch:
     """Concatenate torch cases (on one device) into a CaseBatch."""
     """Prepare model coordinates and terrain on CPU."""
     if cfg.source_scaling is None:
         raise ValueError("Set source_scaling from the dataset normalization recipe.")
     scaling = cfg.scaling if cfg.scaling is not None else DEFAULT_RESIDUAL_SCALING
+    for case in cases:
+        _validate_case_state(case, scaling)
     source_off, source_scale = _coordinate_affine(cfg.source_scaling, cases[0].interior)
     model_off, model_scale = _coordinate_affine(scaling, cases[0].interior)
 
@@ -452,8 +495,13 @@ def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
     k = b.k
     fns = fns if fns is not None else step_functions(model)
     # derivative-free forwards, optionally in bf16; results back to float32 for the losses
-    plain = lambda coords, sizes: _forward_maybe_bf16(
-        fns.forward, coords, b.z, sizes, cfg.bf16_data)[:, :n_obs]
+    def plain(coords, sizes):
+        out = _forward_maybe_bf16(fns.forward, coords, b.z, sizes, cfg.bf16_data)
+        if out.shape != (coords.shape[0], n_obs):
+            raise ValueError(
+                f"Expected predictions with shape ({coords.shape[0]}, {n_obs}); "
+                f"got {tuple(out.shape)}.")
+        return out
 
     with record_function("loss/data"):
         pred = plain(b.interior, b.interior_sizes)
@@ -597,13 +645,19 @@ def train_conditional(
     if model_config is None:
         raise ValueError("The conditional model must provide its configuration.")
 
-    scaling = config.scaling or DEFAULT_RESIDUAL_SCALING
-    if (
-        model_config.tke_offset != scaling.e_sgs.offset
-        or model_config.tke_scale != scaling.e_sgs.scale
-    ):
-        raise ValueError(
-            "Model TKE normalization must match the training state scaling.")
+    if config.scaling is None or config.source_scaling is None:
+        raise ValueError("Provide scaling and source_scaling from the dataset metadata.")
+    scaling = config.scaling
+    if model_config.state_dim != len(STATE_VARS):
+        raise ValueError(f"Model must predict exactly {len(STATE_VARS)} state variables.")
+
+    for prefix, name in (("tke", "e_sgs"), ("rho_d", "rho_d")):
+        expected = getattr(scaling, name)
+
+        if (getattr(model_config, f"{prefix}_offset") != expected.offset
+            or getattr(model_config, f"{prefix}_scale") != expected.scale):
+            raise ValueError(
+                f"Model {name} normalization must match the training state scaling.")
 
     rank, world = _world()
     device = _resolve_device(config.device)
@@ -775,7 +829,7 @@ def _save_checkpoint(model, optimizer, history, epoch, config, manifest=None) ->
     path = Path(config.checkpoint_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    torch.save({"schema_version": 4, "geometry_version": 2, "manifest": manifest,
+    torch.save({"schema_version": 5, "geometry_version": 2, "manifest": manifest,
                 "epoch": epoch, "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(), "history": vars(history)}, tmp)
     tagged = path.with_name(f"{path.stem}_step{epoch:06d}{path.suffix}")
@@ -790,7 +844,7 @@ def _maybe_resume(model, optimizer, history, config, device) -> int:
         return 1
     ckpt = torch.load(config.checkpoint_path, map_location=device, weights_only=True,)
 
-    if (ckpt.get("schema_version") != 4 or ckpt.get("geometry_version") != 2):
+    if (ckpt.get("schema_version") != 5 or ckpt.get("geometry_version") != 2):
         raise ValueError(
             "Checkpoint uses a different formulation; use a new checkpoint path.")
 

@@ -33,9 +33,8 @@ from torch import nn
 
 from wrf_pinn.models.conditional import (
     ConditionalModelConfig,
-    TKE_INDEX,
-    first_layer,
-    transform_state_output,
+    TKE_INDEX,RHO_D_INDEX,
+    first_layer, transform_state_output,
 )
 
 #: spatial second-derivative channels, in order (xx, yy, zz, xy, xz, yz)
@@ -213,66 +212,65 @@ def transform_state_jet(
     """Apply the model's output transform to values and coordinate derivatives."""
     if output_config is None:
         raise ValueError(
-            "Pass model.config; Taylor derivatives require the model's TKE normalization."
+            "Pass model.config; Taylor derivatives require the model's "
+            "TKE & density normalization."
         )
 
     values = transform_state_output(raw.v, output_config)
-    sl = slice(TKE_INDEX, TKE_INDEX + 1)
-    a = raw.v[:, sl].to(values.dtype)
     derivatives = raw.d.to(values.dtype)
+    hessian = None if raw.h is None else raw.h.to(values.dtype)
 
-    # Match F.softplus(beta=1.0, threshold=20.0) in conditional.py,
-    # including its linear branch for inputs greater than 20.
-    below_threshold = a < 20.0
+    transformed_d = derivatives
+    transformed_h = hessian
+    for index, prefix in (
+        (TKE_INDEX, "tke"),
+        (RHO_D_INDEX, "rho_d"),
+    ):
+        sl = slice(index, index + 1)
+        a = raw.v[:, sl].to(values.dtype)
 
-    # At exactly 20, PyTorch retains the nonlinear first-derivative value
-    # but uses zero for its second derivative. Keep that value constant
-    # on this boundary so parameter differentiation agrees as well.
-    sigmoid_argument = torch.where(
-        below_threshold, a, torch.full_like(a, 20.0)
-    )
-    sigmoid = torch.sigmoid(sigmoid_argument)
+        # Match F.softplus(beta=1.0, threshold=20.0).
+        below_threshold = a < 20.0
 
-    ratio = output_config.tke_softplus_scale / output_config.tke_scale
-    first = ratio * torch.where(
-        a > 20.0, torch.ones_like(a), sigmoid
-    )
-    second = ratio * torch.where(
-        below_threshold, sigmoid * (1.0 - sigmoid), torch.zeros_like(a)
-    )
+        # Preserve the existing handling of PyTorch's threshold:
+        # at exactly 20, retain the nonlinear first derivative,
+        # but use zero for the second derivative.
+        sigmoid_argument = torch.where(below_threshold, a, torch.full_like(a, 20.0))
+        sigmoid = torch.sigmoid(sigmoid_argument)
 
-    # First derivatives: d[f(a)]/dx_i = f'(a) * da/dx_i.
-    tke_d = first * derivatives[..., sl]
-    transformed_d = torch.cat(
-        (
-            derivatives[..., :TKE_INDEX],
-            tke_d,
-            derivatives[..., TKE_INDEX + 1:],
-        ),
-        dim=-1,
-    )
+        ratio = (getattr(output_config, f"{prefix}_softplus_scale")
+            / getattr(output_config, f"{prefix}_scale"))
 
-    # Spatial second derivatives:
-    # d2[f(a)]/dx_i dx_j = f'(a) * a_ij + f''(a) * a_i * a_j.
-    transformed_h = None
-    if raw.h is not None:
-        hessian = raw.h.to(values.dtype)
-        products = torch.stack(
-            [
-                derivatives[i, :, sl] * derivatives[j, :, sl]
-                for i, j in PAIRS
-            ],
-            dim=0,
-        )
-        tke_h = first * hessian[..., sl] + second * products
-        transformed_h = torch.cat(
+        first = ratio * torch.where(a > 20.0, torch.ones_like(a), sigmoid)
+        second = ratio * torch.where(below_threshold, sigmoid * (1.0 - sigmoid),
+            torch.zeros_like(a))
+
+        # First derivatives: f'(a) * a_i.
+        field_d = first * derivatives[..., sl]
+        transformed_d = torch.cat(
             (
-                hessian[..., :TKE_INDEX],
-                tke_h,
-                hessian[..., TKE_INDEX + 1:],
+                transformed_d[..., :index],
+                field_d,
+                transformed_d[..., index + 1:],
             ),
             dim=-1,
         )
+
+        # Second derivatives: f'(a) * a_ij + f''(a) * a_i * a_j.
+        if hessian is not None:
+            products = torch.stack(
+                [derivatives[i, :, sl] * derivatives[j, :, sl] for i, j in PAIRS],
+                dim=0,
+            )
+            field_h = first * hessian[..., sl] + second * products
+            transformed_h = torch.cat(
+                (
+                    transformed_h[..., :index],
+                    field_h,
+                    transformed_h[..., index + 1:],
+                ),
+                dim=-1,
+            )
 
     return Jet(values, transformed_d, transformed_h)
 
@@ -292,7 +290,7 @@ def taylor_forward(net: nn.Sequential, coordinates: torch.Tensor, z_rows: torch.
     ``ConditionalModel.forward``) and is multiplied through the first layer once per
     case; it carries no coordinate derivatives either way.
     ``output_config`` must be the corresponding ``model.config``. The returned
-    values include the model's TKE Softplus transformation, and its derivatives
+    values include the model's TKE & density Softplus transformation, and its derivatives
     include the same transformation through the chain rule.
     """
     layers = list(net)

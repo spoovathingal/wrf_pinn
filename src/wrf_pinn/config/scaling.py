@@ -19,7 +19,8 @@ from typing import Literal
 
 
 CoordinateName = Literal["x", "y", "z", "t"]
-StateVariableName = Literal["u", "v", "w", "theta", "p_prime","q_v","e_sgs"]
+StateVariableName = Literal["u", "v", "w", "theta", "p_prime",
+"q_v","e_sgs", "rho_d"]
 ScaledVariableName = CoordinateName | StateVariableName
 
 
@@ -50,17 +51,18 @@ class ResidualScalingConfig:
     p_prime: VariableScale = VariableScale()
     q_v: VariableScale = VariableScale()
     e_sgs: VariableScale = VariableScale()
-
+    rho_d: VariableScale = VariableScale()
     def coordinate_scales(self) -> tuple[float, float, float, float]:
         """Return coordinate scale factors in x, y, z, t order."""
 
         return (self.x.scale, self.y.scale, self.z.scale, self.t.scale)
 
-    def state_scales(self) -> tuple[float, float, float, float, float, float, float]:
-        """Return state scale factors in u, v, w, theta, p' order."""
+    def state_scales(self) -> tuple[float, float, float, float,
+    float, float, float, float]:
+        """Return state scale factors in u, v, w, theta, p', q_v, e_sgs, rho_d order."""
 
         return (self.u.scale, self.v.scale, self.w.scale, self.theta.scale,
-                 self.p_prime.scale, self.q_v.scale, self.e_sgs.scale)
+            self.p_prime.scale, self.q_v.scale, self.e_sgs.scale, self.rho_d.scale)
 
     def scale_for(self, name: ScaledVariableName) -> VariableScale:
         """Return the scale object for a named coordinate or state variable."""

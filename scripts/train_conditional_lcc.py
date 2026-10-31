@@ -5,19 +5,19 @@ from __future__ import annotations
 import argparse
 from dataclasses import replace
 from datetime import timedelta
-import json
+
 import logging
 import os
 from pathlib import Path
 import sys
 import time
-
+import math
 import torch
 import torch.distributed as dist
 
 from wrf_pinn.config.physics import DEFAULT_PHYSICS
 from wrf_pinn.config.scaling import ResidualScalingConfig, VariableScale
-from wrf_pinn.data.conditional_case import read_conditional_case
+from wrf_pinn.data.conditional_case import COORD_NAMES, STATE_VARS, ConditionalMetadata, read_conditional_case
 from wrf_pinn.models.conditional import ConditionalModel, ConditionalModelConfig
 from wrf_pinn.training.train_conditional import (
     ConditionalTrainConfig, train_conditional,
@@ -28,13 +28,29 @@ log = logging.getLogger("train_conditional_lcc")
 MODEL_Z_SCALE_METRES = 3000.0
 
 def _scaling_from_recipe(recipe: dict) -> ResidualScalingConfig:
-    names = recipe["coord_names"] + recipe["state_vars"]
-    offsets = recipe["coord_offset"] + recipe["state_offset"]
-    scales = recipe["coord_scale"] + recipe["state_scale"]
-    return ResidualScalingConfig(**{
-        name: VariableScale(offset=offset, scale=scale or 1.0)
-        for name, offset, scale in zip(names, offsets, scales)
-    })
+    if tuple(recipe["coord_names"]) != COORD_NAMES:
+        raise ValueError(f"Normalization must use coordinates {COORD_NAMES}.")
+
+    if tuple(recipe["state_vars"]) != STATE_VARS:
+        raise ValueError(f"Normalization must include exactly {STATE_VARS}.")
+
+    values = {}
+    for prefix, names in (("coord", COORD_NAMES), ("state", STATE_VARS)):
+        offsets = recipe[f"{prefix}_offset"]
+        scales = recipe[f"{prefix}_scale"]
+
+        if len(offsets) != len(names) or len(scales) != len(names):
+            raise ValueError(
+                f"{prefix} normalization must contain {len(names)} offsets and scales.")
+
+        for name, offset, scale in zip(names, offsets, scales, strict=True):
+            if (not math.isfinite(offset) or not math.isfinite(scale) or scale <= 0.0):
+                raise ValueError(
+                    f"Invalid normalization for {name}: offset must be finite and scale finite and positive.")
+
+            values[name] = VariableScale(offset=offset,scale=scale,)
+
+    return ResidualScalingConfig(**values)
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -113,9 +129,8 @@ def main() -> int:
     )
 
     try:
-        recipe = json.loads(
-            (args.cases_dir / "metadata.json").read_text()
-        )["normalization"]
+        metadata = ConditionalMetadata.load(args.cases_dir / "metadata.json")
+        recipe = metadata.normalization
 
         source_scaling = _scaling_from_recipe(recipe)
         scaling = replace(source_scaling,
@@ -141,7 +156,9 @@ def main() -> int:
         batch_cases = min(args.batch_cases, len(all_paths) // world)
 
         model_config = ConditionalModelConfig(
-            tke_offset=scaling.e_sgs.offset, tke_scale=scaling.e_sgs.scale)
+            tke_offset=scaling.e_sgs.offset, tke_scale=scaling.e_sgs.scale,
+            rho_d_offset=scaling.rho_d.offset, rho_d_scale=scaling.rho_d.scale,
+            )
 
         model = ConditionalModel(z_dim, model_config)
         cfg = ConditionalTrainConfig(

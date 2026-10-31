@@ -11,7 +11,7 @@ from typing import Literal
 
 
 CoordinateSystem = Literal["local_cartesian"]
-PhysicsVariable = Literal["u", "v", "w", "theta", "p_prime", "q_v", "e_sgs"]
+PhysicsVariable = Literal["u", "v", "w", "theta", "p_prime", "q_v", "e_sgs", "rho_d"]
 ResidualName = Literal["mass", "x_momentum", "y_momentum", "z_momentum",
                        "potential_temperature","water_vapor"]
 
@@ -95,7 +95,7 @@ class PhysicalConstants:
 class PhysicsConfig:
     """Configuration for reduced moist Cartesian equations with SGS closure.
 
-    Seven fields are predicted, including positive SGS TKE. Six PDE residuals
+    Eight fields are predicted, including positive SGS TKE. Six PDE residuals
     constrain mass, momentum, potential temperature, and water vapor.
 
     TKE enters the diagnostic SGS stresses and diffusivities, but has no
@@ -104,7 +104,7 @@ class PhysicsConfig:
 
     coordinate_system: CoordinateSystem = "local_cartesian"
     active_variables: tuple[PhysicsVariable, ...] = ("u", "v", "w", "theta",
-                                                      "p_prime", "q_v", "e_sgs")
+                                                "p_prime", "q_v", "e_sgs", "rho_d")
     residuals: tuple[ResidualName, ...] = (
         "mass",
         "x_momentum",
@@ -123,14 +123,9 @@ class PhysicsConfig:
     forcing_is_zero: bool = True
     constants: PhysicalConstants = PhysicalConstants()
 
-    # Fixed hydrostatic base state for the current FastEddy case.
-    hydrostatic_reference_potential_temperature: float = 300.0  # K
-
     # Multiplier taking the data's q_v to kg/kg for the thermodynamics
     # (1e-3 when the data is g/kg, as FastEddy writes it).
     q_v_to_kg_per_kg: float = 1.0
-
-
 
     # Native FE horizontal grid spacing in metres, not tile/subsample spacing.
     sgs_dx: float = 15.0115

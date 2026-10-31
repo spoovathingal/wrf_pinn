@@ -5,15 +5,15 @@ This module implements the reduced moist system with diagnostic SGS closure desc
 
 - local Cartesian coordinates
 - zero external forcing & Coriolis
-- fixed hydrostatic reference potential temperature = 300 K
+- predicted dry density and hydrostatic density inferred from d(p_EOS - p_prime)/dz
 - q_l and f_cond = 0
 
 The residuals are evaluated at continuous PINN collocation points. Inputs are
 expected in coordinate order (x, y, z, t), and state outputs are expected in
-physics-variable order (u, v, w, theta, p_prime, q_v, e_sgs). Coordinates and state outputs may be
+physics-variable order (u, v, w, theta, p_prime, q_v, e_sgs, rho_d). Coordinates and state outputs may be
 normalized; residual scaling maps them back to physical units before the PDE
 terms are assembled.
-Seven state variables are predicted, but only six PDE residuals are returned.
+Eight state variables are predicted, but only six PDE residuals are returned.
 SGS TKE enters stresses and diffusivities without a separate transport residual.
 """
 
@@ -26,7 +26,7 @@ import torch
 
 from wrf_pinn.config.physics import DEFAULT_PHYSICS, PhysicsConfig
 from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING, ResidualScalingConfig
-from wrf_pinn.physics.taylor import Jet, coordinate_jet, taylor_forward, where
+from wrf_pinn.physics.taylor import Jet, taylor_forward, where
 from wrf_pinn.models.conditional import ConditionalModelConfig
 
 TensorDict = dict[str, torch.Tensor]
@@ -103,69 +103,17 @@ def _coordinate_scale_tensor(scales: tuple[float, ...], device: torch.device,
     return torch.tensor(scales, dtype=dtype, device=device).reshape(1, -1)
 
 
-def _hydrostatic_reference_state(
-    z: torch.Tensor,
-    physics: PhysicsConfig,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return hydrostatic pressure and density at physical height z (m)."""
-
-    gravity = physics.constants.gravity
-    cp = physics.constants.dry_air_specific_heat_cp
-    rd = physics.constants.dry_air_gas_constant
-    p0 = physics.constants.reference_pressure
-    theta_h = physics.hydrostatic_reference_potential_temperature
-    # theta_h = torch.where(z <= 500.0, torch.full_like(z, 300.0),
-    #     torch.where(z <= 650.0, 300.0 + 0.08 * (z - 500.0),
-    #         312.0 + 0.003 * (z - 650.0)))
-
-    # # \int^z_0 1/300 dz = z/300
-    # integral_lower = z / 300.0
-    # # \int^500_0 1/300 dz + \int^z_500 1/(300+0.08(z-500)) dz 
-    # integral_middle = (500.0 / 300.0 + 
-    #                    1 / 0.08 * torch.log((300.0 + 0.08 * (z - 500.0)) / 300.0))
-    # # \int^500_0 1/300 dz + \int^650_500 1/(300+0.08(z-500)) dz + \int^z_650 1/(312+0.003(z-650)) dz
-    # integral_upper = (500.0 / 300.0 + 
-    #                   1 / 0.08 * torch.log(torch.tensor(312.0 / 300.0, 
-    #                     dtype=z.dtype, device=z.device)) # compatible and no CPU-GPU mismatch
-    #     + 1 / 0.003 * torch.log((312.0 + 0.003 * (z - 650.0)) / 312.0))
-
-    # integral = torch.where(z <= 500.0, integral_lower,
-    #     torch.where(z <= 650.0, integral_middle, integral_upper))
-    #\Pi_H(0) = 1
-    # pi_h = 1.0 - gravity * integral / cp
-
-    # For the current flat ocean crop:
-    # z_reference = 0 m, p_reference = p0, theta_d,h = 300 K.
-    exner_h = 1.0 - gravity * z / (cp * theta_h)
-    p_d_h = p0 * exner_h.pow(cp / rd)
-    t_d_h = theta_h * exner_h
-    rho_d_h = p_d_h / (rd * t_d_h)
-
-    return p_d_h, rho_d_h
 
 def _split_state(
     state: torch.Tensor,
     physics: PhysicsConfig,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return u, v, w, theta, p_prime, q_v, and e_sgs columns from the model state output."""
+) -> tuple[torch.Tensor, ...]:
+    """Return u, v, w, theta, p_prime, q_v, e_sgs, and density columns from the model state output."""
 
-    if state.ndim != 2:
-        raise ValueError("state must have shape (n_points, n_variables).")
+    if state.ndim != 2 or state.shape[1] != physics.state_dim:
+        raise ValueError(f"state must have shape (n_points, {physics.state_dim}).")
 
-    if state.shape[1] < physics.state_dim:
-        raise ValueError(
-            "state has too few columns for the configured active variables; "
-            f"expected at least {physics.state_dim}, got {state.shape[1]}."
-        )
-
-    u = state[:, physics.variable_index("u") : physics.variable_index("u") + 1]
-    v = state[:, physics.variable_index("v") : physics.variable_index("v") + 1]
-    w = state[:, physics.variable_index("w") : physics.variable_index("w") + 1]
-    theta = state[:, physics.variable_index("theta") : physics.variable_index("theta") + 1]
-    p_prime = state[:, physics.variable_index("p_prime") : physics.variable_index("p_prime") + 1]
-    q_v = state[:, physics.variable_index("q_v") : physics.variable_index("q_v") + 1]
-    e_sgs = state[:, physics.variable_index("e_sgs") : physics.variable_index("e_sgs") + 1]
-    return u, v, w, theta, p_prime, q_v, e_sgs
+    return tuple( state[:, i:i + 1] for i in range(physics.state_dim) )
 
 
 def _to_physical_state(
@@ -176,18 +124,21 @@ def _to_physical_state(
     p_prime: torch.Tensor,
     q_v: torch.Tensor,
     e_sgs: torch.Tensor,
+    rho_d: torch.Tensor,
     scaling: ResidualScalingConfig,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, ...]:
     """Map normalized state variables to physical state variables."""
+    return (
+        scaling.u.offset + scaling.u.scale * u,
+        scaling.v.offset + scaling.v.scale * v,
+        scaling.w.offset + scaling.w.scale * w,
+        scaling.theta.offset + scaling.theta.scale * theta,
+        scaling.p_prime.offset + scaling.p_prime.scale * p_prime,
+        scaling.q_v.offset + scaling.q_v.scale * q_v,
+        scaling.e_sgs.offset + scaling.e_sgs.scale * e_sgs,
+        scaling.rho_d.offset + scaling.rho_d.scale * rho_d,
+    )
 
-    u_physical = scaling.u.offset + scaling.u.scale * u
-    v_physical = scaling.v.offset + scaling.v.scale * v
-    w_physical = scaling.w.offset + scaling.w.scale * w
-    theta_physical = scaling.theta.offset + scaling.theta.scale * theta
-    p_prime_physical = scaling.p_prime.offset + scaling.p_prime.scale * p_prime
-    q_v_physical = scaling.q_v.offset + scaling.q_v.scale * q_v
-    e_sgs_physical = scaling.e_sgs.offset + scaling.e_sgs.scale * e_sgs
-    return u_physical, v_physical, w_physical, theta_physical, p_prime_physical, q_v_physical, e_sgs_physical
 # not used for now until k_m training turned back on
 def _to_physical_eddy_viscosity(
     k_m_unconstrained: torch.Tensor,
@@ -208,8 +159,8 @@ def _validate_physics_config(physics: PhysicsConfig) -> None:
     if physics.coordinate_system != "local_cartesian":
         raise ValueError("Only local_cartesian coordinates are supported.")
 
-    if physics.active_variables != ("u", "v", "w", "theta", "p_prime", "q_v", "e_sgs"):
-        raise ValueError("Residuals currently require active variables u, v, w, theta, p_prime, q_v, e_sgs")
+    if physics.active_variables != ("u", "v", "w", "theta", "p_prime", "q_v", "e_sgs", "rho_d"):
+        raise ValueError("Residuals currently require active variables u, v, w, theta, p_prime, q_v, e_sgs, rho_d")
 
     expected_residuals = ("mass", "x_momentum", "y_momentum", "z_momentum", "potential_temperature", "water_vapor")
     if physics.residuals != expected_residuals:
@@ -239,10 +190,12 @@ def _validate_physics_config(physics: PhysicsConfig) -> None:
     if enabled_terms:
         raise ValueError(f"Unsupported physics terms are enabled: enabled terms: {enabled_terms}.")
 
-def _diagnose_moist_state(theta: torch.Tensor, p_prime: torch.Tensor, q_v: torch.Tensor,
-    z: torch.Tensor, physics: PhysicsConfig) -> tuple[torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Diagnose pressure, temperature, and moist-density quantities.
+def _diagnose_moist_state(theta: torch.Tensor, q_v: torch.Tensor, rho_d: torch.Tensor,
+    physics: PhysicsConfig) -> tuple[torch.Tensor | Jet, ...]:
+    """Calculate thermodynamics from predicted dry density.
+
+    Inputs are in physical units, except q_v retains the dataset's
+    mixing-ratio units until converted locally to kg/kg.
 
     ``q_v`` is the water-vapor mixing ratio in the data's units; it is taken
     to kg/kg with ``physics.q_v_to_kg_per_kg``.
@@ -254,26 +207,18 @@ def _diagnose_moist_state(theta: torch.Tensor, p_prime: torch.Tensor, q_v: torch
     kappa = physics.constants.kappa
     gamma = physics.constants.gamma
 
-    p_d_h, rho_d_h = _hydrostatic_reference_state(z, physics)
-    q_v = q_v * physics.q_v_to_kg_per_kg
+    q_v_kg = q_v * physics.q_v_to_kg_per_kg
+    theta_m = theta * (1.0 + (rv / rd) * q_v_kg)
 
     # Total pressure and moist potential temperature.
-    pressure = p_d_h + p_prime
-    theta_m = theta * (1.0 + (rv / rd) * q_v)
-
-    # Dry-air density obtained from the moist equation of state.
-    rho_d = (  p0**kappa * pressure.pow(1.0 / gamma) / (rd * theta_m)  )
-
+    pressure = (rd * rho_d * theta_m / p0**kappa).pow(gamma)
     temperature = theta * (pressure / p0).pow(kappa)
 
-    # q_l = 0 for the current first-pass system.
-    rho_m = rho_d * (1.0 + q_v)
-    rho_m_prime = rho_m - rho_d_h
-
-    # Multiplies the pressure-gradient and buoyancy bracket.
+    # The supplied FE dataset has q_l = 0.
+    rho_m = rho_d * (1.0 + q_v_kg)
     density_ratio = rho_d / rho_m
 
-    return (pressure, temperature, rho_d, rho_m, rho_m_prime, density_ratio)
+    return pressure, temperature, rho_m, density_ratio
 
 def _brunt_vaisala_squared(theta: torch.Tensor, theta_z: torch.Tensor, physics: PhysicsConfig) -> torch.Tensor:
     """Return N^2 from local dry potential temperature. used for l_sgs"""
@@ -367,8 +312,8 @@ def cartesian_zero_forcing_residuals(
         Collocation coordinates with shape ``(n_points, 4)`` and column order
         ``(x, y, z, t)``. The tensor must have ``requires_grad=True``.
     state:
-        Model outputs with shape ``(n_points, 7)`` and column order
-        ``(u, v, w, theta, p', q_v, e_sgs)``.
+        Model outputs with shape ``(n_points, 8)`` and column order
+        ``(u, v, w, theta, p', q_v, e_sgs, rho_d)``.
     physics:
         Physics configuration. Only the default reduced configuration is
         supported by this implementation.
@@ -392,17 +337,17 @@ def cartesian_zero_forcing_residuals(
     if not coordinates.requires_grad:
         raise ValueError("coordinates must have requires_grad=True.")
 
-    (u_normalized, v_normalized, w_normalized, theta_normalized, p_prime_normalized,
-      q_v_normalized, e_sgs_normalized) = _split_state(state, physics)
+    u, v, w, theta, p_prime, q_v, e_sgs, rho_d = _to_physical_state(
+        *_split_state(state, physics), scaling=scaling,)
 
-    u, v, w, theta, p_prime, q_v, e_sgs = _to_physical_state(
-        u_normalized, v_normalized, w_normalized, theta_normalized, 
-        p_prime_normalized, q_v_normalized, e_sgs_normalized, scaling)
-    #k_m = _to_physical_eddy_viscosity(k_m_unconstrained, physics)
+    pressure, _temperature, rho_m, density_ratio = _diagnose_moist_state(
+        theta, q_v, rho_d, physics)
 
-    z = scaling.z.offset + scaling.z.scale * coordinates[:, 2:3]
-    (_pressure, _temperature, rho_d, _rho_m, rho_m_prime, density_ratio,
-     ) = _diagnose_moist_state(theta, p_prime, q_v, z, physics)
+    # Infer base-state density from the physical vertical pressure gradient.
+    p_d_h = pressure - p_prime
+    grad_p_d_h = _physical_gradient(p_d_h, coordinates, scaling)
+    rho_d_h = -grad_p_d_h[:, 2:3] / physics.constants.gravity
+    rho_m_prime = rho_m - rho_d_h
 
     grad_u = _physical_gradient(u, coordinates, scaling)
     grad_v = _physical_gradient(v, coordinates, scaling)
@@ -594,23 +539,26 @@ def cartesian_zero_forcing_residuals_taylor(
 
     out = taylor_forward(net, coordinates, z_rows, scaling.coordinate_scales(), sizes=sizes,
                             output_config=output_config)
-    if out.v.shape[1] < physics.state_dim:
+    if out.v.shape[1] != physics.state_dim:
         raise ValueError(
-            "state has too few columns for the configured active variables; "
-            f"expected at least {physics.state_dim}, got {out.v.shape[1]}."
-        )
+            f"Expected {physics.state_dim} state columns; got {out.v.shape[1]}.")
 
     def physical(name: str) -> Jet:
         j = out.column(physics.variable_index(name))
         s = getattr(scaling, name)
         return Jet(s.offset + s.scale * j.v, s.scale * j.d, s.scale * j.h)
 
-    u, v, w, theta, p_prime, q_v, e_sgs = (
-        physical(n) for n in ("u", "v", "w", "theta", "p_prime", "q_v", "e_sgs"))
+    u, v, w, theta, p_prime, q_v, e_sgs, rho_d = (
+        physical(name) for name in physics.active_variables)
 
-    z = coordinate_jet(scaling.z.offset + scaling.z.scale * coordinates[:, 2:3], axis=2)
-    (_pressure, _temperature, rho_d, _rho_m, rho_m_prime, density_ratio,
-     ) = _diagnose_moist_state(theta, p_prime, q_v, z, physics)
+    pressure, _temperature, rho_m, density_ratio = _diagnose_moist_state(
+        theta, q_v, rho_d, physics)
+
+    p_d_h = pressure - p_prime
+    rho_d_h = -p_d_h.d[2] / physics.constants.gravity
+
+    # Only the buoyancy value is needed, not its coordinate derivatives.
+    rho_m_prime = rho_m.v - rho_d_h
 
     p_prime_x, p_prime_y, p_prime_z, _p_prime_t = p_prime.d
 
@@ -687,7 +635,7 @@ def cartesian_zero_forcing_residuals_taylor(
 
     z_momentum = (
         rho_d_w_t + rho_d_uw_x + rho_d_vw_y + rho_d_ww_z
-        + ratio * (p_prime_z + physics.constants.gravity * rho_m_prime.v)
+        + ratio * (p_prime_z + physics.constants.gravity * rho_m_prime)
         + tau_xz_x + tau_yz_y + tau_zz_z
     )
 
