@@ -27,10 +27,13 @@ from wrf_pinn.training.train_conditional import (
 log = logging.getLogger("train_conditional_lcc")
 
 
-def _scaling_from_recipe(recipe: dict) -> ResidualScalingConfig:
+def _scaling_from_recipe(recipe: dict, grid_spacing: float = 1.0, step_seconds: float = 1.0) -> ResidualScalingConfig:
+    """Recipe scaling; x, y stored as grid indices and t as solver steps are converted to
+    metres and seconds by grid_spacing and step_seconds (normalized coordinates unchanged)."""
     names = recipe["coord_names"] + recipe["state_vars"]
-    offsets = recipe["coord_offset"] + recipe["state_offset"]
-    scales = recipe["coord_scale"] + recipe["state_scale"]
+    unit = {"x": grid_spacing, "y": grid_spacing, "t": step_seconds}
+    offsets = [o * unit.get(n, 1.0) for n, o in zip(recipe["coord_names"], recipe["coord_offset"])] + recipe["state_offset"]
+    scales = [s * unit.get(n, 1.0) for n, s in zip(recipe["coord_names"], recipe["coord_scale"])] + recipe["state_scale"]
     return ResidualScalingConfig(**{
         name: VariableScale(offset=offset, scale=scale or 1.0)
         for name, offset, scale in zip(names, offsets, scales)
@@ -140,6 +143,10 @@ def main() -> int:
         "--predict-change", action="store_true",
         help="state = initial field + (t - t0)/T * network (needs --keep-raw cases)")
     ap.add_argument("--encoder-dim", type=int, default=256, help="encoder latent size")
+    ap.add_argument("--grid-spacing", type=float, default=1.0,
+                    help="metres per stored x, y unit (carved cases store grid indices: 15)")
+    ap.add_argument("--step-seconds", type=float, default=1.0,
+                    help="seconds per stored t unit (carved cases store FastEddy steps: 0.025)")
     ap.add_argument("--terrain-input", action="store_true",
                     help="the encoder also reads each subdomain's ground height map (--latent encoder)")
     args = ap.parse_args()
@@ -185,7 +192,9 @@ def main() -> int:
             (args.cases_dir / "metadata.json").read_text()
         )["normalization"]
 
-        source_scaling = _scaling_from_recipe(recipe)
+        source_scaling = _scaling_from_recipe(recipe, args.grid_spacing, args.step_seconds)
+        log.info("coordinate units: x, y x %g m, t x %g s (physics and terrain slopes in m and s)",
+                 args.grid_spacing, args.step_seconds)
         scaling = source_scaling
         if args.model_z_max is not None:
             scaling = replace(source_scaling, z=VariableScale(offset=0.0, scale=args.model_z_max))
@@ -233,6 +242,7 @@ def main() -> int:
             learning_rate=args.lr, learning_rate_min=args.lr_min,
             weight_flow_boundary=args.boundary_weight, weight_pde=args.pde_weight,
             source_scaling=source_scaling, source_z_mode=args.source_z_mode, scaling=scaling,
+            terrain_xy_scale=args.grid_spacing,
             terrain_top_height=args.terrain_top_height, fe_surface_reference_z=args.fe_surface_reference_z,
             physics=physics, tke_weight=args.tke_weight, tke_residual_scale=args.tke_residual_scale,
             flux_offset=tuple(recipe["flux_offset"]), flux_scale=tuple(s or 1.0 for s in recipe["flux_scale"]),

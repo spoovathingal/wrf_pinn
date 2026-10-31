@@ -633,3 +633,39 @@ def test_terrain_encoder_trains(tmp_path):
     hist = train_conditional(model, config=cfg, case_paths=paths)
     assert hist.total[-1] < hist.total[0]
     assert any(not torch.equal(a, p) for a, p in zip(before, encoder.ter.parameters()))
+
+
+def test_grid_index_coordinates_converted_to_metres():
+    """Cases storing x, y as grid indices: scaling x, y by the spacing (and the terrain's
+    x, y with terrain_xy_scale) leaves model coordinates unchanged and gives slopes in m/m."""
+    case, cfg = _geometry_fixture()
+    idx = case.terrain.clone()
+    idx[:, :2] /= 100.0                                     # same terrain on a 1-unit grid
+    s = cfg.source_scaling
+    as_index = replace(cfg, source_scaling=replace(s, x=VariableScale(scale=1.0), y=VariableScale(scale=1.0)),
+                       scaling=replace(cfg.scaling, x=VariableScale(scale=1.0), y=VariableScale(scale=1.0)))
+    in_metres = replace(as_index, terrain_xy_scale=100.0,
+                        source_scaling=replace(as_index.source_scaling, x=VariableScale(scale=100.0),
+                                               y=VariableScale(scale=100.0)),
+                        scaling=replace(as_index.scaling, x=VariableScale(scale=100.0), y=VariableScale(scale=100.0)))
+    raw = tc.stack_cases([replace(case, terrain=idx)], as_index)
+    fixed = tc.stack_cases([replace(case, terrain=idx)], in_metres)
+    want = tc.stack_cases([case], cfg)
+    torch.testing.assert_close(fixed.interior, raw.interior)          # network inputs unchanged
+    torch.testing.assert_close(fixed.surface_geometry, want.surface_geometry)   # slopes in m/m
+    torch.testing.assert_close(raw.surface_geometry[:, 1:], 100.0 * want.surface_geometry[:, 1:])
+
+
+def test_recipe_scaling_units():
+    import importlib.util, sys
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location("tcl", Path(__file__).parents[1] / "scripts" / "train_conditional_lcc.py")
+    mod = importlib.util.module_from_spec(spec); sys.modules["tcl"] = mod; spec.loader.exec_module(mod)
+    recipe = {"coord_names": ["x", "y", "z", "t"], "coord_offset": [1440.0, 0.0, 10.0, 400800.0],
+              "coord_scale": [3167.0, 3039.0, 1410.0, 393600.0],
+              "state_vars": list(STATE_VARS), "state_offset": [0.0] * len(STATE_VARS),
+              "state_scale": [1.0] * len(STATE_VARS)}
+    sc = mod._scaling_from_recipe(recipe, 15.0, 0.025)
+    assert (sc.x.offset, sc.x.scale, sc.y.scale) == (21600.0, 47505.0, 45585.0)
+    assert (sc.z.offset, sc.z.scale) == (10.0, 1410.0)
+    assert (sc.t.offset, sc.t.scale) == (10020.0, 9840.0)

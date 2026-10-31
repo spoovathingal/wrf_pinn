@@ -126,6 +126,8 @@ class ConditionalTrainConfig:
     #: The initial field and its derivatives come from each case's ini_raw on the grid,
     #: so PDE points sit on grid nodes (at random times). Off: the network is the state.
     predict_change: bool = False
+    #: metres per stored terrain x, y unit; must match the x, y conversion in source_scaling.
+    terrain_xy_scale: float = 1.0
     def __post_init__(self) -> None:
         if not math.isfinite(self.tke_weight) or self.tke_weight < 0.0:
             raise ValueError("tke_weight must be finite and nonnegative.")
@@ -313,7 +315,8 @@ def stack_cases(cases: list[ConditionalCase], cfg: ConditionalTrainConfig) -> Ca
     source_off, source_scale = _coordinate_affine(cfg.source_scaling, cases[0].interior)
     model_off, model_scale = _coordinate_affine(scaling, cases[0].interior)
 
-    grids = [prepare_terrain(c.terrain) for c in cases]
+    xy = torch.tensor([cfg.terrain_xy_scale, cfg.terrain_xy_scale, 1.0])
+    grids = [prepare_terrain(torch.as_tensor(c.terrain, dtype=torch.float32) * xy) for c in cases]
     if (cfg.source_z_mode == "fe_terrain_following" or cfg.fe_surface_reference_z is not None):
         for case, (_, _, heights) in zip(cases, grids):
             if torch.any(heights >= cfg.terrain_top_height):
@@ -941,7 +944,8 @@ def _maybe_resume(model, optimizer, history, config, device) -> int:
     saved = (ckpt.get("manifest") or {}).get("training", {})
     current = asdict(config)
     keys = ("scaling", "source_scaling", "source_z_mode", "terrain_top_height",
-    "fe_surface_reference_z", "physics", "tke_weight", "tke_residual_scale", "predict_change")
+    "fe_surface_reference_z", "physics", "tke_weight", "tke_residual_scale", "predict_change",
+    "terrain_xy_scale")
 
     if (ckpt.get("geometry_version") != 2 or any(saved.get(k) != current[k] for k in keys)):
         raise ValueError("Checkpoint geometry/physics/TKE loss settings differ; use a new checkpoint path.")
