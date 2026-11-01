@@ -31,6 +31,9 @@ class ConditionalCase:
     boundary: object            # (n_state, n_faces, n_times, face_len): decoded boundary
     boundary_coords: object     # psi coords: (n_faces, n_times, face_len, n_coord)
     surface: object             # (n_times, n_face_pts, 5): x,y,t,fricVel,htFlux (bottom)
+    surface_fe_state: object # Physical FE observations at native z-index 0: (n_times, n_surface, 4), columns rho_d, u, v, theta.
+    surface_z0m: object # Physical momentum roughness [m], shape (n_surface, 1).
+    surface_height: object # Native terrain elevation above sea level [m], shape (n_surface, 1).
     terrain: object             # (n_terr, 3): x, y, elevation (static)
     interior: object            # (n_pts, n_coord): query coords, tau > 0
     targets: object             # (n_pts, n_state): matched interior state
@@ -61,6 +64,9 @@ class ConditionalCase:
             boundary=t(self.boundary),
             boundary_coords=t(self.boundary_coords),
             surface=t(self.surface),
+            surface_fe_state=t(self.surface_fe_state),
+            surface_z0m=t(self.surface_z0m),
+            surface_height=t(self.surface_height),
             terrain=t(self.terrain),
             interior=t(self.interior),
             targets=t(self.targets),
@@ -75,10 +81,8 @@ class ConditionalCase:
 #: Non-POD members written by the generator and read back directly. The initial
 #: and boundary fields are reconstructed from their per-subdomain POD pieces.
 _CASE_MEMBERS: tuple[str, ...] = (
-    "initial_coords", "boundary_coords", "surface", "terrain", "interior",
-    "targets", "times",
-)
-
+    "initial_coords", "boundary_coords", "surface", "surface_fe_state", "surface_z0m",
+    "surface_height", "terrain", "interior", "targets", "times")
 
 def read_conditional_case(npz_path: str | Path) -> ConditionalCase:
     """Load one POD-encoded .npz case; decode initial/boundary, mask NaN targets."""
@@ -103,6 +107,42 @@ def read_conditional_case(npz_path: str | Path) -> ConditionalCase:
             raise ValueError(
                 f"Case {path} has different numbers of targets and interior coordinates."
             )
+
+        surface = members["surface"]
+        fe = members["surface_fe_state"]
+        z0m = members["surface_z0m"]
+
+        if surface.ndim != 3 or surface.shape[2] != 5:
+            raise ValueError(f"Case {path}: surface must have shape (n_times, n_surface, 5).")
+
+        nt, ns, _ = surface.shape
+        if nt == 0 or ns == 0 or members["times"].shape != (nt,):
+            raise ValueError(f"Case {path}: invalid surface/time dimensions.")
+
+        if fe.shape != (nt, ns, 4):
+            raise ValueError(
+                f"Case {path}: surface_fe_state must have shape ({nt}, {ns}, 4).")
+
+        if z0m.shape != (ns, 1):
+            raise ValueError(f"Case {path}: surface_z0m must have shape ({ns}, 1).")
+
+        if members["surface_height"].shape != (ns, 1):
+            raise ValueError(f"Case {path}: surface_height must have shape ({ns}, 1).")
+
+        for name in ("surface", "surface_fe_state", "surface_z0m", "surface_height"):
+            if not np.isfinite(members[name]).all():
+                raise ValueError(f"Case {path}: {name} must contain finite values.")
+
+        if np.any(fe[..., [0, 3]] <= 0.0):
+            raise ValueError(
+                f"Case {path}: physical FE density and theta must be positive.")
+
+        if np.any(z0m <= 0.0):
+            raise ValueError(f"Case {path}: surface_z0m must be positive.")
+
+        if not np.all(surface[..., :2] == surface[0:1, :, :2]):
+            raise ValueError(
+                f"Case {path}: surface x/y point order must stay fixed across times.")
 
         required_pod = [
             f"ini_{part}_{var}" for var in STATE_VARS
@@ -199,6 +239,16 @@ class ConditionalMetadata:
             raise ValueError(
                 f"Metadata {path} must declare state_vars={STATE_VARS}; "
                 f"got {state_vars}. Regenerate the dataset with rho_d included.")
+
+        expected_surface = {
+            "state_vars": ["rho_d", "u", "v", "theta"],
+            "state_units": ["kg/m^3", "m/s", "m/s", "K"],
+            "height_units": "m", "z_index": 0, "z0m_units": "m",
+        }
+
+        if schema.get("surface_reference") != expected_surface:
+            raise ValueError(
+                f"Metadata {path} must declare surface_reference={expected_surface}.")
 
         return cls(
             state_vars=state_vars,

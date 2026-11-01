@@ -25,7 +25,7 @@ from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING, ResidualScalingCon
 from wrf_pinn.physics.residuals_pde import (
     cartesian_zero_forcing_residuals, cartesian_zero_forcing_residuals_taylor,
 )
-from wrf_pinn.physics.residuals_boundary import no_penetration_z_wall_residuals
+from wrf_pinn.physics.residuals_boundary import no_penetration_z_wall_residuals, _surface_layer_transfer_coefficients
 from wrf_pinn.physics.taylor import coordinate_jet, taylor_forward
 from wrf_pinn.training.provenance import run_manifest, write_event
 from wrf_pinn.physics.grid_geometry import sgs_filter_width, terrain_height_jet
@@ -119,6 +119,10 @@ class ConditionalTrainConfig:
                 "fe_surface_reference_z must be finite and between zero and terrain_top_height."
             )
 
+        if not math.isclose(self.fe_surface_reference_z, self.physics.sgs_reference_z[0],
+            rel_tol=0.0, abs_tol=1.0e-6):
+            raise ValueError("fe_surface_reference_z must match native FE z-index 0.")
+
         if self.physics.sgs_reference_z[-1] > self.terrain_top_height:
             raise ValueError(
                 "SGS reference heights must not exceed terrain_top_height."
@@ -156,6 +160,8 @@ class CaseBatch:
     boundary_coords: torch.Tensor
     boundary_targets: torch.Tensor
     surface: torch.Tensor
+    surface_fe_state: torch.Tensor  # physical (N, 4): rho_d, u, v, theta
+    surface_z0m: torch.Tensor       # physical (N, 1), metres
     terrain_x: torch.Tensor
     terrain_y: torch.Tensor
     terrain_h: torch.Tensor
@@ -298,20 +304,88 @@ def stack_cases(cases: list[ConditionalCase], cfg: ConditionalTrainConfig) -> Ca
         return (physical - model_off) / model_scale
 
     interior, initial, boundary, surface, geometry = [], [], [], [], []
+    surface_fe, surface_z0m = [], []
 
     for c, grid in zip(cases, grids):
         interior.append( convert(c.interior, grid) )
         initial.append( convert(c.initial_coords, grid) )
         boundary.append( convert(c.boundary_coords.reshape(-1, 4), grid) )
 
+        nt, ns, _ = c.surface.shape
+
+        if (c.surface_fe_state.shape != (nt, ns, 4)
+            or c.surface_z0m.shape != (ns, 1) or c.surface_height.shape != (ns, 1)):
+            raise ValueError(
+                f"{c.name}: surface observations, roughness, and height must match surface rows.")
+
         rows = c.surface.reshape(-1, c.surface.shape[-1])
+
+        # Validate prescribed fluxes in physical units before GPU training.
+        flux = (rows[:, 3:] * rows.new_tensor(cfg.flux_scale) + rows.new_tensor(cfg.flux_offset))
+        if (
+            not torch.isfinite(flux).all() or torch.any(flux[:, 0] < 0.0)
+            or torch.any((flux[:, 0] == 0.0) & (flux[:, 1] != 0.0))
+        ):
+            raise ValueError(f"{c.name}: invalid physical surface fluxes.")
+
+        fe = c.surface_fe_state.reshape(-1, 4)
+        roughness = c.surface_z0m.repeat(nt, 1)
+
         physical_xyt = (rows[:, :3] * source_scale[[0, 1, 3]] + source_off[[0, 1, 3]])
-        h, hx, hy = terrain_at(physical_xyt[:, 0], physical_xyt[:, 1], *grid)
+
+        # Existing terrain interpolation supplies slopes.
+        # Native elevations locate the wall and first FE cell.
+        _, hx, hy = terrain_at(physical_xyt[:, 0], physical_xyt[:, 1], *grid)
+        h = c.surface_height[:, 0].repeat(nt)
+
         _validate_local_sgs_bounds(c, grid, h, cfg, source_off, source_scale)
+        # Validate the prescribed surface inputs on CPU.
+        with torch.no_grad():
+            if (not torch.isfinite(fe).all()
+                or torch.any(fe[:, [0, 3]] <= 0.0)
+                or not torch.isfinite(roughness).all()
+                or torch.any(roughness <= 0.0)
+            ):
+                raise ValueError(f"{c.name}: invalid FE surface state or roughness.")
+
+            z1 = (cfg.fe_surface_reference_z * (1.0 - h / cfg.terrain_top_height))[:, None]
+
+            U_fe = torch.sqrt(fe[:, 1:2].square() + fe[:, 2:3].square())
+            if not bool((torch.isfinite(U_fe) & (U_fe > 0.0)).all()):
+                raise ValueError(
+                    f"{c.name}: skin-theta inference requires positive finite FE wind speed.")
+
+            # Largest unstable correction in the helper's [-2.5, 2.5] range.
+            # Psi_h also bounds Psi_m, protecting both denominators.
+            xi_limit = (1.0 + 16.0 * 2.5)**0.25
+            psi_h_max = 2.0 * math.log((1.0 + xi_limit**2) / 2.0)
+            log_z = torch.log((z1 + roughness) / roughness)
+
+            if not bool((torch.isfinite(log_z) & (log_z > psi_h_max)).all()):
+                raise ValueError(
+                    f"{c.name}: surface geometry permits nonpositive MOST denominators.")
+
+            try:
+                _, ch_fe = _surface_layer_transfer_coefficients(
+                    fe[:, 3:4], z1, roughness, flux[:, 0:1], flux[:, 1:2], cfg.physics,
+                    check_values=True)
+            except ValueError as exc:
+                raise ValueError(f"{c.name}: {exc}") from exc
+
+            theta_skin_fe = (fe[:, 3:4] + flux[:, 1:2] / (ch_fe * U_fe))
+
+            if not bool((torch.isfinite(ch_fe) & (ch_fe > 0.0) & torch.isfinite(theta_skin_fe)
+                & (theta_skin_fe > 0.0)
+            ).all()):
+                raise ValueError(f"{c.name}: invalid heat coefficient or inferred skin theta.")
+
+        surface_fe.append(fe)
+        surface_z0m.append(roughness)
+
         model_xyt = (physical_xyt - model_off[[0, 1, 3]]) / model_scale[[0, 1, 3]]
 
-        surface.append( torch.cat( (model_xyt, rows[:, 3:]) , dim=1) )
-        geometry.append( torch.stack( (h, hx, hy) , dim=1) )
+        surface.append(torch.cat((model_xyt, rows[:, 3:]), dim=1))
+        geometry.append(torch.stack((h, hx, hy), dim=1))
 
     return CaseBatch(
         z=torch.stack([c.z for c in cases]),
@@ -321,7 +395,7 @@ def stack_cases(cases: list[ConditionalCase], cfg: ConditionalTrainConfig) -> Ca
         boundary_coords=cat(boundary), boundary_targets=cat([_boundary_targets(c) for c in cases]),
         surface=cat(surface), terrain_x=torch.stack([g[0] for g in grids]),
         terrain_y=torch.stack([g[1] for g in grids]), terrain_h=torch.stack([g[2] for g in grids]),
-        surface_geometry=cat(geometry),
+        surface_geometry=cat(geometry), surface_fe_state=cat(surface_fe), surface_z0m=cat(surface_z0m),
         # SOURCE-normalized bounds, deliberately kept unconverted.
         box_lo=torch.stack([c.interior.amin(dim=0) for c in cases]), box_hi=torch.stack([c.interior.amax(dim=0) for c in cases]),
         interior_sizes=sizes(interior), initial_sizes=sizes(initial), boundary_sizes=sizes(boundary), surface_sizes=sizes(surface),
@@ -410,9 +484,10 @@ def _surface_loss(model, b: CaseBatch, cfg, scaling, fns: StepFunctions) -> torc
         fric_vel=phys[:, 0:1], ht_flux=phys[:, 1:2],
         surface_stress_scale=cfg.surface_stress_scale,
         surface_heat_flux_scale=cfg.surface_heat_flux_scale,
+        surface_fe_state=b.surface_fe_state, z0m=b.surface_z0m,
         state_jacobian=state_jacobian, check_values=False,
         terrain_height=h, terrain_slopes=b.surface_geometry[:, 1:3],
-        filter_width=filter_width)  # wall rows are built at z=0 above
+        filter_width=filter_width)  # wall rows like at physical altitude Z = h
     per_eq = torch.stack([_per_case_mean(r.square().reshape(-1), b.surface_sizes, b.k)
                           for r in res.values()])                    # (n_eq, k)
     return per_eq.mean(dim=0).mean()
@@ -829,7 +904,7 @@ def _save_checkpoint(model, optimizer, history, epoch, config, manifest=None) ->
     path = Path(config.checkpoint_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    torch.save({"schema_version": 5, "geometry_version": 2, "manifest": manifest,
+    torch.save({"schema_version": 7, "geometry_version": 2, "manifest": manifest,
                 "epoch": epoch, "model": model.state_dict(),
                 "optimizer": optimizer.state_dict(), "history": vars(history)}, tmp)
     tagged = path.with_name(f"{path.stem}_step{epoch:06d}{path.suffix}")
@@ -844,7 +919,7 @@ def _maybe_resume(model, optimizer, history, config, device) -> int:
         return 1
     ckpt = torch.load(config.checkpoint_path, map_location=device, weights_only=True,)
 
-    if (ckpt.get("schema_version") != 5 or ckpt.get("geometry_version") != 2):
+    if (ckpt.get("schema_version") != 7 or ckpt.get("geometry_version") != 2):
         raise ValueError(
             "Checkpoint uses a different formulation; use a new checkpoint path.")
 
@@ -853,7 +928,7 @@ def _maybe_resume(model, optimizer, history, config, device) -> int:
     current = asdict(config)
 
     keys = ("scaling", "source_scaling", "terrain_top_height",
-    "fe_surface_reference_z", "physics")
+    "fe_surface_reference_z", "physics", "flux_offset", "flux_scale")
 
     if any(saved.get(key) != current[key] for key in keys):
         raise ValueError("Checkpoint geometry, normalization, or physics differ; "

@@ -188,14 +188,58 @@ def _validate_no_penetration_z_wall_inputs(coordinates: torch.Tensor, state: tor
     
     return bottom_mask
 
+def _surface_layer_transfer_coefficients(
+    theta, z1, z0m, fric_vel, ht_flux, physics, *, check_values=True,
+):
+    """2020 Dyer coefficients with |zeta| <= 2.5.
+
+    All inputs are physical (N, 1) tensors. Thermal roughness is
+    assumed equal to momentum roughness, as in the 2020 formula.
+    """
+    kappa = physics.constants.von_karman_constant
+    gravity = physics.constants.gravity
+
+    # Neutral conditions, including u_*=0 with zero heat flux.
+    ustar = torch.where(ht_flux == 0.0, torch.ones_like(fric_vel), fric_vel)
+
+    # zeta = (z1 + z0m)/L.
+    zeta = (-kappa * gravity * (z1 + z0m) * ht_flux / (ustar.pow(3) * theta))
+    zeta = zeta.clamp(min=-2.5, max=2.5)
+
+    # Keep the inactive unstable branch real at stable points.
+    unstable_zeta = torch.minimum(zeta, torch.zeros_like(zeta))
+    xi = (1.0 - 16.0 * unstable_zeta).pow(0.25)
+
+    psi_m_unstable = (2.0 * torch.log((1.0 + xi) / 2.0) + torch.log((1.0 + xi.square()) / 2.0)
+        - 2.0 * torch.atan(xi) + math.pi / 2.0
+    )
+    psi_h_unstable = (
+        2.0 * torch.log((1.0 + xi.square()) / 2.0)
+    )
+
+    psi_m = torch.where(zeta < 0.0, psi_m_unstable, -5.0 * zeta)
+    psi_h = torch.where(zeta < 0.0, psi_h_unstable, -5.0 * zeta)
+
+    log_z = torch.log((z1 + z0m) / z0m)
+    Dm = log_z - psi_m
+    Dh = log_z - psi_h
+
+    if check_values:
+        if not bool((torch.isfinite(Dm) & torch.isfinite(Dh) & (Dm > 0.0) & (Dh > 0.0)).all()):
+            raise ValueError("Surface transfer denominators must be finite and positive.")
+
+    cd = kappa**2 / Dm.square()
+    ch = kappa**2 / (Dm * Dh)
+    return cd, ch
+
 def no_penetration_z_wall_residuals(
     coordinates: torch.Tensor, state: torch.Tensor,
     reference_coordinates: torch.Tensor, reference_state: torch.Tensor,
     physics: PhysicsConfig = DEFAULT_PHYSICS,
     scaling: ResidualScalingConfig = DEFAULT_RESIDUAL_SCALING,
     surface_stress_scale: float = 3.8273,
-    *, fric_vel: torch.Tensor, ht_flux: torch.Tensor,
-    surface_heat_flux_scale: float = 1.0,
+    *, fric_vel: torch.Tensor, ht_flux: torch.Tensor, surface_fe_state: torch.Tensor,
+    z0m: torch.Tensor, surface_heat_flux_scale: float = 1.0,
     state_jacobian: "torch.Tensor | None" = None,
     check_values: bool = True,
     terrain_height: torch.Tensor, terrain_slopes: torch.Tensor,
@@ -219,6 +263,11 @@ def no_penetration_z_wall_residuals(
     extended down to the surface. Supply the values from grid_geometry.
     A Tensor is used for both the autograd and Taylor boundary paths.
 
+    surface_fe_state contains physical FE values at native z-index 0,
+    with shape (N, 4) and columns (rho_d, u, v, theta). Each row must
+    correspond to the same location and time as reference_state.
+    z0m contains physical momentum roughness lengths, shape (N, 1).
+
     state_jacobian, when supplied, contains derivatives of normalized
     state with respect to physical coordinates, with shape
     (n_coord, N, n_state). Otherwise, derivatives use autograd.
@@ -226,6 +275,11 @@ def no_penetration_z_wall_residuals(
     check_values=False skips value checks and surface-point masking.
     The caller then guarantees valid inputs and that every row lies
     on the supplied terrain surface.
+
+    Heat-flux supervision compares expanded surface-layer fluxes at
+    matched first-cell points. Effective skin potential temperature is
+    inferred from FE observations only and shared by both calculations.
+    It is not a network output or a separately loaded temperature field.
     """
     bottom_mask = _validate_no_penetration_z_wall_inputs(
         coordinates=coordinates, state=state,
@@ -234,7 +288,7 @@ def no_penetration_z_wall_residuals(
         check_values=check_values, terrain_height=terrain_height, terrain_slopes=terrain_slopes,
     )
 
-    for name, field in (("fric_vel", fric_vel), ("ht_flux", ht_flux)):
+    for name, field in (("fric_vel", fric_vel), ("ht_flux", ht_flux), ("z0m", z0m)):
         if field.shape != (state.shape[0], 1):
             raise ValueError(f"{name} must have shape (num_wall_points, 1).")
         if check_values and not torch.isfinite(field).all():
@@ -244,8 +298,24 @@ def no_penetration_z_wall_residuals(
     if not math.isfinite(surface_heat_flux_scale) or surface_heat_flux_scale <= 0.0:
         raise ValueError("surface_heat_flux_scale must be finite and positive.")
 
-    fric_vel = fric_vel.to(state)
-    ht_flux = ht_flux.to(state)
+    if surface_fe_state.shape != (state.shape[0], 4):
+        raise ValueError("surface_fe_state must have shape (N, 4): rho_d, u, v, theta.")
+
+    if check_values:
+        if not torch.isfinite(surface_fe_state).all():
+            raise ValueError("surface_fe_state must contain finite values.")
+        if torch.any(surface_fe_state[:, [0, 3]] <= 0.0):
+            raise ValueError("FE density and potential temperature must be positive.")
+        if torch.any(z0m <= 0.0):
+            raise ValueError("z0m must be positive.")
+        if torch.any((fric_vel == 0.0) & (ht_flux != 0.0)):
+            raise ValueError("Nonzero heat flux requires positive friction velocity.")
+
+    # These are prescribed observations, not trainable model outputs.
+    fric_vel = fric_vel.to(state).detach()
+    ht_flux = ht_flux.to(state).detach()
+    z0m = z0m.to(state).detach()
+    surface_fe_state = surface_fe_state.to(state).detach()
 
     u_index = physics.variable_index("u")
     v_index = physics.variable_index("v")
@@ -263,6 +333,14 @@ def no_penetration_z_wall_residuals(
     # Physical first-reference-level velocities.
     u_1 = scaling.u.offset + scaling.u.scale * reference_state[:, u_index : u_index + 1]
     v_1 = scaling.v.offset + scaling.v.scale * reference_state[:, v_index : v_index + 1]
+
+    theta_1 = (scaling.theta.offset + scaling.theta.scale * reference_state[:, theta_index:theta_index + 1])
+
+    z1 = (scaling.z.offset + scaling.z.scale * reference_coordinates[:, 2:3]
+        - terrain_height.to(reference_coordinates)).to(state)
+
+    if check_values and (torch.any(z1 <= 0.0) or torch.any(theta_1 <= 0.0)):
+        raise ValueError("Reference height above ground and predicted theta must be positive.")
 
     rho_wall = _physical_density_from_state(state, physics, scaling)
     rho_1 = _physical_density_from_state(reference_state, physics, scaling)
@@ -286,17 +364,64 @@ def no_penetration_z_wall_residuals(
     _, _, k_m_wall, k_theta_wall = _diagnostic_sgs_coefficients(
         theta=theta_wall, theta_z=theta_z, e_sgs=e_sgs_wall, physics=physics, filter_width=filter_width)
     # Ordinary SGS stress evaluated on the fluid side of the wall.
-    tau_xz_wall = rho_wall * k_m_wall * (u_z + w_x)
-    tau_yz_wall = rho_wall * k_m_wall * (v_z + w_y)
+    tau_xz_sgs = -rho_wall * k_m_wall * (u_z + w_x)
+    tau_yz_sgs = -rho_wall * k_m_wall * (v_z + w_y)
 
-    # Supplied friction velocity sets magnitude; reference winds set direction.
-    horizontal_speed_1 = torch.sqrt(u_1.square() + v_1.square() + 1.0e-12)
-    tau_xz_surface = -rho_1 * fric_vel.square() * u_1 / horizontal_speed_1
-    tau_yz_surface = -rho_1 * fric_vel.square() * v_1 / horizontal_speed_1
+    # FE observations and model predictions at the same first cell.
+    rho_fe, u_fe, v_fe, theta_fe = surface_fe_state.split(1, dim=1)
 
-    # Potential-temperature SGS flux equals the supplied surface flux.
-    tau_theta_wall = -rho_wall * k_theta_wall * theta_z
-    tau_theta_surface = rho_1 * ht_flux
+    cd_model, ch_model = _surface_layer_transfer_coefficients(
+        theta_1, z1, z0m, fric_vel, ht_flux, physics, check_values=check_values)
+
+    # Prescribed skin temperature comes exclusively from FE inputs.
+    # No model prediction or trainable gradient enters this calculation.
+    with torch.no_grad():
+        cd_fe, ch_fe = _surface_layer_transfer_coefficients(
+            theta_fe, z1, z0m, fric_vel, ht_flux, physics, check_values=check_values)
+
+        U_fe = torch.sqrt(u_fe.square() + v_fe.square())
+
+        if check_values and not bool((torch.isfinite(U_fe) & (U_fe > 0.0)).all()):
+            raise ValueError("Inferring skin theta requires positive finite FE wind speed.")
+
+        # htFlux_FE = ch_FE * U_FE * (theta_skin_FE - theta_FE).
+        theta_skin_fe = theta_fe + ht_flux / (ch_fe * U_fe)
+
+        if check_values and not bool((torch.isfinite(theta_skin_fe) & (theta_skin_fe > 0.0)).all()):
+            raise ValueError("Inferred skin theta must be finite and positive.")
+
+    # Smooth the model wind norm to keep calm-wind gradients finite.
+    U_model = torch.sqrt(u_1.square() + v_1.square() + 1.0e-12)
+
+    # Expanded surface-layer momentum fluxes.
+    tau_xz_sl_model = -rho_1 * cd_model * u_1 * U_model
+    tau_yz_sl_model = -rho_1 * cd_model * v_1 * U_model
+
+    tau_xz_sl_fe = -rho_fe * cd_fe * u_fe * U_fe
+    tau_yz_sl_fe = -rho_fe * cd_fe * v_fe * U_fe
+
+    # Active: model SL stresses versus FE SL stresses.
+    r_xz = (tau_xz_sl_model - tau_xz_sl_fe) / surface_stress_scale
+    r_yz = (tau_yz_sl_model - tau_yz_sl_fe) / surface_stress_scale
+
+    # Alternative: model SL stresses versus ordinary SGS stresses.
+    # Disable the active assignments above before enabling these.
+    # r_xz = (tau_xz_sl_model - tau_xz_sgs) / surface_stress_scale
+    # r_yz = (tau_yz_sl_model - tau_yz_sgs) / surface_stress_scale
+
+    # Density-weighted potential-temperature flux; no cp factor.
+    q_sgs = -rho_wall * k_theta_wall * theta_z
+
+    # Both SL expressions use the SAME prescribed FE-derived skin theta.
+    q_sl_model = (rho_1 * ch_model * U_model * (theta_skin_fe - theta_1))
+    q_sl_fe = (rho_fe * ch_fe * U_fe * (theta_skin_fe - theta_fe))
+
+    # Active: model SL heat flux versus FE SL heat flux.
+    r_heat = (q_sl_model - q_sl_fe) / surface_heat_flux_scale
+
+    # Alternative: ordinary SGS heat flux versus expanded model SL flux.
+    # Disable the active assignment above before enabling this.
+    # r_heat = (q_sgs - q_sl_model) / surface_heat_flux_scale
 
     slopes = terrain_slopes.to(state)
     hx = slopes[:, 0:1]
@@ -305,7 +430,7 @@ def no_penetration_z_wall_residuals(
     bottom = (lambda r: r) if bottom_mask is None else (lambda r: r[bottom_mask])
     return {
         "no_penetration_w": normal_velocity / scaling.w.scale, # z = 0 and z = z_max
-        "surface_stress_xz": bottom((tau_xz_wall + tau_xz_surface) / surface_stress_scale), # z = 0
-        "surface_stress_yz": bottom((tau_yz_wall + tau_yz_surface) / surface_stress_scale), # z = 0
-        "surface_heat_flux": bottom((tau_theta_wall - tau_theta_surface) / surface_heat_flux_scale),
+        "surface_stress_xz": bottom(r_xz), # z = 0
+        "surface_stress_yz": bottom(r_yz), # z = 0
+        "surface_heat_flux": bottom(r_heat),
     }
