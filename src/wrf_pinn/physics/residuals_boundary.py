@@ -247,6 +247,7 @@ def no_penetration_z_wall_residuals(
     check_values: bool = True,
     terrain_height: torch.Tensor, terrain_slopes: torch.Tensor,
     filter_width: torch.Tensor,
+    raw_residuals: dict[str, torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Return terrain no-penetration, surface stress, and heat-flux residuals.
 
@@ -424,13 +425,17 @@ def no_penetration_z_wall_residuals(
     tau_yz_sl_fe = -rho_fe * cd_fe * v_fe * U_fe
 
     # Active: model SL stresses versus FE SL stresses.
-    r_xz = (tau_xz_sl_model - tau_xz_sl_fe) / xz_scale
-    r_yz = (tau_yz_sl_model - tau_yz_sl_fe) / yz_scale
+    raw_xz = tau_xz_sl_model - tau_xz_sl_fe
+    raw_yz = tau_yz_sl_model - tau_yz_sl_fe
 
     # Alternative: model SL stresses versus ordinary SGS stresses.
     # Disable the active assignments above before enabling these.
-    # r_xz = (tau_xz_sl_model - tau_xz_sgs) / xz_scale
-    # r_yz = (tau_yz_sl_model - tau_yz_sgs) / yz_scale
+    # raw_xz = tau_xz_sl_model - tau_xz_sgs
+    # raw_yz = tau_yz_sl_model - tau_yz_sgs
+
+    # Normalized residuals used by the training loss.
+    r_xz = raw_xz / xz_scale
+    r_yz = raw_yz / yz_scale
 
     # Density-weighted potential-temperature flux; no cp factor.
     q_sgs = -rho_wall * k_theta_wall * theta_z
@@ -440,20 +445,39 @@ def no_penetration_z_wall_residuals(
     q_sl_fe = (rho_fe * ch_fe * U_fe * (theta_skin_fe - theta_fe))
 
     # Active: model SL heat flux versus FE SL heat flux.
-    r_heat = (q_sl_model - q_sl_fe) / surface_heat_flux_scale
+    raw_heat = q_sl_model - q_sl_fe
 
     # Alternative: ordinary SGS heat flux versus expanded model SL flux.
     # Disable the active assignment above before enabling this.
-    # r_heat = (q_sgs - q_sl_model) / surface_heat_flux_scale
+    # raw_heat = q_sgs - q_sl_model
+
+    # Normalized residual used by the training loss.
+    r_heat = raw_heat / surface_heat_flux_scale
 
     slopes = terrain_slopes.to(state)
     hx = slopes[:, 0:1]
     hy = slopes[:, 1:2]
-    normal_velocity = (w_wall - u_wall * hx - v_wall * hy) / torch.sqrt(1.0 + hx.square() + hy.square())
-    bottom = (lambda r: r) if bottom_mask is None else (lambda r: r[bottom_mask])
+
+    normal_velocity =( ( w_wall - u_wall * hx - v_wall * hy ) 
+     / torch.sqrt(1.0 + hx.square() + hy.square()) )
+
+    bottom = ( (lambda r: r) if bottom_mask is None
+        else (lambda r: r[bottom_mask]) )
+
+    # Optional logging output: physical residuals, detached from autograd.
+    # Apply the same point selection as the corresponding training residuals.
+    if raw_residuals is not None:
+        raw_residuals.update({
+            "no_penetration_w": normal_velocity.detach(),
+            "surface_stress_xz": bottom(raw_xz.detach()),
+            "surface_stress_yz": bottom(raw_yz.detach()),
+            "surface_heat_flux": bottom(raw_heat.detach()),
+        })
+
+    # Existing normalized outputs used by the training loss.
     return {
-        "no_penetration_w": normal_velocity / normal_scale, # z = 0 and z = z_max
-        "surface_stress_xz": bottom(r_xz), # z = 0
-        "surface_stress_yz": bottom(r_yz), # z = 0
+        "no_penetration_w": normal_velocity / normal_scale,
+        "surface_stress_xz": bottom(r_xz),
+        "surface_stress_yz": bottom(r_yz),
         "surface_heat_flux": bottom(r_heat),
     }

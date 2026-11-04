@@ -34,7 +34,11 @@ from wrf_pinn.training.losses import PDEResidualScales
 from wrf_pinn.physics.grid_geometry import sgs_filter_width, terrain_height_jet
 #: the five losses of the conditional PINN, in order.
 LOSS_NAMES: tuple[str, ...] = ("data", "initial", "flow_boundary", "pde", "surface")
-
+PDE_RAW_NAMES = ("mass", "x_momentum", "y_momentum", "z_momentum",
+    "potential_temperature", "water_vapor")
+SURFACE_RAW_NAMES = ("surface_stress_xz", "surface_stress_yz",
+    "surface_heat_flux", "no_penetration_w")
+RAW_RESIDUAL_NAMES = PDE_RAW_NAMES + SURFACE_RAW_NAMES
 
 @dataclass
 class ConditionalHistory:
@@ -577,7 +581,8 @@ def _taylor_supported(model: nn.Module) -> bool:
     return getattr(getattr(model, "config", None), "activation", None) == "tanh"
 
 
-def _surface_loss(model, b: CaseBatch, cfg, scaling, fns: StepFunctions) -> torch.Tensor:
+def _surface_loss(model, b: CaseBatch, cfg, scaling, fns: StepFunctions,
+                  *, raw_mse: dict[str, torch.Tensor] | None = None) -> torch.Tensor:
     """Surface-layer residual on each case's bottom face, using its stored fluxes.
 
     Wall coords come from the surface rows (x,y,t normalized; z at the floor);
@@ -626,6 +631,7 @@ def _surface_loss(model, b: CaseBatch, cfg, scaling, fns: StepFunctions) -> torc
     f_off = _device_constant(tuple(cfg.flux_offset), dev, dt)
     f_scale = _device_constant(tuple(cfg.flux_scale), dev, dt)
     phys = surf[:, 3:] * f_scale + f_off                             # un-normalize fluxes
+    raw_fields = {} if raw_mse is not None else None
     res = no_penetration_z_wall_residuals(
         coordinates=wall, state=wall_state,
         reference_coordinates=reference, reference_state=reference_state,
@@ -638,14 +644,24 @@ def _surface_loss(model, b: CaseBatch, cfg, scaling, fns: StepFunctions) -> torc
         surface_fe_state=b.surface_fe_state, z0m=b.surface_z0m,
         state_jacobian=state_jacobian, check_values=False,
         terrain_height=h, terrain_slopes=b.surface_geometry[:, 1:3],
-        filter_width=filter_width)  # wall rows like at physical altitude Z = h
+        filter_width=filter_width,
+        raw_residuals=raw_fields)  # wall rows like at physical altitude Z = h
+    if raw_mse is not None:
+        raw_mse.update({
+            name: _per_case_mean(
+                r.detach().square().reshape(-1), b.surface_sizes, b.k,
+            ).mean() for name, r in raw_fields.items()
+        })
+
     per_eq = torch.stack([_per_case_mean(r.square().reshape(-1), b.surface_sizes, b.k)
                           for r in res.values()])                    # (n_eq, k)
     return per_eq.mean(dim=0).mean()
 
 
 def _pde_loss(model, coll: torch.Tensor, z: torch.Tensor, cfg, scaling, fns: StepFunctions,
-              out: "Jet | None" = None, *, terrain_batch: CaseBatch) -> torch.Tensor:
+              out: "Jet | None" = None,
+              *, terrain_batch: CaseBatch, raw_mse: dict[str, torch.Tensor] | None = None,
+              ) -> torch.Tensor:
     """Mean of six PDE residual MSEs, using local SGS widths.
 
     ``z`` holds one latent row per case; each case owns ``cfg.n_collocation``
@@ -692,6 +708,10 @@ def _pde_loss(model, coll: torch.Tensor, z: torch.Tensor, cfg, scaling, fns: Ste
             physics=cfg.physics, scaling=scaling,
             filter_width=filter_width,
         )
+    if raw_mse is not None:
+        raw_mse.update({
+            name: r.detach().square().mean() for name, r in res.items()
+        })
 
     return torch.stack([
         (r / cfg.pde_residual_scales.scale_for(name)).square().mean()
@@ -715,7 +735,8 @@ def _ramp(b: CaseBatch, coords: torch.Tensor, sizes: torch.Tensor) -> torch.Tens
 
 
 def _pde_loss_on_nodes(model, b: CaseBatch, u: torch.Tensor, cfg, scaling,
-                       fns: StepFunctions) -> torch.Tensor:
+                       fns: StepFunctions, *,
+                       raw_mse: dict[str, torch.Tensor] | None = None) -> torch.Tensor:
     """PDE loss of initial + ramp * network (predict_change) at grid nodes, where the
     initial field's derivatives are known. ``u`` (k, n_collocation, 4) uniform draws:
     column 0 picks each point's node, column 3 its time in the window."""
@@ -733,12 +754,13 @@ def _pde_loss_on_nodes(model, b: CaseBatch, u: torch.Tensor, cfg, scaling,
     out = transform_state_jet(
         _with_initial(net, s, ds, b.base_v[node], b.base_d[:, node], b.base_h[:, node]),
         model.config)
-    return _pde_loss(model, coll, b.z, cfg, scaling, fns, out=out, terrain_batch=b)
+    return _pde_loss(model, coll, b.z, cfg, scaling, fns, out=out, terrain_batch=b, raw_mse=raw_mse)
 
 
 def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
                   unit_coll: "torch.Tensor | None" = None,
-                  fns: "StepFunctions | None" = None) -> dict[str, torch.Tensor]:
+                  fns: "StepFunctions | None" = None, *,
+                  raw_mse: dict[str, torch.Tensor] | None = None) -> dict[str, torch.Tensor]:
     """The five losses, each averaged over the batch's cases (one forward per loss).
 
     ``unit_coll`` is (k, n_collocation, n_coord) uniform [0, 1) draws placing each
@@ -796,7 +818,7 @@ def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
             u = unit_coll if unit_coll is not None else torch.rand(
                 (k, cfg.n_collocation, b.box_lo.shape[1]), device=pred.device, dtype=pred.dtype)
             if cfg.predict_change:
-                pde = _pde_loss_on_nodes(model, b, u, cfg, scaling, fns)
+                pde = _pde_loss_on_nodes(model, b, u, cfg, scaling, fns, raw_mse=raw_mse)
             else:
                 source_off, source_scale = _coordinate_affine(cfg.source_scaling, u)
                 model_off, model_scale = _coordinate_affine(scaling, u)
@@ -808,13 +830,13 @@ def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
                 physical[:, :, 2] = _source_height_to_altitude(physical[:, :, 2], h, cfg)
                 coll = ((physical - model_off) / model_scale).reshape(-1, 4)
 
-                pde = _pde_loss(model, coll, b.z, cfg, scaling, fns, terrain_batch=b)
+                pde = _pde_loss(model, coll, b.z, cfg, scaling, fns, terrain_batch=b, raw_mse=raw_mse)
     else:
         pde = zero
 
     if cfg.weight_surface != 0.0:
         with record_function("loss/surface"):
-            surface = _surface_loss(model, b, cfg, scaling, fns)
+            surface = _surface_loss(model, b, cfg, scaling, fns, raw_mse=raw_mse)
     else:
         surface = zero
 
@@ -988,6 +1010,8 @@ def train_conditional(
                "flow_boundary": config.weight_flow_boundary,
                "pde": config.weight_pde, "surface": config.weight_surface}
 
+    raw_names = (  ( PDE_RAW_NAMES if config.weight_pde != 0.0 else () )
+        + ( SURFACE_RAW_NAMES if config.weight_surface != 0.0 else () ) )
     start_epoch = _maybe_resume(model, optimizer, history, config, device)
     k = min(config.batch_cases, n_cases)
     draw = lambda: torch.randperm(n_cases, generator=rng)[:k].tolist()
@@ -1026,7 +1050,17 @@ def train_conditional(
         for group in optimizer.param_groups:
             group["lr"] = lr
         optimizer.zero_grad()
-        watch["on"] = rank == 0 and (epoch == 1 or epoch == config.epochs or epoch % config.log_every == 0)
+        log_residuals = (epoch == 1
+            or epoch == config.epochs
+            or epoch % config.log_every == 0
+        )
+        watch["on"] = rank == 0 and log_residuals
+
+        # One sum per active residual, followed by the case count.
+        raw_sums = (
+            torch.zeros(len(raw_names) + 1, device=device)
+            if log_residuals and raw_names else None
+        )
         # Gradient accumulation: each pass's loss is weighted by its share of the
         # batch, so the summed gradients equal one pass over all k cases.
         losses = torch.zeros(1 + len(weights), device=device)
@@ -1039,12 +1073,16 @@ def train_conditional(
             share = b.k / k
             u = unit_coll[first:first + b.k] if unit_coll is not None else None
             first += b.k
-            batch = _batch_losses(model, b, config, u, fns)
+            batch_raw = {} if raw_sums is not None else None
+            batch = _batch_losses(model, b, config, u, fns, raw_mse=batch_raw)
             total = sum(weights[name] * batch[name] for name in weights)
             with record_function("step/backward"):
                 (share * total).backward()
             losses += share * torch.stack([total.detach()] + [batch[n].detach() for n in weights])
-            del batch, total, b  # free this pass's graph before the next
+            if raw_sums is not None:
+                raw_sums[:-1] += b.k * torch.stack([ batch_raw[n] for n in raw_names ])
+                raw_sums[-1] += b.k
+            del batch, total, b, batch_raw  # free this pass's graph before the next
         if prof is not None:
             if cuda:
                 torch.cuda.synchronize()
@@ -1055,6 +1093,17 @@ def train_conditional(
         losses = losses.cpu().tolist()
         if not all(map(lambda x: x == x and abs(x) != float("inf"), losses)):
             raise FloatingPointError(f"Non-finite loss at epoch {epoch}.")
+
+        # Disabled groups remain None and are reported as N/A.
+        raw_rms = dict.fromkeys(RAW_RESIDUAL_NAMES) if log_residuals else None
+        if raw_sums is not None:
+            if world > 1:
+                dist.all_reduce(raw_sums)  # SUM across all GPUs
+            values = ( raw_sums[:-1] / raw_sums[-1] ).sqrt().cpu().tolist()
+            if not all(math.isfinite(v) for v in values):
+                raise FloatingPointError(f"Non-finite raw residual RMS at epoch {epoch}.")
+            raw_rms.update(zip(raw_names, values))
+
         # Clip gradients: PDE residual gradients (2nd derivatives via autograd) can
         # spike and freeze training. Standard PINN safeguard.
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_norm)
@@ -1076,12 +1125,13 @@ def train_conditional(
         if on_step is not None:
             on_step(epoch)
 
-        if rank == 0 and (epoch == 1 or epoch == config.epochs or epoch % config.log_every == 0):
+        if rank == 0 and log_residuals:
             if config.events_path:
                 norm = float(grad_norm.detach().cpu())
                 write_event(config.events_path, {
                     "event": "step", "epoch": epoch,
                     "losses": dict(zip(("total", *weights), losses)),
+                    "raw_residual_rms": raw_rms,
                     "gradient_norm_before_clip": norm if math.isfinite(norm) else None,
                     "gradient_norm_finite": math.isfinite(norm),
                     "gradient_clip_norm": config.grad_clip_norm,
@@ -1096,6 +1146,14 @@ def train_conditional(
                   f"lr={lr:.2e} {s_step:.2f}s/step wait={wait_window / steps_window * 1e3:.0f}ms/step "
                   f"elapsed={(now - t_start) / 3600:.2f}h eta={eta_h:.2f}h{mem}",
                   file=sys.stderr, flush=True)
+
+            raw_parts = " ".join( f"{name}={value:.4e}"
+                if value is not None else f"{name}=N/A"
+                for name, value in raw_rms.items()
+            )
+            print(f"  raw residual RMS (physical units): {raw_parts}",
+                file=sys.stderr, flush=True)
+
             if watch["sat"] or watch["lat"]:
                 msg = f"  collapse check: first tanh saturated {torch.stack(watch['sat']).mean():.3f}" if watch["sat"] else "  collapse check:"
                 if len(watch["lat"]) > 0:
