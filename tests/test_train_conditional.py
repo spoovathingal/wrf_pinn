@@ -22,8 +22,32 @@ from dataclasses import replace
 
 from wrf_pinn.config.scaling import ResidualScalingConfig, VariableScale
 import wrf_pinn.training.train_conditional as tc
-
+import wrf_pinn.models.conditional as tm
+from wrf_pinn.config.physics import DEFAULT_PHYSICS
 LATENT_DIM = 8
+RHO_D = STATE_VARS.index("rho_d")
+
+
+def _surface_members(n_times: int, n_surface: int, rng, height=0.0) -> dict:
+    """Surface-layer members of a case: FE rho_d, u, v, theta at the first level; z0m;
+    ground height (m) at each surface point."""
+    fe = np.stack([1.1 + 0.05 * rng.random((n_times, n_surface)),
+                   2.0 + rng.random((n_times, n_surface)),
+                   2.0 + rng.random((n_times, n_surface)),
+                   300.0 + rng.random((n_times, n_surface))], axis=-1)
+    return dict(surface_fe_state=fe.astype(np.float32),
+                surface_z0m=np.full((n_surface, 1), 0.1, dtype=np.float32),
+                surface_height=np.broadcast_to(np.asarray(height, dtype=np.float32).reshape(-1, 1),
+                                               (n_surface, 1)).copy())
+
+
+def _positive_rho_d(a: np.ndarray, axis: int, rng) -> np.ndarray:
+    """``a`` with its rho_d entries along ``axis`` set to physical-looking densities."""
+    a = a.copy()
+    idx = [slice(None)] * a.ndim
+    idx[axis] = RHO_D
+    a[tuple(idx)] = 1.0 + 0.1 * rng.random(a[tuple(idx)].shape)
+    return a
 
 
 def _make_case(name: str, seed: int) -> ConditionalCase:
@@ -33,20 +57,23 @@ def _make_case(name: str, seed: int) -> ConditionalCase:
     n_times, face_len, n_pts = 3, 4, 12
     rng = np.random.default_rng(seed)
     f32 = np.float32
+    surface = rng.random((n_times, 9, 5))
+    surface[:, :, :2] = surface[:1, :, :2]       # surface points stay put across times
     return ConditionalCase(
         name=name,
         z=rng.standard_normal(LATENT_DIM).astype(f32),
         initial_coords=rng.random((n_ic, nc)).astype(f32),
-        initial=rng.standard_normal(
+        initial=_positive_rho_d(rng.standard_normal(
             (nv, nz, nx * ny)
-        ).astype(f32),
-        boundary=rng.standard_normal(
+        ), 0, rng).astype(f32),
+        boundary=_positive_rho_d(rng.standard_normal(
             (nv, nf, n_times, face_len)
-        ).astype(f32),
+        ), 0, rng).astype(f32),
         boundary_coords=rng.random(
             (nf, n_times, face_len, nc)
         ).astype(f32),
-        surface=rng.random((n_times, 9, 5)).astype(f32),
+        surface=surface.astype(f32),
+        **_surface_members(n_times, 9, rng),
         terrain=np.array(
             [
                 [0.0, 0.0, 0.0],
@@ -57,7 +84,7 @@ def _make_case(name: str, seed: int) -> ConditionalCase:
             dtype=f32,
             ),
         interior=rng.random((n_pts, nc)).astype(f32),
-        targets=rng.standard_normal((n_pts, nv)).astype(f32),
+        targets=_positive_rho_d(rng.standard_normal((n_pts, nv)), 1, rng).astype(f32),
         target_mask=np.ones((n_pts, nv), dtype=f32),
         times=np.arange(n_times, dtype=f32),
     )
@@ -74,19 +101,19 @@ def _geometry_fixture():
         dtype=np.float32,
     )
 
+    rng = np.random.default_rng(0)
     case = ConditionalCase(
         name="geometry",
         z=np.zeros(LATENT_DIM, dtype=np.float32),
         initial_coords=rows.copy(),
-        initial=np.zeros((len(STATE_VARS), 1, 4), dtype=np.float32),
+        initial=_positive_rho_d(np.zeros((len(STATE_VARS), 1, 4)), 0, rng).astype(np.float32),
         boundary_coords=np.tile(rows, (len(FACE_NAMES), 1, 1, 1)),
-        boundary=np.zeros(
-            (len(STATE_VARS), len(FACE_NAMES), 1, 4),
-            dtype=np.float32,
-        ),
+        boundary=_positive_rho_d(np.zeros(
+            (len(STATE_VARS), len(FACE_NAMES), 1, 4)), 0, rng).astype(np.float32),
         surface=np.column_stack(
             (rows[:, [0, 1, 3]], np.zeros((4, 2), dtype=np.float32))
         )[None],
+        **_surface_members(1, 4, rng, height=[100.0, 300.0, 400.0, 600.0]),
         terrain=np.array(
             [
                 [0.0, 0.0, 100.0],
@@ -97,7 +124,7 @@ def _geometry_fixture():
             dtype=np.float32,
         ),
         interior=rows.copy(),
-        targets=np.zeros((4, len(STATE_VARS)), dtype=np.float32),
+        targets=_positive_rho_d(np.zeros((4, len(STATE_VARS))), 1, rng).astype(np.float32),
         target_mask=np.ones((4, len(STATE_VARS)), dtype=np.float32),
         times=np.array([0.0], dtype=np.float32),
     ).as_torch()
@@ -114,7 +141,7 @@ def _geometry_fixture():
     cfg = ConditionalTrainConfig(
         source_scaling=source,
         scaling=model_scaling,
-        source_z_mode="fe_terrain_following",
+        physics=replace(DEFAULT_PHYSICS, sgs_reference_z=(10.0, 55.0, 100.0)),
         terrain_top_height=1000.0,
         fe_surface_reference_z=10.0,
         n_collocation=4,
@@ -126,7 +153,7 @@ def _geometry_fixture():
 # PDE/surface losses need physical fields; random synthetic data drives the moist
 # EOS to NaN, so the data-wiring smoke tests zero those weights.
 _DATA_ONLY = dict(weight_pde=0.0, weight_surface=0.0,
-    source_scaling=ResidualScalingConfig())
+    source_scaling=ResidualScalingConfig(), scaling=ResidualScalingConfig())
 
 
 def test_pipeline_runs():
@@ -163,11 +190,10 @@ def test_checkpoint_save_and_resume(tmp_path):
     # the saved epoch must be the last multiple of checkpoint_every (or final epoch)
     ck = torch.load(str(ckpt), map_location="cpu")
     assert ck["epoch"] == 20
-    assert ck["schema_version"] == 3
+    assert ck["schema_version"] == 7
     assert ck["geometry_version"] == 2
 
     saved_training = ck["manifest"]["training"]
-    assert saved_training["source_z_mode"] == cfg.source_z_mode
     assert saved_training["terrain_top_height"] == cfg.terrain_top_height
     assert saved_training["fe_surface_reference_z"] == cfg.fe_surface_reference_z
     assert ck["manifest"]["model"]["latent_dim"] == LATENT_DIM
@@ -182,11 +208,13 @@ def test_checkpoint_save_and_resume(tmp_path):
     # Changed geometry must not silently resume an existing run.
     for changed in (
         {"terrain_top_height": cfg.terrain_top_height + 100.0},
-        {"fe_surface_reference_z": cfg.fe_surface_reference_z + 1.0},
-        {"source_z_mode": "height_above_ground"},
+        {"fe_surface_reference_z": cfg.fe_surface_reference_z + 1.0,
+         "physics": replace(cfg.physics, sgs_reference_z=(cfg.physics.sgs_reference_z[0] + 1.0,)
+                            + tuple(cfg.physics.sgs_reference_z[1:]))},
+        {"physics": replace(cfg.physics, sgs_dx=cfg.physics.sgs_dx + 1.0)},
     ):
         incompatible = replace(cfg, epochs=21, **changed)
-        with pytest.raises(ValueError, match="settings differ"):
+        with pytest.raises(ValueError, match="physics differ"):
             train_conditional(model, cases, incompatible)
 
     # Previous geometry versions must also be rejected.
@@ -196,7 +224,7 @@ def test_checkpoint_save_and_resume(tmp_path):
     incompatible = replace(
         cfg, epochs=21, checkpoint_path=str(old_path)
     )
-    with pytest.raises(ValueError, match="settings differ"):
+    with pytest.raises(ValueError, match="different formulation"):
         train_conditional(model, cases, incompatible)
 
     # resume into a FRESH model: weights load from the checkpoint, start epoch advances.
@@ -237,7 +265,7 @@ def test_collocation_points_independent_of_cases_per_pass(monkeypatch):
     def collocation(cases_per_pass: int) -> torch.Tensor:
         seen = []
 
-        def fake_pde(model, coll, z_rows, cfg, scaling, fns=None):  # random data NaNs the real PDE
+        def fake_pde(model, coll, z_rows, cfg, scaling, fns=None, *, terrain_batch):  # random data NaNs the real PDE
             seen.append(coll.detach().clone())
             return (model(coll, z_rows, cfg.n_collocation) * 0.0).sum()  # z per case
 
@@ -246,7 +274,7 @@ def test_collocation_points_independent_of_cases_per_pass(monkeypatch):
         model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=16))
         cfg = ConditionalTrainConfig(epochs=3, batch_cases=4, cases_per_pass=cases_per_pass,
                                      n_collocation=16, device="cpu", log_every=100,
-                                     source_scaling=ResidualScalingConfig(),weight_surface=0.0)
+                                     source_scaling=ResidualScalingConfig(), scaling=ResidualScalingConfig(), weight_surface=0.0)
         train_conditional(model, cases, cfg)
         return torch.cat(seen)
 
@@ -311,16 +339,20 @@ def _write_case_npz(path, seed: int) -> None:
     _, nf, nt, fl = case.boundary.shape
     rng = np.random.default_rng(seed)
     f32 = np.float32
-    blob = {k: getattr(case, k) for k in ("initial_coords", "boundary_coords", "surface", "terrain",
-                                          "interior", "targets", "times")}
+    blob = {k: getattr(case, k) for k in ("initial_coords", "boundary_coords", "surface",
+                                          "surface_fe_state", "surface_z0m", "surface_height",
+                                          "terrain", "interior", "targets", "times")}
     for v in STATE_VARS:
-        blob[f"ini_mean_{v}"] = rng.standard_normal(nxy).astype(f32)
+        # rho_d decodes to a positive density: mean near 1, small modes
+        mean = (lambda n: 1.0 + 0.1 * rng.random(n)) if v == "rho_d" else rng.standard_normal
+        amp = 0.01 if v == "rho_d" else 1.0
+        blob[f"ini_mean_{v}"] = mean(nxy).astype(f32)
         blob[f"ini_modes_{v}"] = rng.standard_normal((nxy, 1)).astype(f32)
-        blob[f"ini_coeffs_{v}"] = rng.standard_normal((nz, 1)).astype(f32)
+        blob[f"ini_coeffs_{v}"] = (amp * rng.standard_normal((nz, 1))).astype(f32)
         for f in range(nf):
-            blob[f"bnd_mean_{v}_{f}"] = rng.standard_normal(fl).astype(f32)
+            blob[f"bnd_mean_{v}_{f}"] = mean(fl).astype(f32)
             blob[f"bnd_modes_{v}_{f}"] = rng.standard_normal((fl, 1)).astype(f32)
-            blob[f"bnd_coeffs_{v}_{f}"] = rng.standard_normal((nt, 1)).astype(f32)
+            blob[f"bnd_coeffs_{v}_{f}"] = (amp * rng.standard_normal((nt, 1))).astype(f32)
     np.savez(path, **blob)
 
 
@@ -406,7 +438,7 @@ def test_terrain_collocation_matches_observations(monkeypatch):
     )
     seen = {}
 
-    def capture_pde(model, coll, z_rows, config, scaling, fns):
+    def capture_pde(model, coll, z_rows, config, scaling, fns, *, terrain_batch):
         seen["coordinates"] = coll.detach().clone()
         return coll.new_zeros(())
 
@@ -456,39 +488,16 @@ def test_terrain_surface_reference_height(monkeypatch):
         torch.tensor([0.129, 0.327, 0.426, 0.624]),
     )
 
-def test_physical_altitude_is_not_transformed_twice():
-    case, cfg = _geometry_fixture()
-    expected = tc.stack_cases([case], cfg)
-
-    physical_case = replace(
-        case,
-        interior=expected.interior,
-        initial_coords=expected.initial_coords,
-        boundary_coords=expected.boundary_coords.reshape_as(
-            case.boundary_coords
-        ),
-    )
-    physical_cfg = replace(
-        cfg,
-        source_z_mode="physical_altitude",
-        source_scaling=cfg.scaling,
-    )
-    actual = tc.stack_cases([physical_case], physical_cfg)
-
-    torch.testing.assert_close(actual.interior, expected.interior)
-    torch.testing.assert_close(actual.initial_coords, expected.initial_coords)
-    torch.testing.assert_close(actual.boundary_coords, expected.boundary_coords)
-
 @pytest.mark.parametrize(
     "changes",
     [
         {"terrain_top_height": 0.0},
+        {"terrain_top_height": 90.0},
         {"terrain_top_height": float("nan")},
         {"terrain_top_height": float("inf")},
         {"fe_surface_reference_z": 0.0},
         {"fe_surface_reference_z": float("nan")},
         {"fe_surface_reference_z": 1000.0},
-        {"source_z_mode": "unknown"},
     ],
 )
 def test_invalid_terrain_configuration(changes):
@@ -513,8 +522,8 @@ def _write_raw_case_npz(path, seed: int) -> tuple[np.ndarray, np.ndarray]:
     rng = np.random.default_rng(seed + 100)
     nv, nz, nxy = case.initial.shape
     _, nf, nt, fl = case.boundary.shape
-    ini = rng.standard_normal((nv, nz, nxy)).astype(np.float32)
-    bnd = rng.standard_normal((nf, nt, fl, nv)).astype(np.float32)
+    ini = _positive_rho_d(rng.standard_normal((nv, nz, nxy)), 0, rng).astype(np.float32)
+    bnd = _positive_rho_d(rng.standard_normal((nf, nt, fl, nv)), 3, rng).astype(np.float32)
     with np.load(path) as blob:
         members = dict(blob)
     np.savez(path, **members, ini_raw=ini, bnd_raw=bnd, initial_grid=np.array([3, 3, nz]))
@@ -573,7 +582,7 @@ def test_raw_and_encoder_latents_train(tmp_path, latent):
     encoder = None
     if latent == "encoder":
         with np.load(paths[0]) as b:
-            encoder = RawEncoder((7, 4, 3, 3), b["bnd_raw"].shape, out_dim=8, width=4)
+            encoder = RawEncoder((len(STATE_VARS), 4, 3, 3), b["bnd_raw"].shape, out_dim=8, width=4)
     model = ConditionalModel(z_dim, ConditionalModelConfig(hidden_layers=2, hidden_width=32), encoder)
     cfg = ConditionalTrainConfig(epochs=60, batch_cases=4, cases_per_pass=2, device="cpu",
                                  log_every=100, latent="raw", **_DATA_ONLY)
@@ -603,12 +612,12 @@ def test_terrain_latent_and_encoder_channels(tmp_path):
     h = _add_terrain_grid(tmp_path / "c0.npz", 0)
     z = read_conditional_case(tmp_path / "c0.npz", "raw_terrain").z
     np.testing.assert_array_equal(z, np.concatenate([bnd.ravel(), ini.ravel(), h.ravel()]))
-    enc = RawEncoder((7, 4, 3, 3), bnd.shape, out_dim=8, width=4, terrain=True)
+    enc = RawEncoder((len(STATE_VARS), 4, 3, 3), bnd.shape, out_dim=8, width=4, terrain=True)
     enc.set_terrain_stats(100.0, 50.0, 20.0)
     ch = enc.split_terrain(torch.from_numpy(z)[None]).numpy()[0]
     np.testing.assert_allclose(ch[0], (h - h.mean()) / 20.0, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(ch[1], np.full((3, 3), (h.mean() - 100.0) / 50.0), rtol=1e-5)
-    np.testing.assert_array_equal(enc.split(torch.from_numpy(z)[None])[0].numpy()[0], ini.reshape(7, 4, 3, 3))
+    np.testing.assert_array_equal(enc.split(torch.from_numpy(z)[None])[0].numpy()[0], ini.reshape(len(STATE_VARS), 4, 3, 3))
     z2 = torch.from_numpy(z)[None].clone()
     z2[0, -9:] += torch.from_numpy(np.linspace(0, 200, 9, dtype=np.float32))  # a different hill
     assert not torch.equal(enc(torch.from_numpy(z)[None]), enc(z2))
@@ -625,7 +634,7 @@ def test_terrain_encoder_trains(tmp_path):
     torch.manual_seed(0)
     z_dim = read_conditional_case(paths[0], "raw_terrain").z.shape[0]
     with np.load(paths[0]) as b:
-        encoder = RawEncoder((7, 4, 3, 3), b["bnd_raw"].shape, out_dim=8, width=4, terrain=True)
+        encoder = RawEncoder((len(STATE_VARS), 4, 3, 3), b["bnd_raw"].shape, out_dim=8, width=4, terrain=True)
     model = ConditionalModel(z_dim, ConditionalModelConfig(hidden_layers=2, hidden_width=32), encoder)
     cfg = ConditionalTrainConfig(epochs=60, batch_cases=4, cases_per_pass=2, device="cpu",
                                  log_every=100, latent="raw_terrain", **_DATA_ONLY)
@@ -669,3 +678,49 @@ def test_recipe_scaling_units():
     assert (sc.x.offset, sc.x.scale, sc.y.scale) == (21600.0, 47505.0, 45585.0)
     assert (sc.z.offset, sc.z.scale) == (10.0, 1410.0)
     assert (sc.t.offset, sc.t.scale) == (10020.0, 9840.0)
+
+
+def _positive_state(n: int, config: ConditionalModelConfig, seed: int = 0) -> torch.Tensor:
+    """Normalized states with physical TKE and rho_d above their floors."""
+    g = torch.Generator().manual_seed(seed)
+    x = torch.randn(n, len(STATE_VARS), generator=g, dtype=torch.float64)
+    for index, prefix, lo in ((tm.TKE_INDEX, "tke", 1e-4), (tm.RHO_D_INDEX, "rho_d", 0.9)):
+        physical = lo + torch.rand(n, generator=g, dtype=torch.float64)
+        x[:, index] = (physical - getattr(config, f"{prefix}_offset")) / getattr(config, f"{prefix}_scale")
+    return x
+
+
+def test_inverse_transform_round_trips():
+    """predict_change takes the initial field back through the output transform; forward again is the identity."""
+    config = ConditionalModelConfig(tke_offset=0.1, tke_scale=0.5, rho_d_offset=1.0, rho_d_scale=0.1)
+    x = _positive_state(64, config)
+    back = tm.transform_state_output(tm.inverse_transform_state(x, config), config)
+    torch.testing.assert_close(back, x, rtol=1e-9, atol=1e-9)
+
+
+def test_predict_change_keeps_tke_and_rho_d_positive():
+    """A large negative change, added before the transform, still leaves TKE and rho_d above their floors."""
+    config = ConditionalModelConfig(tke_offset=0.1, tke_scale=0.5, rho_d_offset=1.0, rho_d_scale=0.1)
+    base = tm.inverse_transform_state(_positive_state(64, config), config)
+    state = tm.transform_state_output(base - 100.0, config)
+    for index, prefix in ((tm.TKE_INDEX, "tke"), (tm.RHO_D_INDEX, "rho_d")):
+        physical = getattr(config, f"{prefix}_offset") + getattr(config, f"{prefix}_scale") * state[:, index]
+        # at the floor up to the offset/scale rounding
+        assert bool((physical > 0.0).all())
+        torch.testing.assert_close(physical.min(), torch.tensor(getattr(config, f"{prefix}_floor"),
+                                   dtype=physical.dtype), rtol=0.0, atol=1e-9)
+
+
+def test_raw_only_case_reads_raw_fields(tmp_path):
+    """A case written without POD (carver --no-pod) takes initial and boundary from ini_raw, bnd_raw."""
+    from wrf_pinn.data.conditional_case import read_conditional_case
+    path = tmp_path / "c0.npz"
+    ini, bnd = _write_raw_case_npz(path, 0)
+    with np.load(path) as blob:
+        members = {k: v for k, v in blob.items() if not k.startswith(("ini_m", "ini_c", "bnd_m", "bnd_c"))}
+    np.savez(path, **members)
+    case = read_conditional_case(path, "raw")
+    np.testing.assert_array_equal(case.initial, ini)
+    np.testing.assert_array_equal(case.boundary, np.moveaxis(bnd, -1, 0))
+    with pytest.raises(ValueError, match="no POD"):
+        read_conditional_case(path, "pod")

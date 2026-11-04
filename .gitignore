@@ -8,3 +8,4 @@ dist/
 *.egg-info/
 
 src/wrf_pinn/config/GenesisPINN.code-workspace
+.DS_Store

@@ -31,7 +31,11 @@ from functools import lru_cache
 import torch
 from torch import nn
 
-from wrf_pinn.models.conditional import first_layer
+from wrf_pinn.models.conditional import (
+    ConditionalModelConfig,
+    TKE_INDEX,RHO_D_INDEX,
+    first_layer, transform_state_output,
+)
 
 #: spatial second-derivative channels, in order (xx, yy, zz, xy, xz, yz)
 PAIRS: tuple[tuple[int, int], ...] = ((0, 0), (1, 1), (2, 2), (0, 1), (0, 2), (1, 2))
@@ -202,10 +206,79 @@ def _scale_column(scales: tuple[float, ...], device: torch.device,
     per-call host-to-device copy makes the CPU wait for the GPU."""
     return torch.tensor(scales, dtype=dtype, device=device)[:, None]
 
+def transform_state_jet(
+    raw: Jet, output_config: ConditionalModelConfig,
+) -> Jet:
+    """Apply the model's output transform to values and coordinate derivatives."""
+    if output_config is None:
+        raise ValueError(
+            "Pass model.config; Taylor derivatives require the model's "
+            "TKE & density normalization."
+        )
+
+    values = transform_state_output(raw.v, output_config)
+    derivatives = raw.d.to(values.dtype)
+    hessian = None if raw.h is None else raw.h.to(values.dtype)
+
+    transformed_d = derivatives
+    transformed_h = hessian
+    for index, prefix in (
+        (TKE_INDEX, "tke"),
+        (RHO_D_INDEX, "rho_d"),
+    ):
+        sl = slice(index, index + 1)
+        a = raw.v[:, sl].to(values.dtype)
+
+        # Match F.softplus(beta=1.0, threshold=20.0).
+        below_threshold = a < 20.0
+
+        # Preserve the existing handling of PyTorch's threshold:
+        # at exactly 20, retain the nonlinear first derivative,
+        # but use zero for the second derivative.
+        sigmoid_argument = torch.where(below_threshold, a, torch.full_like(a, 20.0))
+        sigmoid = torch.sigmoid(sigmoid_argument)
+
+        ratio = (getattr(output_config, f"{prefix}_softplus_scale")
+            / getattr(output_config, f"{prefix}_scale"))
+
+        first = ratio * torch.where(a > 20.0, torch.ones_like(a), sigmoid)
+        second = ratio * torch.where(below_threshold, sigmoid * (1.0 - sigmoid),
+            torch.zeros_like(a))
+
+        # First derivatives: f'(a) * a_i.
+        field_d = first * derivatives[..., sl]
+        transformed_d = torch.cat(
+            (
+                transformed_d[..., :index],
+                field_d,
+                transformed_d[..., index + 1:],
+            ),
+            dim=-1,
+        )
+
+        # Second derivatives: f'(a) * a_ij + f''(a) * a_i * a_j.
+        if hessian is not None:
+            products = torch.stack(
+                [derivatives[i, :, sl] * derivatives[j, :, sl] for i, j in PAIRS],
+                dim=0,
+            )
+            field_h = first * hessian[..., sl] + second * products
+            transformed_h = torch.cat(
+                (
+                    transformed_h[..., :index],
+                    field_h,
+                    transformed_h[..., index + 1:],
+                ),
+                dim=-1,
+            )
+
+    return Jet(values, transformed_d, transformed_h)
 
 def taylor_forward(net: nn.Sequential, coordinates: torch.Tensor, z_rows: torch.Tensor,
                    coordinate_scales: Sequence[float], second: bool = True,
-                   sizes: "torch.Tensor | int | None" = None) -> Jet:
+                   sizes: "torch.Tensor | int | None" = None,
+                   *,
+                   output_config: ConditionalModelConfig, raw: bool = False) -> Jet:
     """Network outputs with first (x, y, z, t) and spatial second derivatives.
 
     ``net`` is a Sequential of Linear layers with Tanh between them, fed
@@ -215,7 +288,12 @@ def taylor_forward(net: nn.Sequential, coordinates: torch.Tensor, z_rows: torch.
     derivatives only (5 channels instead of 11; the result has ``h=None``).
     With ``sizes``, ``z_rows`` is one latent row per case (see
     ``ConditionalModel.forward``) and is multiplied through the first layer once per
-    case; it carries no coordinate derivatives either way."""
+    case; it carries no coordinate derivatives either way.
+    ``output_config`` must be the corresponding ``model.config``. The returned
+    values include the model's TKE & density Softplus transformation, and its derivatives
+    include the same transformation through the chain rule. ``raw``: skip the
+    transform (predict_change adds the initial field before applying it).
+    """
     layers = list(net)
     if not (isinstance(layers[0], nn.Linear) and isinstance(layers[-1], nn.Linear)
             and all(isinstance(m, nn.Tanh) for m in layers[1::2])
@@ -250,4 +328,4 @@ def taylor_forward(net: nn.Sequential, coordinates: torch.Tensor, z_rows: torch.
         v = out[0] + lin.bias
         d = out[1:1 + n_coord]
         h = out[1 + n_coord:] if second else None
-    return Jet(v, d, h)
+    return Jet(v, d, h) if raw else transform_state_jet(Jet(v, d, h), output_config)

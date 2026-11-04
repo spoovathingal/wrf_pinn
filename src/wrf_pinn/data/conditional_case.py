@@ -12,7 +12,7 @@ import torch
 import numpy as np
 
 #: Variables carried in the conditioning fields and predicted by the model.
-STATE_VARS: tuple[str, ...] = ("u", "v", "w", "theta", "p_prime", "q_v", "e_sgs")
+STATE_VARS: tuple[str, ...] = ("u", "v", "w", "theta", "p_prime", "q_v", "e_sgs", "rho_d")
 #: Interior sample coordinate columns.
 COORD_NAMES: tuple[str, ...] = ("x", "y", "z", "t")
 #: The four open side faces of a sub-domain, in a fixed order.
@@ -31,6 +31,9 @@ class ConditionalCase:
     boundary: object            # (n_state, n_faces, n_times, face_len): decoded boundary
     boundary_coords: object     # psi coords: (n_faces, n_times, face_len, n_coord)
     surface: object             # (n_times, n_face_pts, 5): x,y,t,fricVel,htFlux (bottom)
+    surface_fe_state: object # Physical FE observations at native z-index 0: (n_times, n_surface, 4), columns rho_d, u, v, theta.
+    surface_z0m: object # Physical momentum roughness [m], shape (n_surface, 1).
+    surface_height: object # Native terrain elevation above sea level [m], shape (n_surface, 1).
     terrain: object             # (n_terr, 3): x, y, elevation (static)
     interior: object            # (n_pts, n_coord): query coords, tau > 0
     targets: object             # (n_pts, n_state): matched interior state
@@ -62,6 +65,9 @@ class ConditionalCase:
             boundary=t(self.boundary),
             boundary_coords=t(self.boundary_coords),
             surface=t(self.surface),
+            surface_fe_state=t(self.surface_fe_state),
+            surface_z0m=t(self.surface_z0m),
+            surface_height=t(self.surface_height),
             terrain=t(self.terrain),
             interior=t(self.interior),
             targets=t(self.targets),
@@ -78,9 +84,8 @@ class ConditionalCase:
 #: and boundary fields are reconstructed from their per-subdomain POD pieces;
 #: ``interior`` is rebuilt (``interior_from_grid``) when a case omits it.
 _CASE_MEMBERS: tuple[str, ...] = (
-    "initial_coords", "boundary_coords", "surface", "terrain",
-    "targets", "times",
-)
+    "initial_coords", "boundary_coords", "surface", "surface_fe_state", "surface_z0m",
+    "surface_height", "terrain", "targets", "times")
 
 
 def interior_from_grid(initial_coords: np.ndarray, boundary_coords: np.ndarray) -> np.ndarray:
@@ -92,7 +97,8 @@ def interior_from_grid(initial_coords: np.ndarray, boundary_coords: np.ndarray) 
 
 
 def read_conditional_case(npz_path: str | Path, latent: str = "pod") -> ConditionalCase:
-    """Load one POD-encoded .npz case; decode initial/boundary, mask NaN targets.
+    """Load one .npz case; decode initial/boundary, mask NaN targets. A case written
+    without POD (the carver's --no-pod) takes them from its raw fields instead.
     latent picks z: 'pod' (POD coeffs) or 'raw' (the full raw fields, see latent_vector)."""
     path = Path(npz_path)
     if not path.exists():
@@ -106,8 +112,75 @@ def read_conditional_case(npz_path: str | Path, latent: str = "pod") -> Conditio
         members["interior"] = (blob["interior"].astype(np.float32) if "interior" in blob.files
                                else interior_from_grid(members["initial_coords"],
                                                        members["boundary_coords"]))
-        bnd = decode_boundary(blob)
-        ini = decode_initial(blob)
+        targets = members["targets"]
+
+        if targets.ndim != 2 or targets.shape[1] != len(STATE_VARS):
+            raise ValueError(
+                f"Case {path} targets must have {len(STATE_VARS)} columns "
+                f"in order {STATE_VARS}; got shape {targets.shape}. "
+                "Regenerate the case with dry-air density included."
+            )
+        if targets.shape[0] != members["interior"].shape[0]:
+            raise ValueError(
+                f"Case {path} has different numbers of targets and interior coordinates."
+            )
+
+        surface = members["surface"]
+        fe = members["surface_fe_state"]
+        z0m = members["surface_z0m"]
+
+        if surface.ndim != 3 or surface.shape[2] != 5:
+            raise ValueError(f"Case {path}: surface must have shape (n_times, n_surface, 5).")
+
+        nt, ns, _ = surface.shape
+        if nt == 0 or ns == 0 or members["times"].shape != (nt,):
+            raise ValueError(f"Case {path}: invalid surface/time dimensions.")
+
+        if fe.shape != (nt, ns, 4):
+            raise ValueError(
+                f"Case {path}: surface_fe_state must have shape ({nt}, {ns}, 4).")
+
+        if z0m.shape != (ns, 1):
+            raise ValueError(f"Case {path}: surface_z0m must have shape ({ns}, 1).")
+
+        if members["surface_height"].shape != (ns, 1):
+            raise ValueError(f"Case {path}: surface_height must have shape ({ns}, 1).")
+
+        for name in ("surface", "surface_fe_state", "surface_z0m", "surface_height"):
+            if not np.isfinite(members[name]).all():
+                raise ValueError(f"Case {path}: {name} must contain finite values.")
+
+        if np.any(fe[..., [0, 3]] <= 0.0):
+            raise ValueError(
+                f"Case {path}: physical FE density and theta must be positive.")
+
+        if np.any(z0m <= 0.0):
+            raise ValueError(f"Case {path}: surface_z0m must be positive.")
+
+        if not np.all(surface[..., :2] == surface[0:1, :, :2]):
+            raise ValueError(
+                f"Case {path}: surface x/y point order must stay fixed across times.")
+
+        required_pod = [
+            f"ini_{part}_{var}" for var in STATE_VARS
+            for part in ("mean", "modes", "coeffs")
+        ]
+        required_pod += [
+            f"bnd_{part}_{var}_{face}" for var in STATE_VARS
+            for face in range(len(FACE_NAMES)) for part in ("mean", "modes", "coeffs")
+        ]
+        missing_pod = [key for key in required_pod if key not in blob.files]
+        raw_only = bool(missing_pod) and {"ini_raw", "bnd_raw"} <= set(blob.files)
+        if raw_only and latent == "pod":
+            raise ValueError(f"Case {path} has no POD arrays; use a raw or encoder latent.")
+        if missing_pod and not raw_only:
+            raise ValueError(
+                f"Case {path} is missing required POD arrays: {missing_pod}. "
+                "Regenerate the case with all eight state variables."
+            )
+
+        bnd = raw_boundary(blob) if raw_only else decode_boundary(blob)
+        ini = raw_initial(blob) if raw_only else decode_initial(blob)
         members["z"] = latent_vector(blob, latent)
         if "ini_raw" in blob.files:
             members["initial_raw"] = blob["ini_raw"].astype(np.float32)
@@ -157,6 +230,19 @@ def decode_initial(blob) -> dict:
     return out
 
 
+def raw_boundary(blob) -> dict:
+    """The boundary state from bnd_raw (n_faces, n_times, face_len, n_state), in
+    decode_boundary's layout {var: (n_faces, n_times, face_len)}."""
+    b = blob["bnd_raw"]
+    return {var: b[..., j] for j, var in enumerate(STATE_VARS)}
+
+
+def raw_initial(blob) -> dict:
+    """The initial state from ini_raw (n_state, nz, nx*ny), in decode_initial's layout."""
+    i = blob["ini_raw"]
+    return {var: i[j] for j, var in enumerate(STATE_VARS)}
+
+
 def terrain_grid(terrain) -> np.ndarray:
     """Terrain rows (x, y, elevation) -> elevations (nx*ny,), x slow like ini_raw."""
     t = np.asarray(terrain, dtype=np.float64)
@@ -198,8 +284,25 @@ class ConditionalMetadata:
     def load(cls, path: str | Path) -> "ConditionalMetadata":
         raw = json.loads(Path(path).read_text())
         schema = raw.get("schema", {})
+        state_vars = tuple(schema.get("state_vars", ()))
+
+        if state_vars != STATE_VARS:
+            raise ValueError(
+                f"Metadata {path} must declare state_vars={STATE_VARS}; "
+                f"got {state_vars}. Regenerate the dataset with rho_d included.")
+
+        expected_surface = {
+            "state_vars": ["rho_d", "u", "v", "theta"],
+            "state_units": ["kg/m^3", "m/s", "m/s", "K"],
+            "height_units": "m", "z_index": 0, "z0m_units": "m",
+        }
+
+        if schema.get("surface_reference") != expected_surface:
+            raise ValueError(
+                f"Metadata {path} must declare surface_reference={expected_surface}.")
+
         return cls(
-            state_vars=tuple(schema.get("state_vars", STATE_VARS)),
+            state_vars=state_vars,
             coord_names=tuple(schema.get("coord_names", COORD_NAMES)),
             normalization=raw.get("normalization", {}),
         )

@@ -1,22 +1,24 @@
 """Residual equations for the simplified Cartesian WRF PINN model.
 
-This module implements the dry neutral boundary layer system described in
+This module implements the reduced moist system with diagnostic SGS closure described in
 ``wrf_pinn.config.physics``:
 
 - local Cartesian coordinates
 - zero external forcing & Coriolis
-- fixed hydrostatic reference potential temperature = 300 K
+- predicted dry density and hydrostatic density inferred from d(p_EOS - p_prime)/dz
 - q_l and f_cond = 0
 
 The residuals are evaluated at continuous PINN collocation points. Inputs are
 expected in coordinate order (x, y, z, t), and state outputs are expected in
-physics-variable order (u, v, w, theta, p_prime, q_v, e_sgs). Coordinates and state outputs may be
+physics-variable order (u, v, w, theta, p_prime, q_v, e_sgs, rho_d). Coordinates and state outputs may be
 normalized; residual scaling maps them back to physical units before the PDE
 terms are assembled.
+Eight state variables are predicted, but only six PDE residuals are returned.
+SGS TKE enters stresses and diffusivities without a separate transport residual.
 """
 
 from __future__ import annotations
-import math
+
 from collections.abc import Mapping
 from functools import lru_cache
 
@@ -24,8 +26,8 @@ import torch
 
 from wrf_pinn.config.physics import DEFAULT_PHYSICS, PhysicsConfig
 from wrf_pinn.config.scaling import DEFAULT_RESIDUAL_SCALING, ResidualScalingConfig
-from wrf_pinn.physics.taylor import Jet, coordinate_jet, taylor_forward, where
-
+from wrf_pinn.physics.taylor import Jet, taylor_forward, where
+from wrf_pinn.models.conditional import ConditionalModelConfig
 
 TensorDict = dict[str, torch.Tensor]
 
@@ -101,69 +103,17 @@ def _coordinate_scale_tensor(scales: tuple[float, ...], device: torch.device,
     return torch.tensor(scales, dtype=dtype, device=device).reshape(1, -1)
 
 
-def _hydrostatic_reference_state(
-    z: torch.Tensor,
-    physics: PhysicsConfig,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return hydrostatic pressure and density at physical height z (m)."""
-
-    gravity = physics.constants.gravity
-    cp = physics.constants.dry_air_specific_heat_cp
-    rd = physics.constants.dry_air_gas_constant
-    p0 = physics.constants.reference_pressure
-    theta_h = physics.hydrostatic_reference_potential_temperature
-    # theta_h = torch.where(z <= 500.0, torch.full_like(z, 300.0),
-    #     torch.where(z <= 650.0, 300.0 + 0.08 * (z - 500.0),
-    #         312.0 + 0.003 * (z - 650.0)))
-
-    # # \int^z_0 1/300 dz = z/300
-    # integral_lower = z / 300.0
-    # # \int^500_0 1/300 dz + \int^z_500 1/(300+0.08(z-500)) dz 
-    # integral_middle = (500.0 / 300.0 + 
-    #                    1 / 0.08 * torch.log((300.0 + 0.08 * (z - 500.0)) / 300.0))
-    # # \int^500_0 1/300 dz + \int^650_500 1/(300+0.08(z-500)) dz + \int^z_650 1/(312+0.003(z-650)) dz
-    # integral_upper = (500.0 / 300.0 + 
-    #                   1 / 0.08 * torch.log(torch.tensor(312.0 / 300.0, 
-    #                     dtype=z.dtype, device=z.device)) # compatible and no CPU-GPU mismatch
-    #     + 1 / 0.003 * torch.log((312.0 + 0.003 * (z - 650.0)) / 312.0))
-
-    # integral = torch.where(z <= 500.0, integral_lower,
-    #     torch.where(z <= 650.0, integral_middle, integral_upper))
-    #\Pi_H(0) = 1
-    # pi_h = 1.0 - gravity * integral / cp
-
-    # For the current flat ocean crop:
-    # z_reference = 0 m, p_reference = p0, theta_d,h = 300 K.
-    exner_h = 1.0 - gravity * z / (cp * theta_h)
-    p_d_h = p0 * exner_h.pow(cp / rd)
-    t_d_h = theta_h * exner_h
-    rho_d_h = p_d_h / (rd * t_d_h)
-
-    return p_d_h, rho_d_h
 
 def _split_state(
     state: torch.Tensor,
     physics: PhysicsConfig,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return u, v, w, theta, p_prime, q_v, and e_sgs columns from the model state output."""
+) -> tuple[torch.Tensor, ...]:
+    """Return u, v, w, theta, p_prime, q_v, e_sgs, and density columns from the model state output."""
 
-    if state.ndim != 2:
-        raise ValueError("state must have shape (n_points, n_variables).")
+    if state.ndim != 2 or state.shape[1] != physics.state_dim:
+        raise ValueError(f"state must have shape (n_points, {physics.state_dim}).")
 
-    if state.shape[1] < physics.state_dim:
-        raise ValueError(
-            "state has too few columns for the configured active variables; "
-            f"expected at least {physics.state_dim}, got {state.shape[1]}."
-        )
-
-    u = state[:, physics.variable_index("u") : physics.variable_index("u") + 1]
-    v = state[:, physics.variable_index("v") : physics.variable_index("v") + 1]
-    w = state[:, physics.variable_index("w") : physics.variable_index("w") + 1]
-    theta = state[:, physics.variable_index("theta") : physics.variable_index("theta") + 1]
-    p_prime = state[:, physics.variable_index("p_prime") : physics.variable_index("p_prime") + 1]
-    q_v = state[:, physics.variable_index("q_v") : physics.variable_index("q_v") + 1]
-    e_sgs = state[:, physics.variable_index("e_sgs") : physics.variable_index("e_sgs") + 1]
-    return u, v, w, theta, p_prime, q_v, e_sgs
+    return tuple( state[:, i:i + 1] for i in range(physics.state_dim) )
 
 
 def _to_physical_state(
@@ -174,18 +124,21 @@ def _to_physical_state(
     p_prime: torch.Tensor,
     q_v: torch.Tensor,
     e_sgs: torch.Tensor,
+    rho_d: torch.Tensor,
     scaling: ResidualScalingConfig,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, ...]:
     """Map normalized state variables to physical state variables."""
+    return (
+        scaling.u.offset + scaling.u.scale * u,
+        scaling.v.offset + scaling.v.scale * v,
+        scaling.w.offset + scaling.w.scale * w,
+        scaling.theta.offset + scaling.theta.scale * theta,
+        scaling.p_prime.offset + scaling.p_prime.scale * p_prime,
+        scaling.q_v.offset + scaling.q_v.scale * q_v,
+        scaling.e_sgs.offset + scaling.e_sgs.scale * e_sgs,
+        scaling.rho_d.offset + scaling.rho_d.scale * rho_d,
+    )
 
-    u_physical = scaling.u.offset + scaling.u.scale * u
-    v_physical = scaling.v.offset + scaling.v.scale * v
-    w_physical = scaling.w.offset + scaling.w.scale * w
-    theta_physical = scaling.theta.offset + scaling.theta.scale * theta
-    p_prime_physical = scaling.p_prime.offset + scaling.p_prime.scale * p_prime
-    q_v_physical = scaling.q_v.offset + scaling.q_v.scale * q_v
-    e_sgs_physical = scaling.e_sgs.offset + scaling.e_sgs.scale * e_sgs
-    return u_physical, v_physical, w_physical, theta_physical, p_prime_physical, q_v_physical, e_sgs_physical
 # not used for now until k_m training turned back on
 def _to_physical_eddy_viscosity(
     k_m_unconstrained: torch.Tensor,
@@ -206,10 +159,10 @@ def _validate_physics_config(physics: PhysicsConfig) -> None:
     if physics.coordinate_system != "local_cartesian":
         raise ValueError("Only local_cartesian coordinates are supported.")
 
-    if physics.active_variables != ("u", "v", "w", "theta", "p_prime", "q_v", "e_sgs"):
-        raise ValueError("Residuals currently require active variables u, v, w, theta, p_prime, q_v, e_sgs")
+    if physics.active_variables != ("u", "v", "w", "theta", "p_prime", "q_v", "e_sgs", "rho_d"):
+        raise ValueError("Residuals currently require active variables u, v, w, theta, p_prime, q_v, e_sgs, rho_d")
 
-    expected_residuals = ("mass", "x_momentum", "y_momentum", "z_momentum", "potential_temperature", "water_vapor", "sgs_tke")
+    expected_residuals = ("mass", "x_momentum", "y_momentum", "z_momentum", "potential_temperature", "water_vapor")
     if physics.residuals != expected_residuals:
         raise ValueError(f"Residuals require equations {expected_residuals}.")
 
@@ -237,10 +190,12 @@ def _validate_physics_config(physics: PhysicsConfig) -> None:
     if enabled_terms:
         raise ValueError(f"Unsupported physics terms are enabled: enabled terms: {enabled_terms}.")
 
-def _diagnose_moist_state(theta: torch.Tensor, p_prime: torch.Tensor, q_v: torch.Tensor,
-    z: torch.Tensor, physics: PhysicsConfig) -> tuple[torch.Tensor, torch.Tensor,
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Diagnose pressure, temperature, and moist-density quantities.
+def _diagnose_moist_state(theta: torch.Tensor, q_v: torch.Tensor, rho_d: torch.Tensor,
+    physics: PhysicsConfig) -> tuple[torch.Tensor | Jet, ...]:
+    """Calculate thermodynamics from predicted dry density.
+
+    Inputs are in physical units, except q_v retains the dataset's
+    mixing-ratio units until converted locally to kg/kg.
 
     ``q_v`` is the water-vapor mixing ratio in the data's units; it is taken
     to kg/kg with ``physics.q_v_to_kg_per_kg``.
@@ -252,26 +207,18 @@ def _diagnose_moist_state(theta: torch.Tensor, p_prime: torch.Tensor, q_v: torch
     kappa = physics.constants.kappa
     gamma = physics.constants.gamma
 
-    p_d_h, rho_d_h = _hydrostatic_reference_state(z, physics)
-    q_v = q_v * physics.q_v_to_kg_per_kg
+    q_v_kg = q_v * physics.q_v_to_kg_per_kg
+    theta_m = theta * (1.0 + (rv / rd) * q_v_kg)
 
     # Total pressure and moist potential temperature.
-    pressure = p_d_h + p_prime
-    theta_m = theta * (1.0 + (rv / rd) * q_v)
-
-    # Dry-air density obtained from the moist equation of state.
-    rho_d = (  p0**kappa * pressure.pow(1.0 / gamma) / (rd * theta_m)  )
-
+    pressure = (rd * rho_d * theta_m / p0**kappa).pow(gamma)
     temperature = theta * (pressure / p0).pow(kappa)
 
-    # q_l = 0 for the current first-pass system.
-    rho_m = rho_d * (1.0 + q_v)
-    rho_m_prime = rho_m - rho_d_h
-
-    # Multiplies the pressure-gradient and buoyancy bracket.
+    # The supplied FE dataset has q_l = 0.
+    rho_m = rho_d * (1.0 + q_v_kg)
     density_ratio = rho_d / rho_m
 
-    return (pressure, temperature, rho_d, rho_m, rho_m_prime, density_ratio)
+    return pressure, temperature, rho_m, density_ratio
 
 def _brunt_vaisala_squared(theta: torch.Tensor, theta_z: torch.Tensor, physics: PhysicsConfig) -> torch.Tensor:
     """Return N^2 from local dry potential temperature. used for l_sgs"""
@@ -281,10 +228,36 @@ def _brunt_vaisala_squared(theta: torch.Tensor, theta_z: torch.Tensor, physics: 
 
     return (physics.constants.gravity * theta_z / theta_safe)
 
-def _sgs_mixing_length(n_squared: torch.Tensor, e_sgs: torch.Tensor, physics: PhysicsConfig) -> torch.Tensor:
-    """Return the SGS mixing length for stable and unstable flow."""
+def _sgs_delta(like, filter_width):
+    """Validate and return the required local SGS filter width."""
+    if filter_width is None:
+        raise ValueError("A local filter_width from grid_geometry is required.")
 
-    delta = physics.uniform_filter_width            # plain floats: no device copy, no sync
+    is_jet = isinstance(like, Jet)
+    if isinstance(filter_width, Jet) != is_jet:
+        raise TypeError(
+            "Local filter_width must be a Jet for Taylor or a Tensor for autograd."
+        )
+
+    width = filter_width.v if is_jet else filter_width
+    values = like.v if is_jet else like
+
+    if not isinstance(width, torch.Tensor):
+        raise TypeError("Local filter_width must contain a Tensor.")
+    if width.shape != values.shape:
+        raise ValueError("Local filter_width must match the scalar field shape.")
+    if width.dtype != values.dtype or width.device != values.device:
+        raise ValueError("Local filter_width must match field dtype and device.")
+    if is_jet and filter_width.d.shape != like.d.shape:
+        raise ValueError("Local filter_width must match the field's Jet derivative shape.")
+
+    return filter_width
+
+def _sgs_mixing_length(n_squared: torch.Tensor, e_sgs: torch.Tensor, physics: PhysicsConfig,
+                        *, filter_width):
+    """Return the SGS mixing length, preserving local-width derivatives."""
+
+    delta = _sgs_delta(e_sgs, filter_width)
     minimum_length = physics.minimum_mixing_length
 
     numerical_floor = torch.finfo(e_sgs.dtype).tiny
@@ -293,11 +266,12 @@ def _sgs_mixing_length(n_squared: torch.Tensor, e_sgs: torch.Tensor, physics: Ph
     # torch.where evaluates both branches, so N^2 must be clamped before
     # taking its square root even where the unstable branch is selected.
     stable_n = n_squared.clamp_min(numerical_floor).sqrt()
-
     stable_candidate = (physics.stable_mixing_length_coefficient * sqrt_e_sgs / stable_n)
 
     # = max(min(candidate, delta), minimum_length), since minimum_length <= delta
-    stable_length = stable_candidate.clamp_max(delta).clamp_min(minimum_length)
+    stable_length = where(
+        stable_candidate <= delta, stable_candidate, delta,
+    ).clamp_min(minimum_length)
 
     return where(n_squared > 0.0, stable_length, delta)
 
@@ -306,39 +280,31 @@ def _diagnostic_sgs_coefficients(
     theta_z: torch.Tensor,
     e_sgs: torch.Tensor,
     physics: PhysicsConfig,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    *,
+    filter_width,
+):
     """Diagnose N^2, mixing length, K_m, and scalar diffusivity."""
+    delta = _sgs_delta(e_sgs, filter_width)
     n_squared = _brunt_vaisala_squared(theta, theta_z, physics)
-    mixing_length = _sgs_mixing_length(n_squared, e_sgs, physics)
+    mixing_length = _sgs_mixing_length(n_squared, e_sgs, physics, filter_width=filter_width)
 
     numerical_floor = torch.finfo(e_sgs.dtype).tiny
     sqrt_e_sgs = (e_sgs.clamp_min(0.0) + numerical_floor).sqrt()
 
-    k_m = (physics.sgs_mixing_coefficient * mixing_length * sqrt_e_sgs)
-
-    delta = physics.uniform_filter_width
-
+    k_m = physics.sgs_mixing_coefficient * mixing_length * sqrt_e_sgs
     k_scalar = k_m * (1.0 + 2.0 * mixing_length / delta)
 
     return (n_squared, mixing_length, k_m, k_scalar)
-
-def _sgs_tke_dissipation(rho_d: torch.Tensor, e_sgs: torch.Tensor, 
-    mixing_length: torch.Tensor, physics: PhysicsConfig) -> torch.Tensor:
-    """Positive dissipation magnitude, using physical tensor values."""
-    a_ck = physics.tke_dissipation_mixing_factor * physics.sgs_mixing_coefficient
-    c_e = a_ck + (physics.tke_dissipation_coefficient - a_ck) *(
-        mixing_length / physics.uniform_filter_width)
-
-    e_positive = e_sgs.clamp_min(0.0)
-    return rho_d * c_e * e_positive.pow(1.5) / mixing_length
 
 def cartesian_zero_forcing_residuals(
     coordinates: torch.Tensor,
     state: torch.Tensor,
     physics: PhysicsConfig = DEFAULT_PHYSICS,
     scaling: ResidualScalingConfig = DEFAULT_RESIDUAL_SCALING,
+    *,
+    filter_width: torch.Tensor,
 ) -> TensorDict:
-    """Compute reduced moist Cartesian continuity and momentum residuals.
+    """Compute six moist Cartesian residuals with TKE-dependent SGS closure.
 
     Parameters
     ----------
@@ -346,8 +312,8 @@ def cartesian_zero_forcing_residuals(
         Collocation coordinates with shape ``(n_points, 4)`` and column order
         ``(x, y, z, t)``. The tensor must have ``requires_grad=True``.
     state:
-        Model outputs with shape ``(n_points, 7)`` and column order
-        ``(u, v, w, theta, p', q_v, e_sgs)``.
+        Model outputs with shape ``(n_points, 8)`` and column order
+        ``(u, v, w, theta, p', q_v, e_sgs, rho_d)``.
     physics:
         Physics configuration. Only the default reduced configuration is
         supported by this implementation.
@@ -359,8 +325,8 @@ def cartesian_zero_forcing_residuals(
     Returns
     -------
     dict[str, torch.Tensor]
-        Residual tensors keyed by ``mass``, ``x_momentum``, ``y_momentum``,
-        ``z_momentum``, ''potential_temperature'', and "water vapor" Each tensor has shape ``(n_points, 1)``.
+        Residual tensors keyed by ``mass``, ``x_momentum``, ``y_momentum``, ``z_momentum``,
+        ''potential_temperature'', and "water vapor" Each tensor has shape ``(n_points, 1)``.
     """
 
     _validate_physics_config(physics)
@@ -371,17 +337,17 @@ def cartesian_zero_forcing_residuals(
     if not coordinates.requires_grad:
         raise ValueError("coordinates must have requires_grad=True.")
 
-    (u_normalized, v_normalized, w_normalized, theta_normalized, p_prime_normalized,
-      q_v_normalized, e_sgs_normalized) = _split_state(state, physics)
+    u, v, w, theta, p_prime, q_v, e_sgs, rho_d = _to_physical_state(
+        *_split_state(state, physics), scaling=scaling,)
 
-    u, v, w, theta, p_prime, q_v, e_sgs = _to_physical_state(
-        u_normalized, v_normalized, w_normalized, theta_normalized, 
-        p_prime_normalized, q_v_normalized, e_sgs_normalized, scaling)
-    #k_m = _to_physical_eddy_viscosity(k_m_unconstrained, physics)
+    pressure, _temperature, rho_m, density_ratio = _diagnose_moist_state(
+        theta, q_v, rho_d, physics)
 
-    z = scaling.z.offset + scaling.z.scale * coordinates[:, 2:3]
-    (_pressure, _temperature, rho_d, _rho_m, rho_m_prime, density_ratio,
-     ) = _diagnose_moist_state(theta, p_prime, q_v, z, physics)
+    # Infer base-state density from the physical vertical pressure gradient.
+    p_d_h = pressure - p_prime
+    grad_p_d_h = _physical_gradient(p_d_h, coordinates, scaling)
+    rho_d_h = -grad_p_d_h[:, 2:3] / physics.constants.gravity
+    rho_m_prime = rho_m - rho_d_h
 
     grad_u = _physical_gradient(u, coordinates, scaling)
     grad_v = _physical_gradient(v, coordinates, scaling)
@@ -399,8 +365,8 @@ def cartesian_zero_forcing_residuals(
     p_prime_x, p_prime_y, p_prime_z, _p_prime_t = grad_p_prime.split(1, dim=1)
 
     # Diagnose the SGS coefficients from local theta_z and e_sgs.
-    _n_squared, _mixing_length, k_m, k_scalar = _diagnostic_sgs_coefficients(theta,
-        theta_z, e_sgs, physics)
+    _, _, k_m, k_scalar = _diagnostic_sgs_coefficients(theta,
+        theta_z, e_sgs, physics, filter_width=filter_width)
 
     # The current first-pass model uses the same SGS diffusivity for
     # potential temperature and water vapor.
@@ -533,34 +499,6 @@ def cartesian_zero_forcing_residuals(
         + tau_q_v_x_x + tau_q_v_y_y + tau_q_v_z_z
     )
 
-    # Conservative SGS TKE budget in physical units.
-    grad_e_sgs = _physical_gradient(e_sgs, coordinates, scaling)
-    ge = (e_sgs, grad_e_sgs)
-    tke_storage = _product_gradient(rho, ge)[:, 3:4]
-    tke_advection = (
-        _product_gradient(rho, gu, ge)[:, 0:1]
-        + _product_gradient(rho, gv, ge)[:, 1:2]
-        + _product_gradient(rho, gw, ge)[:, 2:3]
-    )
-
-    # B = -rho_d * K_theta * N^2.
-    tke_buoyancy = -rho_d * k_theta * _n_squared
-    tke_shear = -(
-        tau_xx * u_x + tau_yy * v_y + tau_zz * w_z
-        + tau_xy * (u_y + v_x) + tau_xz * (u_z + w_x) + tau_yz * (v_z + w_y) )
-    
-    tke_dissipation = _sgs_tke_dissipation(rho_d, e_sgs, _mixing_length, physics)
-    
-    tke_transport = physics.tke_transport_coefficient * sum(
-        _physical_gradient(
-            rho_d * k_m * grad_e_sgs[:, j:j + 1], coordinates, scaling
-        )[:, j:j + 1] for j in range(3)
-    )
-    sgs_tke = (
-        tke_storage + tke_advection
-        - tke_buoyancy - tke_shear + tke_dissipation - tke_transport
-    )
-
     return {
         "mass": mass,
         "x_momentum": x_momentum,
@@ -568,7 +506,6 @@ def cartesian_zero_forcing_residuals(
         "z_momentum": z_momentum,
         "potential_temperature": potential_temperature,
         "water_vapor": water_vapor,
-        "sgs_tke": sgs_tke,
     }
 
 
@@ -580,6 +517,9 @@ def cartesian_zero_forcing_residuals_taylor(
     scaling: ResidualScalingConfig = DEFAULT_RESIDUAL_SCALING,
     sizes: "torch.Tensor | int | None" = None,
     out: "Jet | None" = None,
+    *,
+    output_config: ConditionalModelConfig,
+    filter_width: Jet,
 ) -> TensorDict:
     """The residuals of ``cartesian_zero_forcing_residuals``, without nested autograd.
 
@@ -601,31 +541,35 @@ def cartesian_zero_forcing_residuals_taylor(
         raise ValueError("coordinates must have shape (n_points, 4).")
 
     if out is None:
-        out = taylor_forward(net, coordinates, z_rows, scaling.coordinate_scales(), sizes=sizes)
-    if out.v.shape[1] < physics.state_dim:
+        out = taylor_forward(net, coordinates, z_rows, scaling.coordinate_scales(), sizes=sizes,
+                             output_config=output_config)
+    if out.v.shape[1] != physics.state_dim:
         raise ValueError(
-            "state has too few columns for the configured active variables; "
-            f"expected at least {physics.state_dim}, got {out.v.shape[1]}."
-        )
+            f"Expected {physics.state_dim} state columns; got {out.v.shape[1]}.")
 
     def physical(name: str) -> Jet:
         j = out.column(physics.variable_index(name))
         s = getattr(scaling, name)
         return Jet(s.offset + s.scale * j.v, s.scale * j.d, s.scale * j.h)
 
-    u, v, w, theta, p_prime, q_v, e_sgs = (
-        physical(n) for n in ("u", "v", "w", "theta", "p_prime", "q_v", "e_sgs"))
+    u, v, w, theta, p_prime, q_v, e_sgs, rho_d = (
+        physical(name) for name in physics.active_variables)
 
-    z = coordinate_jet(scaling.z.offset + scaling.z.scale * coordinates[:, 2:3], axis=2)
-    (_pressure, _temperature, rho_d, _rho_m, rho_m_prime, density_ratio,
-     ) = _diagnose_moist_state(theta, p_prime, q_v, z, physics)
+    pressure, _temperature, rho_m, density_ratio = _diagnose_moist_state(
+        theta, q_v, rho_d, physics)
+
+    p_d_h = pressure - p_prime
+    rho_d_h = -p_d_h.d[2] / physics.constants.gravity
+
+    # Only the buoyancy value is needed, not its coordinate derivatives.
+    rho_m_prime = rho_m.v - rho_d_h
 
     p_prime_x, p_prime_y, p_prime_z, _p_prime_t = p_prime.d
 
     # Diagnose the SGS coefficients from local theta_z and e_sgs (jets in x, y, z,
     # so their gradients carry theta's second derivatives).
     _n_squared, _mixing_length, k_m, k_scalar = _diagnostic_sgs_coefficients(
-        theta, theta.deriv(2), e_sgs, physics)
+        theta, theta.deriv(2), e_sgs, physics, filter_width=filter_width)
     k_theta = k_scalar
     k_q_v = k_scalar
 
@@ -695,7 +639,7 @@ def cartesian_zero_forcing_residuals_taylor(
 
     z_momentum = (
         rho_d_w_t + rho_d_uw_x + rho_d_vw_y + rho_d_ww_z
-        + ratio * (p_prime_z + physics.constants.gravity * rho_m_prime.v)
+        + ratio * (p_prime_z + physics.constants.gravity * rho_m_prime)
         + tau_xz_x + tau_yz_y + tau_zz_z
     )
 
@@ -709,28 +653,6 @@ def cartesian_zero_forcing_residuals_taylor(
         + tau_q_v_x_x + tau_q_v_y_y + tau_q_v_z_z
     )
 
-    # Keep the original energy Jet for conservative and diffusion derivatives.
-    rho_d_e = rho_d * e_sgs
-    tke_storage = rho_d_e.d[3]
-    tke_advection = sum(
-        (rho_d_e * velocity).d[j] for j, velocity in enumerate((u, v, w))
-    )
-
-    tke_buoyancy = -rho_d.v * k_theta.v * _n_squared.v
-    tke_shear = -(
-        tau_xx.v * u_x.v + tau_yy.v * v_y.v + tau_zz.v * w_z.v
-        + tau_xy.v * (u_y.v + v_x.v) + tau_xz.v * (u_z.v + w_x.v) + tau_yz.v * (v_z.v + w_y.v)
-    )
-    tke_dissipation = _sgs_tke_dissipation(rho_d.v, e_sgs.v, _mixing_length.v, physics)
-    tke_transport = physics.tke_transport_coefficient * sum(
-        (rho_d * k_m * e_sgs.deriv(j)).d[j] for j in range(3)
-    )
-
-    sgs_tke = (
-        tke_storage + tke_advection
-        - tke_buoyancy - tke_shear + tke_dissipation - tke_transport
-    )
-
     return {
         "mass": mass,
         "x_momentum": x_momentum,
@@ -738,5 +660,4 @@ def cartesian_zero_forcing_residuals_taylor(
         "z_momentum": z_momentum,
         "potential_temperature": potential_temperature,
         "water_vapor": water_vapor,
-        "sgs_tke": sgs_tke,
     }

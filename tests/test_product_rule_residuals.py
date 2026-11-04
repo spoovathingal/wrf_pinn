@@ -19,14 +19,16 @@ torch = pytest.importorskip("torch")
 import wrf_pinn.physics.residuals_pde as rp  # noqa: E402
 from wrf_pinn.config.physics import DEFAULT_PHYSICS  # noqa: E402
 from wrf_pinn.config.scaling import ResidualScalingConfig, VariableScale  # noqa: E402
+from wrf_pinn.physics.grid_geometry import sgs_filter_width
 
 # Normalized coords/state in about [-1, 1]; physical = offset + scale * normalized.
 SCALING = ResidualScalingConfig(
     x=VariableScale(500.0, 500.0), y=VariableScale(500.0, 500.0),
-    z=VariableScale(800.0, 700.0), t=VariableScale(300.0, 300.0),
+    z=VariableScale(700.0, 600.0), t=VariableScale(300.0, 300.0),
     u=VariableScale(5.0, 2.0), v=VariableScale(2.0, 2.0), w=VariableScale(0.0, 0.5),
     theta=VariableScale(300.0, 2.0), p_prime=VariableScale(0.0, 50.0),
     q_v=VariableScale(8.0, 1.0), e_sgs=VariableScale(0.5, 0.1),
+    rho_d=VariableScale(1.1, 0.05),
 )
 PHYSICS = dataclasses.replace(DEFAULT_PHYSICS, q_v_to_kg_per_kg=1e-3)  # q_v in g/kg
 
@@ -39,6 +41,18 @@ def _inputs(seed: int = 0, n: int = 64):
     coords = (2 * torch.rand(n, 4, dtype=torch.float64) - 1).requires_grad_(True)
     return net, coords
 
+def _residuals(coords, state):
+    # Build width from these same differentiable coordinates so spatial
+    # derivatives include both vertical stretching and terrain compression.
+    x = SCALING.x.offset + SCALING.x.scale * coords[:, 0:1]
+    y = SCALING.y.offset + SCALING.y.scale * coords[:, 1:2]
+    altitude = SCALING.z.offset + SCALING.z.scale * coords[:, 2:3]
+    terrain = 20.0 + 0.01 * x + 0.02 * y
+
+    width = sgs_filter_width(altitude, terrain, PHYSICS, 4027.5)
+
+    return rp.cartesian_zero_forcing_residuals(coords, state,
+        physics=PHYSICS, scaling=SCALING, filter_width=width)
 
 def _reference_product_gradient(coords):
     """The original: one autograd backward pass per product, same factor order."""
@@ -65,12 +79,14 @@ def test_product_gradient_matches_autograd():
 def test_residuals_match_original_formulation(monkeypatch):
     net, coords = _inputs(seed=1)
     state = net(coords)
-    new = rp.cartesian_zero_forcing_residuals(coords, state, physics=PHYSICS, scaling=SCALING)
+    new = _residuals(coords, state)
 
     monkeypatch.setattr(rp, "_product_gradient", _reference_product_gradient(coords))
-    old = rp.cartesian_zero_forcing_residuals(coords, state, physics=PHYSICS, scaling=SCALING)
+    old = _residuals(coords, state)
 
-    assert new.keys() == old.keys()
+    assert set(new) == set(old) == {"mass", "x_momentum", "y_momentum",
+    "z_momentum", "potential_temperature", "water_vapor",
+}
     for name in new:
         assert torch.isfinite(old[name]).all(), f"{name}: reference not finite"
         torch.testing.assert_close(new[name], old[name], rtol=1e-10, atol=1e-12,
@@ -83,8 +99,7 @@ def test_residual_gradients_match_original_formulation(monkeypatch):
         net, coords = _inputs(seed=2)
         if product_gradient is not None:
             monkeypatch.setattr(rp, "_product_gradient", product_gradient(coords))
-        res = rp.cartesian_zero_forcing_residuals(coords, net(coords), physics=PHYSICS,
-                                                  scaling=SCALING)
+        res = _residuals(coords, net(coords))
         loss = sum(r.square().mean() for r in res.values())
         return torch.autograd.grad(loss, list(net.parameters()))
 
@@ -94,11 +109,12 @@ def test_residual_gradients_match_original_formulation(monkeypatch):
         torch.testing.assert_close(g_new, g_old, rtol=1e-9, atol=1e-12)
 
 
-def test_residuals_use_19_backward_passes(monkeypatch):
-    """6 primitives + rho_d + 12 SGS stress/flux terms; was 36 before the product rule."""
+def test_residuals_use_20_backward_passes(monkeypatch):
+    """p_d_h (hydrostatic density) + 6 primitives + rho_d + 12 SGS stress/flux terms;
+    was 36 before the product rule."""
     calls = []
     original = rp._gradient
     monkeypatch.setattr(rp, "_gradient", lambda f, c: (calls.append(1), original(f, c))[1])
     net, coords = _inputs()
-    rp.cartesian_zero_forcing_residuals(coords, net(coords), physics=PHYSICS, scaling=SCALING)
-    assert len(calls) == 19
+    _residuals(coords, net(coords))
+    assert len(calls) == 20
