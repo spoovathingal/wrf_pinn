@@ -30,8 +30,8 @@ log = logging.getLogger("train_conditional_lcc")
 # Physical-altitude normalization for the network, in metres; not a ceiling.
 MODEL_Z_SCALE_METRES = 3000.0
 
-def _scaling_from_recipe(recipe: dict, grid_spacing: float = 15.0,
-                         step_seconds: float = 0.025) -> ResidualScalingConfig:
+def _scaling_from_recipe(recipe: dict, grid_spacing: float = 1.0,
+                         step_seconds: float = 1.0) -> ResidualScalingConfig:
     """Recipe scaling; x, y stored as grid indices and t as solver steps are converted to
     metres and seconds by grid_spacing and step_seconds (normalized coordinates unchanged)."""
     if tuple(recipe["coord_names"]) != COORD_NAMES:
@@ -60,11 +60,11 @@ def _scaling_from_recipe(recipe: dict, grid_spacing: float = 15.0,
 
     return ResidualScalingConfig(**values)
 
-def _raw_input_stats(paths: list[Path], n: int = 256) -> tuple[torch.Tensor, torch.Tensor]:
+def _raw_input_stats(paths: list[Path], read, n: int = 256) -> tuple[torch.Tensor, torch.Tensor]:
     """Mean and spread per (state variable, level) of the raw initial field over n training
-    cases spread evenly through the sorted list (the same on every rank)."""
+    cases spread evenly through the sorted list (the same on every rank). ``read`` loads a case."""
     pick = paths[::max(1, len(paths) // n)][:n]
-    ini = np.stack([np.load(p)["ini_raw"].astype(np.float64) for p in pick])    # (n, nv, nz, nxy)
+    ini = np.stack([read(p).initial_raw.astype(np.float64) for p in pick])    # (n, nv, nz, nxy)
     mean, std = ini.mean(axis=(0, 3)), ini.std(axis=(0, 3))
     log.info("encoder input stats from %d cases: std per variable (level mean) %s",
              len(pick), np.array2string(std.mean(1), precision=4))
@@ -150,10 +150,14 @@ def main() -> int:
         "--predict-change", action="store_true",
         help="state = initial field + (t - t0)/T * network (needs --keep-raw cases)")
     ap.add_argument("--encoder-dim", type=int, default=256, help="encoder latent size")
-    ap.add_argument("--grid-spacing", type=float, default=15.0,
-                    help="metres per stored x, y unit (carved cases store grid indices: 15)")
-    ap.add_argument("--step-seconds", type=float, default=0.025,
-                    help="seconds per stored t unit (carved cases store FastEddy steps: 0.025)")
+    ap.add_argument("--grid-spacing", type=float, default=1.0,
+                    help="metres per stored x, y unit: 1 for cases in metres (build_fe_cases.py); "
+                         "15.0115 for grid-index cases (carve_encode_gpu.py)")
+    ap.add_argument("--step-seconds", type=float, default=1.0,
+                    help="seconds per stored t unit: 1 for cases in seconds; 0.025 for FastEddy-step cases")
+    ap.add_argument("--initial-from-targets", action="store_true",
+                    help="start each window at its first lead, all raw: no POD enters z or any loss "
+                         "(POD-only cases such as cstldense128_5; window loses one snapshot)")
     ap.add_argument("--terrain-input", action="store_true",
                     help="the encoder also reads each subdomain's ground height map (--latent encoder)")
     args = ap.parse_args()
@@ -216,15 +220,17 @@ def main() -> int:
         if args.terrain_input and args.latent != "encoder":
             raise ValueError("--terrain-input needs --latent encoder")
         read_latent = "pod" if args.latent == "pod" else "raw_terrain" if args.terrain_input else "raw"
-        z_dim = read_conditional_case(all_paths[0], read_latent).z.shape[0]
+        read = lambda p: read_conditional_case(p, read_latent, args.initial_from_targets)
+        first = read(all_paths[0])
+        z_dim = first.z.shape[0]
         encoder = None
         if args.latent == "encoder":
             with np.load(all_paths[0]) as blob:
                 nx, ny, nz = (int(v) for v in blob["initial_grid"])
-                nv = blob["ini_raw"].shape[0]
-                bnd_shape = blob["bnd_raw"].shape
+            nv = first.initial_raw.shape[0]
+            bnd_shape = tuple(np.moveaxis(first.boundary, 0, -1).shape)   # (face, time, face_len, var)
             encoder = RawEncoder((nv, nz, nx, ny), bnd_shape, args.encoder_dim, terrain=args.terrain_input)
-            encoder.set_input_stats(*_raw_input_stats(all_paths))
+            encoder.set_input_stats(*_raw_input_stats(all_paths, read))
             if args.terrain_input:
                 encoder.set_terrain_stats(*_terrain_stats(all_paths))
         elif args.latent == "raw":
@@ -260,6 +266,7 @@ def main() -> int:
             compile=args.compile_model, events_path=args.events,
             checkpoint_path=args.checkpoint, checkpoint_every=args.checkpoint_every,
             latent=read_latent, predict_change=args.predict_change,
+            initial_from_targets=args.initial_from_targets,
         )
 
         log.info(
@@ -306,7 +313,7 @@ def main() -> int:
             )
         else:
             t0 = time.time()
-            cases = [read_conditional_case(path, read_latent) for path in paths]
+            cases = [read(path) for path in paths]
 
             if any(case.z.shape[0] != z_dim for case in cases):
                 raise ValueError(

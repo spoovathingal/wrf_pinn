@@ -96,10 +96,13 @@ def interior_from_grid(initial_coords: np.ndarray, boundary_coords: np.ndarray) 
     return np.concatenate([xyz, np.repeat(t, len(initial_coords))[:, None]], 1).astype(np.float32)
 
 
-def read_conditional_case(npz_path: str | Path, latent: str = "pod") -> ConditionalCase:
+def read_conditional_case(npz_path: str | Path, latent: str = "pod",
+                          initial_from_targets: bool = False) -> ConditionalCase:
     """Load one .npz case; decode initial/boundary, mask NaN targets. A case written
     without POD (the carver's --no-pod) takes them from its raw fields instead.
-    latent picks z: 'pod' (POD coeffs) or 'raw' (the full raw fields, see latent_vector)."""
+    latent picks z: 'pod' (POD coeffs) or 'raw' (the full raw fields, see latent_vector).
+    initial_from_targets: ignore any POD and start the window at its first lead
+    snapshot, taken raw from ``targets`` (see first_lead_as_initial)."""
     path = Path(npz_path)
     if not path.exists():
         raise FileNotFoundError(f"Conditional case not found: {path}.")
@@ -170,6 +173,14 @@ def read_conditional_case(npz_path: str | Path, latent: str = "pod") -> Conditio
             for face in range(len(FACE_NAMES)) for part in ("mean", "modes", "coeffs")
         ]
         missing_pod = [key for key in required_pod if key not in blob.files]
+        if initial_from_targets:
+            if latent == "pod":
+                raise ValueError("initial_from_targets uses no POD; use a raw or encoder latent.")
+            members.update(first_lead_as_initial(members, path))
+            members["z"] = latent_vector(
+                {"bnd_raw": members.pop("bnd_raw"), "ini_raw": members["initial_raw"],
+                 "terrain": members["terrain"]}, latent)
+            return _finish_case(path, members)
         raw_only = bool(missing_pod) and {"ini_raw", "bnd_raw"} <= set(blob.files)
         if raw_only and latent == "pod":
             raise ValueError(f"Case {path} has no POD arrays; use a raw or encoder latent.")
@@ -187,7 +198,11 @@ def read_conditional_case(npz_path: str | Path, latent: str = "pod") -> Conditio
 
     members["boundary"] = np.stack([bnd[v] for v in STATE_VARS], axis=0).astype(np.float32)
     members["initial"] = np.stack([ini[v] for v in STATE_VARS], axis=0).astype(np.float32)
+    return _finish_case(path, members)
 
+
+def _finish_case(path: Path, members: dict) -> ConditionalCase:
+    """Check coordinates, mask NaN targets, build the case."""
     if not np.isfinite(members["interior"]).all():
         raise ValueError(f"Non-finite interior coordinates in {path}.")
 
@@ -228,6 +243,46 @@ def decode_initial(blob) -> dict:
         coeffs = blob[f"ini_coeffs_{var}"]           # (nz, k)
         out[var] = mean + coeffs @ modes.T           # (nz, nx*ny)
     return out
+
+
+def first_lead_as_initial(members: dict, path: Path) -> dict:
+    """Members for the same window started at its first lead snapshot, all raw.
+
+    ``interior``/``targets`` must hold the full initial grid at every lead (lead-major,
+    initial point order), as the builders write them. The first lead becomes the initial
+    field (initial_coords, initial, initial_raw); its boundary faces at every remaining
+    time come from the lead snapshots by node lookup (boundary, bnd_raw); the first lead
+    leaves interior/targets, and the first snapshot leaves surface, surface_fe_state, times.
+    No POD piece is read, so nothing encoded enters the latent or any loss target."""
+    ic, interior, targets = members["initial_coords"], members["interior"], members["targets"]
+    n, nt = len(ic), len(members["times"])
+    if interior.shape[0] != (nt - 1) * n or not np.allclose(
+            interior[:, :3], np.tile(ic[:, :3], (nt - 1, 1)), rtol=0, atol=1e-6):
+        raise ValueError(f"Case {path}: interior is not the initial grid at each lead time.")
+    axes = [np.unique(ic[:, a]) for a in range(3)]
+    nx, ny, nz = (len(a) for a in axes)
+    if nx * ny * nz != n:
+        raise ValueError(f"Case {path}: initial points are not a full grid.")
+
+    def node(xyz):                       # flat initial-grid index (x, y slow; z fast)
+        idx = [np.searchsorted(a, xyz[..., k]) for k, a in enumerate(axes)]
+        for k, (a, i) in enumerate(zip(axes, idx)):
+            if not np.allclose(a[np.minimum(i, len(a) - 1)], xyz[..., k], rtol=0, atol=1e-6):
+                raise ValueError(f"Case {path}: boundary points are not on the initial grid.")
+        return (idx[0] * ny + idx[1]) * nz + idx[2]
+
+    lead = targets.reshape(nt - 1, n, -1)                        # (lead, point, var)
+    bcoords = members["boundary_coords"][:, 1:]                  # faces at the lead times
+    bnd_raw = np.stack([lead[k][node(bcoords[:, k, :, :3])]      # (face, lead, face_len, var)
+                        for k in range(nt - 1)], axis=1)
+    ini_raw = lead[0].reshape(nx * ny, nz, -1).transpose(2, 1, 0)   # (var, nz, nx*ny)
+    return {
+        "initial_coords": interior[:n], "initial": ini_raw, "initial_raw": ini_raw,
+        "boundary_coords": bcoords, "boundary": np.moveaxis(bnd_raw, -1, 0), "bnd_raw": bnd_raw,
+        "interior": interior[n:], "targets": targets[n:],
+        "surface": members["surface"][1:], "surface_fe_state": members["surface_fe_state"][1:],
+        "times": members["times"][1:],
+    }
 
 
 def raw_boundary(blob) -> dict:

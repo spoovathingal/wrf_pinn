@@ -724,3 +724,71 @@ def test_raw_only_case_reads_raw_fields(tmp_path):
     np.testing.assert_array_equal(case.boundary, np.moveaxis(bnd, -1, 0))
     with pytest.raises(ValueError, match="no POD"):
         read_conditional_case(path, "pod")
+
+
+def _write_grid_case_npz(path, seed: int, nx=3, ny=3, nz=4, nt=3):
+    """A POD-only case laid out like build_fe_cases.py + conditional_cases.py: interior is the
+    initial grid at every lead (lead-major), targets are the raw normalized state there."""
+    rng = np.random.default_rng(seed)
+    f32 = np.float32
+    nv = len(STATE_VARS)
+    gx, gy, gz = (a.reshape(-1) for a in np.meshgrid(np.arange(nx), np.arange(ny), np.arange(nz),
+                                                     indexing="ij"))
+    xyz = np.stack([gx, gy, gz], 1).astype(f32) / 4
+    times = np.arange(nt, dtype=f32) / nt
+    rows = lambda t: np.column_stack([xyz, np.full(len(xyz), t, dtype=f32)])
+    targets = _positive_rho_d(rng.standard_normal(((nt - 1) * len(xyz), nv)), 1, rng).astype(f32)
+    faces = [xyz[gx == 0], xyz[gx == nx - 1], xyz[gy == 0], xyz[gy == ny - 1]]
+    bcoords = np.stack([np.stack([np.column_stack([f, np.full(len(f), t, dtype=f32)]) for t in times])
+                        for f in faces]).astype(f32)                   # (face, time, face_len, 4)
+    surface = rng.random((nt, nx * ny, 5)).astype(f32)
+    surface[:, :, :2] = surface[:1, :, :2]
+    blob = dict(initial_coords=rows(times[0]), interior=np.concatenate([rows(t) for t in times[1:]]),
+                targets=targets, times=times, boundary_coords=bcoords, surface=surface,
+                terrain=np.column_stack([gx[gz == 0], gy[gz == 0], np.zeros(nx * ny)]).astype(f32),
+                initial_grid=np.array([nx, ny, nz]), **_surface_members(nt, nx * ny, rng))
+    for v in STATE_VARS:                                               # POD pieces the option must ignore
+        blob[f"ini_mean_{v}"] = np.zeros(nx * ny, f32)
+        blob[f"ini_modes_{v}"] = np.zeros((nx * ny, 1), f32)
+        blob[f"ini_coeffs_{v}"] = np.zeros((nz, 1), f32)
+        for f in range(4):
+            blob[f"bnd_mean_{v}_{f}"] = np.zeros(len(faces[f]), f32)
+            blob[f"bnd_modes_{v}_{f}"] = np.zeros((len(faces[f]), 1), f32)
+            blob[f"bnd_coeffs_{v}_{f}"] = np.zeros((nt, 1), f32)
+    np.savez(path, **blob)
+    return blob
+
+
+def test_initial_from_targets_uses_only_raw_leads(tmp_path):
+    """The window restarts at its first lead: initial and boundary come from the raw targets."""
+    from wrf_pinn.data.conditional_case import read_conditional_case
+    path = tmp_path / "g.npz"
+    blob = _write_grid_case_npz(path, 0)
+    n = len(blob["initial_coords"])
+    case = read_conditional_case(path, "raw", initial_from_targets=True)
+    lead1 = blob["targets"][:n]                                         # (x, y slow; z fast) rows
+    np.testing.assert_array_equal(case.initial, lead1.reshape(9, 4, -1).transpose(2, 1, 0))
+    np.testing.assert_array_equal(case.initial_coords, blob["interior"][:n])
+    np.testing.assert_array_equal(case.targets, blob["targets"][n:])
+    np.testing.assert_array_equal(case.times, blob["times"][1:])
+    assert case.surface.shape[0] == case.surface_fe_state.shape[0] == len(case.times)
+    # every boundary value is the raw lead value at that face node and time
+    lead = blob["targets"].reshape(2, n, -1)
+    for f in range(4):
+        for k in range(2):
+            for j, p in enumerate(case.boundary_coords[f, k]):
+                i = int(np.flatnonzero((np.abs(blob["initial_coords"][:, :3] - p[:3]) < 1e-6).all(1))[0])
+                np.testing.assert_array_equal(case.boundary[:, f, k, j], lead[k, i])
+    assert case.z.shape[0] == case.boundary.size + case.initial.size
+    with pytest.raises(ValueError, match="no POD"):
+        read_conditional_case(path, "pod", initial_from_targets=True)
+
+
+def test_initial_from_targets_needs_grid_interior(tmp_path):
+    from wrf_pinn.data.conditional_case import read_conditional_case
+    path = tmp_path / "g.npz"
+    blob = _write_grid_case_npz(path, 1)
+    blob["interior"] = blob["interior"][::-1].copy()
+    np.savez(path, **blob)
+    with pytest.raises(ValueError, match="initial grid at each lead"):
+        read_conditional_case(path, "raw", initial_from_targets=True)
