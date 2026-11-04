@@ -240,6 +240,9 @@ def no_penetration_z_wall_residuals(
     surface_stress_scale: float = 3.8273,
     *, fric_vel: torch.Tensor, ht_flux: torch.Tensor, surface_fe_state: torch.Tensor,
     z0m: torch.Tensor, surface_heat_flux_scale: float = 1.0,
+    surface_stress_xz_scale: float | None = None,
+    surface_stress_yz_scale: float | None = None,
+    no_penetration_scale: float | None = None,
     state_jacobian: "torch.Tensor | None" = None,
     check_values: bool = True,
     terrain_height: torch.Tensor, terrain_slopes: torch.Tensor,
@@ -281,6 +284,26 @@ def no_penetration_z_wall_residuals(
     inferred from FE observations only and shared by both calculations.
     It is not a network output or a separately loaded temperature field.
     """
+    # Use explicit scales when supplied; preserve old callers' behavior otherwise.
+    xz_scale = (surface_stress_scale
+        if surface_stress_xz_scale is None else surface_stress_xz_scale
+    )
+    yz_scale = (surface_stress_scale
+        if surface_stress_yz_scale is None else surface_stress_yz_scale
+    )
+    normal_scale = (scaling.w.scale
+        if no_penetration_scale is None else no_penetration_scale
+    )
+
+    # These scalar configuration checks apply even when check_values=False.
+    for name, value in (("surface_stress_xz_scale", xz_scale),
+        ("surface_stress_yz_scale", yz_scale),
+        ("surface_heat_flux_scale", surface_heat_flux_scale),
+        ("no_penetration_scale", normal_scale),
+    ):
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"{name} must be finite and positive.")
+
     bottom_mask = _validate_no_penetration_z_wall_inputs(
         coordinates=coordinates, state=state,
         reference_coordinates=reference_coordinates, reference_state=reference_state,
@@ -401,13 +424,13 @@ def no_penetration_z_wall_residuals(
     tau_yz_sl_fe = -rho_fe * cd_fe * v_fe * U_fe
 
     # Active: model SL stresses versus FE SL stresses.
-    r_xz = (tau_xz_sl_model - tau_xz_sl_fe) / surface_stress_scale
-    r_yz = (tau_yz_sl_model - tau_yz_sl_fe) / surface_stress_scale
+    r_xz = (tau_xz_sl_model - tau_xz_sl_fe) / xz_scale
+    r_yz = (tau_yz_sl_model - tau_yz_sl_fe) / yz_scale
 
     # Alternative: model SL stresses versus ordinary SGS stresses.
     # Disable the active assignments above before enabling these.
-    # r_xz = (tau_xz_sl_model - tau_xz_sgs) / surface_stress_scale
-    # r_yz = (tau_yz_sl_model - tau_yz_sgs) / surface_stress_scale
+    # r_xz = (tau_xz_sl_model - tau_xz_sgs) / xz_scale
+    # r_yz = (tau_yz_sl_model - tau_yz_sgs) / yz_scale
 
     # Density-weighted potential-temperature flux; no cp factor.
     q_sgs = -rho_wall * k_theta_wall * theta_z
@@ -429,7 +452,7 @@ def no_penetration_z_wall_residuals(
     normal_velocity = (w_wall - u_wall * hx - v_wall * hy) / torch.sqrt(1.0 + hx.square() + hy.square())
     bottom = (lambda r: r) if bottom_mask is None else (lambda r: r[bottom_mask])
     return {
-        "no_penetration_w": normal_velocity / scaling.w.scale, # z = 0 and z = z_max
+        "no_penetration_w": normal_velocity / normal_scale, # z = 0 and z = z_max
         "surface_stress_xz": bottom(r_xz), # z = 0
         "surface_stress_yz": bottom(r_yz), # z = 0
         "surface_heat_flux": bottom(r_heat),

@@ -30,6 +30,7 @@ from wrf_pinn.physics.taylor import Jet, coordinate_jet, taylor_forward, transfo
 from wrf_pinn.models.conditional import (
     ConditionalModelConfig, inverse_transform_state, transform_state_output)
 from wrf_pinn.training.provenance import run_manifest, write_event
+from wrf_pinn.training.losses import PDEResidualScales
 from wrf_pinn.physics.grid_geometry import sgs_filter_width, terrain_height_jet
 #: the five losses of the conditional PINN, in order.
 LOSS_NAMES: tuple[str, ...] = ("data", "initial", "flow_boundary", "pde", "surface")
@@ -74,6 +75,11 @@ class ConditionalTrainConfig:
     #: SOURCE normalization: saved NPZ coordinates -> source units.
     source_scaling: "ResidualScalingConfig | None" = None
 
+    pde_residual_scales: PDEResidualScales = PDEResidualScales(
+        mass=0.01055433, x_momentum=0.123516, y_momentum=0.1609373,
+        z_momentum=0.1284609, potential_temperature=3.118683,
+        water_vapor=0.03973627,
+    )
     #: Source z is always the stretched FE reference height before compression.
     #: FE terrain-compression height in metres, inferred for the CSTL dataset.
     terrain_top_height: float = 4027.5
@@ -87,8 +93,12 @@ class ConditionalTrainConfig:
     #: case.surface back to physical for the surface-layer residual.
     flux_offset: tuple[float, float] = (0.0, 0.0)
     flux_scale: tuple[float, float] = (1.0, 1.0)
-    surface_stress_scale: float = 3.8273
-    surface_heat_flux_scale: float = 1.0
+    # Characteristic scales for physical boundary residuals.
+    surface_stress_xz_scale: float = 0.05866764   # kg / (m s^2)
+    surface_stress_yz_scale: float = 0.07587101   # kg / (m s^2)
+    surface_heat_flux_scale: float = 0.06877512  # kg K / (m^2 s)
+    no_penetration_scale: float = 0.3895873      # m / s
+
     log_every: int = 100
     device: str = "auto"
     seed: int = 0
@@ -621,8 +631,10 @@ def _surface_loss(model, b: CaseBatch, cfg, scaling, fns: StepFunctions) -> torc
         reference_coordinates=reference, reference_state=reference_state,
         physics=cfg.physics, scaling=scaling,
         fric_vel=phys[:, 0:1], ht_flux=phys[:, 1:2],
-        surface_stress_scale=cfg.surface_stress_scale,
+        surface_stress_xz_scale=cfg.surface_stress_xz_scale,
+        surface_stress_yz_scale=cfg.surface_stress_yz_scale,
         surface_heat_flux_scale=cfg.surface_heat_flux_scale,
+        no_penetration_scale=cfg.no_penetration_scale,
         surface_fe_state=b.surface_fe_state, z0m=b.surface_z0m,
         state_jacobian=state_jacobian, check_values=False,
         terrain_height=h, terrain_slopes=b.surface_geometry[:, 1:3],
@@ -681,9 +693,10 @@ def _pde_loss(model, coll: torch.Tensor, z: torch.Tensor, cfg, scaling, fns: Ste
             filter_width=filter_width,
         )
 
-    return torch.stack(
-        [r.square().mean() for r in res.values()]
-        ).mean()
+    return torch.stack([
+        (r / cfg.pde_residual_scales.scale_for(name)).square().mean()
+        for name, r in res.items()
+    ]).mean()
 
 
 def _forward_maybe_bf16(forward: Callable, coords: torch.Tensor, z: torch.Tensor,
