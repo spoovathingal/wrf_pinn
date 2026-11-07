@@ -11,13 +11,28 @@ from pathlib import Path
 import torch
 import numpy as np
 
-#: Variables carried in the conditioning fields and predicted by the model.
-STATE_VARS: tuple[str, ...] = ("u", "v", "w", "theta", "p_prime", "q_v", "e_sgs", "rho_d")
+# Variable order in the existing eight-variable dataset.
+STORED_STATE_VARS: tuple[str, ...] = ("u", "v", "w", "theta", "p_prime", "q_v", "e_sgs", "rho_d")
+# Variables used by the simplified model.
+STATE_VARS: tuple[str, ...] = ("u", "v", "w", "theta", "p_prime", "rho_d")
+ACTIVE_STATE_INDICES = tuple(STORED_STATE_VARS.index(name) for name in STATE_VARS)
+
 #: Interior sample coordinate columns.
 COORD_NAMES: tuple[str, ...] = ("x", "y", "z", "t")
 #: The four open side faces of a sub-domain, in a fixed order.
 FACE_NAMES: tuple[str, ...] = ("west", "east", "south", "north")
 
+def _select_active_state(values: np.ndarray, axis: int) -> np.ndarray:
+    """Select six active fields from the supported stored array layouts."""
+    n = values.shape[axis]
+
+    if n == len(STORED_STATE_VARS):
+        return np.take(values, ACTIVE_STATE_INDICES, axis=axis)
+
+    if n == len(STATE_VARS):
+        return values
+
+    raise ValueError(f"Expected 8 stored or 6 active state variables; got {n}.")
 
 @dataclass(frozen=True)
 class ConditionalCase:
@@ -115,6 +130,7 @@ def read_conditional_case(npz_path: str | Path, latent: str = "pod",
         members["interior"] = (blob["interior"].astype(np.float32) if "interior" in blob.files
                                else interior_from_grid(members["initial_coords"],
                                                        members["boundary_coords"]))
+        members["targets"] = _select_active_state(members["targets"], axis=-1)
         targets = members["targets"]
 
         if targets.ndim != 2 or targets.shape[1] != len(STATE_VARS):
@@ -187,14 +203,16 @@ def read_conditional_case(npz_path: str | Path, latent: str = "pod",
         if missing_pod and not raw_only:
             raise ValueError(
                 f"Case {path} is missing required POD arrays: {missing_pod}. "
-                "Regenerate the case with all eight state variables."
+                "The case must provide POD arrays for all active fields "
+                "or both ini_raw and bnd_raw."
             )
 
         bnd = raw_boundary(blob) if raw_only else decode_boundary(blob)
         ini = raw_initial(blob) if raw_only else decode_initial(blob)
         members["z"] = latent_vector(blob, latent)
         if "ini_raw" in blob.files:
-            members["initial_raw"] = blob["ini_raw"].astype(np.float32)
+            members["initial_raw"] = _select_active_state(
+                blob["ini_raw"], axis=0).astype(np.float32)
 
     members["boundary"] = np.stack([bnd[v] for v in STATE_VARS], axis=0).astype(np.float32)
     members["initial"] = np.stack([ini[v] for v in STATE_VARS], axis=0).astype(np.float32)
@@ -288,13 +306,13 @@ def first_lead_as_initial(members: dict, path: Path) -> dict:
 def raw_boundary(blob) -> dict:
     """The boundary state from bnd_raw (n_faces, n_times, face_len, n_state), in
     decode_boundary's layout {var: (n_faces, n_times, face_len)}."""
-    b = blob["bnd_raw"]
+    b = _select_active_state(blob["bnd_raw"], axis=-1)
     return {var: b[..., j] for j, var in enumerate(STATE_VARS)}
 
 
 def raw_initial(blob) -> dict:
     """The initial state from ini_raw (n_state, nz, nx*ny), in decode_initial's layout."""
-    i = blob["ini_raw"]
+    i = _select_active_state(blob["ini_raw"], axis=0)
     return {var: i[j] for j, var in enumerate(STATE_VARS)}
 
 
@@ -311,7 +329,8 @@ def latent_vector(blob, latent: str = "pod") -> np.ndarray:
     face_len, n_state) then ini_raw (n_state, nz, nx*ny), flattened (needs --keep-raw).
     latent='raw_terrain': the same, then the ground height (m) on the grid (terrain_grid)."""
     if latent in ("raw", "raw_terrain"):
-        parts = [blob["bnd_raw"].reshape(-1), blob["ini_raw"].reshape(-1)]
+        parts = [_select_active_state(blob["bnd_raw"], axis=-1).reshape(-1),
+            _select_active_state(blob["ini_raw"], axis=0).reshape(-1)]
         if latent == "raw_terrain":
             parts.append(terrain_grid(blob["terrain"]))
         return np.concatenate(parts).astype(np.float32)
@@ -339,12 +358,13 @@ class ConditionalMetadata:
     def load(cls, path: str | Path) -> "ConditionalMetadata":
         raw = json.loads(Path(path).read_text())
         schema = raw.get("schema", {})
-        state_vars = tuple(schema.get("state_vars", ()))
+        stored_vars = tuple(schema.get("state_vars", ()))
 
-        if state_vars != STATE_VARS:
+        if stored_vars not in (STORED_STATE_VARS, STATE_VARS):
             raise ValueError(
-                f"Metadata {path} must declare state_vars={STATE_VARS}; "
-                f"got {state_vars}. Regenerate the dataset with rho_d included.")
+                f"Metadata {path} must use the supported eight- or "
+                f"six-variable order; got {stored_vars}."
+            )
 
         expected_surface = {
             "state_vars": ["rho_d", "u", "v", "theta"],
@@ -354,12 +374,32 @@ class ConditionalMetadata:
 
         if schema.get("surface_reference") != expected_surface:
             raise ValueError(
-                f"Metadata {path} must declare surface_reference={expected_surface}.")
+                f"Metadata {path} must declare surface_reference={expected_surface}."
+            )
+
+        recipe = dict(raw.get("normalization", {}))
+
+        if tuple(recipe.get("state_vars", ())) != stored_vars:
+            raise ValueError(
+                f"Metadata {path}: schema and normalization state orders differ."
+            )
+
+        indices = [stored_vars.index(name) for name in STATE_VARS]
+
+        for key in ("state_offset", "state_scale"):
+            values = recipe.get(key, [])
+
+            if len(values) != len(stored_vars):
+                raise ValueError( f"Metadata {path}: invalid {key} length." )
+
+            recipe[key] = [values[i] for i in indices]
+
+        recipe["state_vars"] = list(STATE_VARS)
 
         return cls(
-            state_vars=state_vars,
+            state_vars=STATE_VARS,
             coord_names=tuple(schema.get("coord_names", COORD_NAMES)),
-            normalization=raw.get("normalization", {}),
+            normalization=recipe,
         )
 
 def prepare_terrain(terrain):

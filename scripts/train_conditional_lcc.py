@@ -21,7 +21,7 @@ from wrf_pinn.config.physics import DEFAULT_PHYSICS
 from wrf_pinn.config.scaling import ResidualScalingConfig, VariableScale
 from wrf_pinn.data.conditional_case import COORD_NAMES, STATE_VARS, ConditionalMetadata, read_conditional_case
 from wrf_pinn.models.conditional import (
-    RHO_D_INDEX, TKE_INDEX, ConditionalModel, ConditionalModelConfig, RawEncoder, RawProjection)
+    RHO_D_INDEX, ConditionalModel, ConditionalModelConfig, RawEncoder, RawProjection)
 from wrf_pinn.training.train_conditional import (
     ConditionalTrainConfig, train_conditional,
 )
@@ -170,8 +170,7 @@ def main() -> int:
     if args.n_cases is not None and args.n_cases < 1:
         ap.error("n-cases must be positive")
 
-    physics = replace(DEFAULT_PHYSICS, q_v_to_kg_per_kg=args.q_v_to_kg_per_kg)
-
+    physics = DEFAULT_PHYSICS
     distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
     rank, world = 0, 1
     device = args.device
@@ -203,8 +202,6 @@ def main() -> int:
         log.info("coordinate units: x, y x %g m, t x %g s (physics and terrain slopes in m and s)",
                  args.grid_spacing, args.step_seconds)
         scaling = replace(source_scaling, z=VariableScale(offset=0.0, scale=args.model_z_max))
-        # Preprocessing preserves FastEddy qv in g/kg.
-        # Convert to kg/kg inside the physics calculations.
 
         all_paths = sorted((args.cases_dir / "train").glob("*.npz"))
         if args.n_cases is not None:
@@ -241,14 +238,14 @@ def main() -> int:
         batch_cases = min(args.batch_cases, len(all_paths) // world)
 
         model_config = ConditionalModelConfig(
-            tke_offset=scaling.e_sgs.offset, tke_scale=scaling.e_sgs.scale,
-            rho_d_offset=scaling.rho_d.offset, rho_d_scale=scaling.rho_d.scale,
-            )
+            rho_d_offset=scaling.rho_d.offset,
+            rho_d_scale=scaling.rho_d.scale,
+        )
 
         model = ConditionalModel(z_dim, model_config, encoder)
         if args.predict_change:   # the network is a change: start TKE and rho_d at no change
             with torch.no_grad():
-                model.net[-1].bias[[TKE_INDEX, RHO_D_INDEX]] = 0.0
+                model.net[-1].bias[[RHO_D_INDEX]] = 0.0
         cfg = ConditionalTrainConfig(
             epochs=args.epochs, batch_cases=batch_cases,
             cases_per_pass=args.cases_per_pass, readers=args.readers,
@@ -258,10 +255,8 @@ def main() -> int:
             weight_flow_boundary=args.boundary_weight, weight_pde=args.pde_weight,
             source_scaling=source_scaling, scaling=scaling,
             terrain_xy_scale=args.grid_spacing,
-            terrain_top_height=args.terrain_top_height, fe_surface_reference_z=args.fe_surface_reference_z,
+            terrain_top_height=args.terrain_top_height,
             physics=physics,
-            flux_offset=tuple(recipe["flux_offset"]),
-            flux_scale=tuple(s or 1.0 for s in recipe["flux_scale"]),
             profile=args.profile, bf16_data=args.bf16_data,
             compile=args.compile_model, events_path=args.events,
             checkpoint_path=args.checkpoint, checkpoint_every=args.checkpoint_every,
@@ -270,43 +265,42 @@ def main() -> int:
         )
 
         log.info(
-            "geometry: FE terrain-following; H=%.6f m;  first reference z=%.9f m; "
+            "geometry: FE terrain-following; H=%.6f m; "
             "model z offset=%.6f m; model z scale=%.6f m",
-            cfg.terrain_top_height, cfg.fe_surface_reference_z,
-            scaling.z.offset, scaling.z.scale,
+            cfg.terrain_top_height,
+            scaling.z.offset,
+            scaling.z.scale,
         )
 
         log.info(
             "device=%s; local cases=%d/%d; latent dim=%d; "
-            "batch/GPU=%d; global batch=%d; q_v conversion=%g; mode=%s; "
-            "lr=%g->%s; boundary weight=%g; pde weight=%g; latent=%s; params=%d",
-            device, len(paths), len(all_paths), z_dim,
+            "batch/GPU=%d; global batch=%d; mode=%s; "
+            "lr=%g->%s; boundary weight=%g; pde weight=%g; "
+            "latent=%s; params=%d",
+            device,len(paths), len(all_paths), z_dim,
             batch_cases, batch_cases * world,
-            args.q_v_to_kg_per_kg,
             "lazy" if args.lazy else "resident",
-            args.lr, args.lr_min, args.boundary_weight, args.pde_weight,
-            args.latent, sum(p.numel() for p in model.parameters()),
+            args.lr, args.lr_min, args.boundary_weight,
+            args.pde_weight, args.latent,
+            sum(p.numel() for p in model.parameters()),
         )
 
         log.info(
-            "TKE output: softplus; offset=%g; scale=%g; floor=%g; "
-            "softplus scale=%g; initial value=%g [physical TKE: m^2/s^2]",
-            model_config.tke_offset, model_config.tke_scale,
-            model_config.tke_floor, model_config.tke_softplus_scale,
-            model_config.tke_initial_value,
+            "rho_d output: softplus; offset=%g; scale=%g; floor=%g; "
+            "softplus scale=%g; initial value=%g [kg/m^3]",
+            model_config.rho_d_offset,
+            model_config.rho_d_scale,
+            model_config.rho_d_floor,
+            model_config.rho_d_softplus_scale,
+            model_config.rho_d_initial_value,
         )
 
         log.info(
-            "SGS width: FE cell volume; native dx=%g m; native dy=%g m; "
-            "reference levels=%d; reference z=%g..%g m; edges=%s",
-            physics.sgs_dx, physics.sgs_dy, len(physics.sgs_reference_z),
-            physics.sgs_reference_z[0], physics.sgs_reference_z[-1],
-            physics.sgs_vertical_edge_policy,
+            "dry system: outputs=%s; PDE residuals=%s; "
+            "surface=no_penetration_w; moisture and SGS disabled",
+            physics.active_variables,
+            physics.residuals,
         )
-
-        log.info("PDE: %d residuals; TKE transport equation disabled",
-            physics.residual_dim)
-
         if args.lazy:
             hist = train_conditional(
                 model, config=cfg, case_paths=paths,

@@ -33,8 +33,9 @@ from torch import nn
 
 from wrf_pinn.models.conditional import (
     ConditionalModelConfig,
-    TKE_INDEX,RHO_D_INDEX,
-    first_layer, transform_state_output,
+    RHO_D_INDEX,
+    first_layer,
+    transform_state_output,
 )
 
 #: spatial second-derivative channels, in order (xx, yy, zz, xy, xz, yz)
@@ -213,7 +214,7 @@ def transform_state_jet(
     if output_config is None:
         raise ValueError(
             "Pass model.config; Taylor derivatives require the model's "
-            "TKE & density normalization."
+            "density normalization."
         )
 
     values = transform_state_output(raw.v, output_config)
@@ -222,10 +223,7 @@ def transform_state_jet(
 
     transformed_d = derivatives
     transformed_h = hessian
-    for index, prefix in (
-        (TKE_INDEX, "tke"),
-        (RHO_D_INDEX, "rho_d"),
-    ):
+    for index, prefix in ( (RHO_D_INDEX, "rho_d"), ):
         sl = slice(index, index + 1)
         a = raw.v[:, sl].to(values.dtype)
 
@@ -290,7 +288,7 @@ def taylor_forward(net: nn.Sequential, coordinates: torch.Tensor, z_rows: torch.
     ``ConditionalModel.forward``) and is multiplied through the first layer once per
     case; it carries no coordinate derivatives either way.
     ``output_config`` must be the corresponding ``model.config``. The returned
-    values include the model's TKE & density Softplus transformation, and its derivatives
+    values include the model's density Softplus transformation, and its derivatives
     include the same transformation through the chain rule. ``raw``: skip the
     transform (predict_change adds the initial field before applying it).
     """

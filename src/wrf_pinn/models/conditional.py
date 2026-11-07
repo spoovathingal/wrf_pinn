@@ -13,7 +13,6 @@ from torch import nn
 from torch.nn import functional as F
 from wrf_pinn.config.physics import DEFAULT_PHYSICS
 
-TKE_INDEX = DEFAULT_PHYSICS.variable_index("e_sgs")
 RHO_D_INDEX = DEFAULT_PHYSICS.variable_index("rho_d")
 
 @dataclass(frozen=True)
@@ -24,13 +23,6 @@ class ConditionalModelConfig:
     hidden_layers: int = 4
     activation: str = "tanh"
 
-    # Dataset normalization: e_physical = tke_offset + tke_scale * e_normalized.
-    tke_offset: float = 0.0
-    tke_scale: float = 1.0
-    # Physical units: m^2/s^2.
-    tke_floor: float = 1.0e-10
-    tke_softplus_scale: float = 1.0
-    tke_initial_value: float = 0.01
     # Dataset normalization:
     # rho_physical = rho_d_offset + rho_d_scale * rho_normalized.
     rho_d_offset: float = 0.0
@@ -48,7 +40,7 @@ class ConditionalModelConfig:
                 "including the rho_d output."
             )
 
-        for prefix in ("tke", "rho_d"):
+        for prefix in ("rho_d",):
             for suffix in ("offset", "scale", "floor","softplus_scale", "initial_value"):
                 name = f"{prefix}_{suffix}"
                 if not math.isfinite(getattr(self, name)):
@@ -77,7 +69,7 @@ class ConditionalModelConfig:
 
 def transform_state_output(raw_state: torch.Tensor,config: ConditionalModelConfig,
 ) -> torch.Tensor:
-    """Convert raw outputs to normalized state, enforcing physical TKE positivity."""
+    """Convert raw outputs to normalized state, enforcing positive dry density."""
     # Keep the affine conversion and Softplus at least float32, including when
     # the derivative-free network forwards use bf16 autocast.
     if raw_state.ndim != 2 or raw_state.shape[1] != config.state_dim:
@@ -88,7 +80,7 @@ def transform_state_output(raw_state: torch.Tensor,config: ConditionalModelConfi
         raw_state = raw_state.float()
 
     state = raw_state
-    for index, prefix in ((TKE_INDEX, "tke"), (RHO_D_INDEX, "rho_d")):
+    for index, prefix in ((RHO_D_INDEX, "rho_d"),):
         raw = raw_state[:, index:index + 1]
         physical = (getattr(config, f"{prefix}_floor")
             + getattr(config, f"{prefix}_softplus_scale")
@@ -105,10 +97,11 @@ def transform_state_output(raw_state: torch.Tensor,config: ConditionalModelConfi
 
 
 def inverse_transform_state(state: torch.Tensor, config: ConditionalModelConfig) -> torch.Tensor:
-    """Raw outputs that ``transform_state_output`` maps to ``state`` (n, state_dim).
-    TKE and rho_d at or below their floor are clamped just above it."""
+    """Invert transform_state_output for a normalized state.
+    Dry density at or below its floor is clamped just above it.
+    """
     raw_state = state
-    for index, prefix in ((TKE_INDEX, "tke"), (RHO_D_INDEX, "rho_d")):
+    for index, prefix in ((RHO_D_INDEX, "rho_d"),):
         physical = (getattr(config, f"{prefix}_offset")
                     + getattr(config, f"{prefix}_scale") * state[:, index:index + 1])
         y = ((physical - getattr(config, f"{prefix}_floor"))
@@ -210,35 +203,35 @@ class ConditionalModel(nn.Module):
     The encoder output is LayerNormed so a wide raw input cannot saturate the first
     tanh layer (unnormalized, Adam grew it to ~100-1000 and the output went constant)."""
 
-    def __init__(self, latent_dim: int,
-                 config: ConditionalModelConfig = ConditionalModelConfig(),
-                 encoder: "RawEncoder | RawProjection | None" = None) -> None:
+    def __init__(
+        self,
+        latent_dim: int,
+        config: ConditionalModelConfig = ConditionalModelConfig(),
+        encoder: "RawEncoder | RawProjection | None" = None,
+    ) -> None:
         super().__init__()
         self.config = config
         self.encoder = encoder
+
         width = encoder.out_dim if encoder is not None else latent_dim
         self.latent_norm = nn.LayerNorm(width) if encoder is not None else None
         self.net = self._build(config.coord_dim + width, config)
 
-    def encode(self, z: torch.Tensor) -> torch.Tensor:
-        """The case latent the net sees: LayerNorm(encoder(z)), or z itself."""
-        return z if self.encoder is None else self.latent_norm(self.encoder(z))
-
-        # Initialize TKE and density near their physical starting values.
+        # Set the density bias using the inverse physical Softplus transform.
         # Random output weights retain spatial and case-dependent variation.
         with torch.no_grad():
-            for index, prefix in ((TKE_INDEX, "tke"), (RHO_D_INDEX, "rho_d")):
-                
-                target = (
-                    getattr(config, f"{prefix}_initial_value")
-                    - getattr(config, f"{prefix}_floor")
-                ) / getattr(config, f"{prefix}_softplus_scale")
+            target = (config.rho_d_initial_value - config.rho_d_floor
+            ) / config.rho_d_softplus_scale
 
-                bias = (
-                    target if target > 20.0
-                    else target + math.log(-math.expm1(-target))
-                )
-                self.net[-1].bias[index] = bias
+            bias = (
+                target if target > 20.0 else target + math.log(-math.expm1(-target))
+            )
+
+            self.net[-1].bias[RHO_D_INDEX] = bias
+
+    def encode(self, z: torch.Tensor) -> torch.Tensor:
+        """Return the case conditioning vector, optionally encoded."""
+        return z if self.encoder is None else self.latent_norm(self.encoder(z))
 
     @staticmethod
     def _build(in_features: int, config: ConditionalModelConfig) -> nn.Sequential:

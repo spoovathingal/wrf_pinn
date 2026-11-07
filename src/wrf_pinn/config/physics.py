@@ -11,9 +11,9 @@ from typing import Literal
 
 
 CoordinateSystem = Literal["local_cartesian"]
-PhysicsVariable = Literal["u", "v", "w", "theta", "p_prime", "q_v", "e_sgs", "rho_d"]
+PhysicsVariable = Literal["u", "v", "w", "theta", "p_prime", "rho_d"]
 ResidualName = Literal["mass", "x_momentum", "y_momentum", "z_momentum",
-                       "potential_temperature","water_vapor"]
+                       "potential_temperature"]
 
 @dataclass(frozen=True)
 class PhysicalConstants:
@@ -93,34 +93,38 @@ class PhysicalConstants:
 
 @dataclass(frozen=True)
 class PhysicsConfig:
-    """Configuration for reduced moist Cartesian equations with SGS closure.
+    """Dry Cartesian equations without SGS transport.
 
-    Eight fields are predicted, including positive SGS TKE. Six PDE residuals
-    constrain mass, momentum, potential temperature, and water vapor.
+    Six predicted fields: u, v, w, theta, p_prime, rho_d.
+    Five PDE residuals: continuity, three momentum equations,
+    and potential-temperature transport.
 
-    TKE enters the diagnostic SGS stresses and diffusivities, but has no
-    separate transport-equation residual.
+    Moisture, SGS stresses, scalar diffusion, and microphysics
+    are excluded. Gravity and pressure gradients are retained.
     """
 
     coordinate_system: CoordinateSystem = "local_cartesian"
-    active_variables: tuple[PhysicsVariable, ...] = ("u", "v", "w", "theta",
-                                                "p_prime", "q_v", "e_sgs", "rho_d")
+
+    active_variables: tuple[PhysicsVariable, ...] = (
+        "u", "v", "w", "theta", "p_prime", "rho_d",
+    )
+
     residuals: tuple[ResidualName, ...] = (
         "mass",
         "x_momentum",
         "y_momentum",
         "z_momentum",
         "potential_temperature",
-        "water_vapor",
     )
     include_coriolis: bool = False
     include_gravity: bool = True
     include_pressure_gradient: bool = True
     include_temperature: bool = True
-    include_moisture: bool = True
-    include_turbulence: bool = True
+    include_moisture: bool = False
+    include_turbulence: bool = False
     include_microphysics: bool = False
     forcing_is_zero: bool = True
+
     constants: PhysicalConstants = PhysicalConstants()
 
     # Multiplier taking the data's q_v to kg/kg for the thermodynamics
@@ -193,7 +197,7 @@ class PhysicsConfig:
 
     @property
     def state_dim(self) -> int:
-        """Number of predicted state variables, including SGS TKE"""
+        """Number of predicted state variables"""
         return len(self.active_variables)
 
     @property
