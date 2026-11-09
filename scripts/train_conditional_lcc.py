@@ -93,6 +93,7 @@ def main() -> int:
         "--batch-cases", type=int, default=4,
         help="Cases per GPU per update")
     ap.add_argument("--device", default="auto")
+    ap.add_argument("--activation", choices=("tanh", "silu", "gelu", "relu"), default="tanh")
     ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--lazy", action="store_true")
     ap.add_argument("--checkpoint", default=None)
@@ -238,6 +239,7 @@ def main() -> int:
         batch_cases = min(args.batch_cases, len(all_paths) // world)
 
         model_config = ConditionalModelConfig(
+            activation=args.activation,
             rho_d_offset=scaling.rho_d.offset,
             rho_d_scale=scaling.rho_d.scale,
         )
