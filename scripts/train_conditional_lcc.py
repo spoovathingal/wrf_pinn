@@ -158,6 +158,13 @@ def main() -> int:
     ap.add_argument("--initial-from-targets", action="store_true",
                     help="start each window at its first lead, all raw: no POD enters z or any loss "
                          "(POD-only cases such as cstldense128_5; window loses one snapshot)")
+    ap.add_argument("--hidden-layers", type=int, default=4)
+    ap.add_argument("--hidden-width", type=int, default=128)
+    ap.add_argument("--activation", choices=("tanh", "silu", "gelu", "relu"), default="tanh")
+    ap.add_argument("--surface-weight", type=float, default=1.0)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--stop-epoch", type=int, default=None,
+                    help="end early at this step; the lr schedule still spans --epochs")
     ap.add_argument("--terrain-input", action="store_true",
                     help="the encoder also reads each subdomain's ground height map (--latent encoder)")
     args = ap.parse_args()
@@ -240,7 +247,10 @@ def main() -> int:
         paths = all_paths[rank::world]
         batch_cases = min(args.batch_cases, len(all_paths) // world)
 
+        torch.manual_seed(args.seed)
         model_config = ConditionalModelConfig(
+            hidden_layers=args.hidden_layers, hidden_width=args.hidden_width,
+            activation=args.activation,
             tke_offset=scaling.e_sgs.offset, tke_scale=scaling.e_sgs.scale,
             rho_d_offset=scaling.rho_d.offset, rho_d_scale=scaling.rho_d.scale,
             )
@@ -256,6 +266,7 @@ def main() -> int:
             log_every=args.log_every,
             learning_rate=args.lr, learning_rate_min=args.lr_min,
             weight_flow_boundary=args.boundary_weight, weight_pde=args.pde_weight,
+            weight_surface=args.surface_weight, seed=args.seed, stop_epoch=args.stop_epoch,
             source_scaling=source_scaling, scaling=scaling,
             terrain_xy_scale=args.grid_spacing,
             terrain_top_height=args.terrain_top_height, fe_surface_reference_z=args.fe_surface_reference_z,

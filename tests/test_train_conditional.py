@@ -240,6 +240,19 @@ def test_checkpoint_save_and_resume(tmp_path):
     assert any(not torch.equal(b, a) for b, a in zip(before, after)), "weights not restored on resume"
 
 
+def test_stop_epoch_then_resume(tmp_path):
+    cases = [_make_case(f"c{i}", i) for i in range(6)]
+    ckpt = tmp_path / "run.pt"
+    cfg = ConditionalTrainConfig(epochs=20, stop_epoch=8, batch_cases=3, device="cpu", log_every=20,
+                                 checkpoint_path=str(ckpt), checkpoint_every=100, **_DATA_ONLY)
+    model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=16))
+    assert len(train_conditional(model, cases, cfg).total) == 8
+    assert torch.load(str(ckpt), map_location="cpu")["epoch"] == 8
+
+    model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=16))
+    assert len(train_conditional(model, cases, replace(cfg, stop_epoch=None)).total) == 20
+
+
 def test_latent_conditions_output():
     """Changing z must change the prediction at fixed coordinates."""
     case = _make_case("c", 0).as_torch()

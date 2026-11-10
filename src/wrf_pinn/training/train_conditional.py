@@ -55,6 +55,7 @@ class ConditionalHistory:
 @dataclass(frozen=True)
 class ConditionalTrainConfig:
     epochs: int = 2000
+    stop_epoch: int | None = None   # end early here; the lr schedule still spans epochs
     batch_cases: int = 4          # cases drawn per step (per process when distributed)
     #: cases per forward/backward pass; gradients accumulate over the step's
     #: passes, so the math matches one pass over batch_cases. 0 = whole batch.
@@ -1022,7 +1023,8 @@ def train_conditional(
 
     # Prefetch: the next step's batch is stacked + pinned while the GPU works, on a
     # thread, or in DataLoader worker processes (same draws, same order).
-    n_steps = config.epochs - start_epoch + 1
+    last = min(config.stop_epoch or config.epochs, config.epochs)
+    n_steps = last - start_epoch + 1
     if case_paths is not None and config.loader_workers > 0:
         loader = torch.utils.data.DataLoader(
             _CaseFiles(case_paths, config.latent, config.initial_from_targets), batch_sampler=_StepDraws(n_cases, k, config.seed + rank, n_steps),
@@ -1036,11 +1038,11 @@ def train_conditional(
         pending = pool.submit(host_batch, draw())
         next_batch = lambda: pending.result()
 
-    for epoch in range(start_epoch, config.epochs + 1):
+    for epoch in range(start_epoch, last + 1):
         t_wait = time.perf_counter()
         passes = [b.to(device) for b in next_batch()]
         wait_window += time.perf_counter() - t_wait
-        if pool is not None and epoch < config.epochs:
+        if pool is not None and epoch < last:
             pending = pool.submit(host_batch, draw())
 
         if prof is not None and cuda:
@@ -1051,7 +1053,7 @@ def train_conditional(
             group["lr"] = lr
         optimizer.zero_grad()
         log_residuals = (epoch == 1
-            or epoch == config.epochs
+            or epoch == last
             or epoch % config.log_every == 0
         )
         watch["on"] = rank == 0 and log_residuals
@@ -1138,7 +1140,7 @@ def train_conditional(
                 })
             now = time.perf_counter()
             s_step = (now - t_window) / steps_window
-            eta_h = s_step * (config.epochs - epoch) / 3600
+            eta_h = s_step * (last - epoch) / 3600
             mem = f" gpu_mem={torch.cuda.max_memory_allocated(device) / 1e9:.1f}GB" if cuda else ""
             parts = " ".join(f"{n}={v:.4e}" for n, v in zip(weights, losses[1:]))
             # stderr + flush so progress is live in the SLURM log, never buffered
@@ -1173,7 +1175,7 @@ def train_conditional(
             t_window, wait_window, steps_window = now, 0.0, 0
 
         if rank == 0 and config.checkpoint_path and (epoch % config.checkpoint_every == 0
-                                                     or epoch == config.epochs):
+                                                     or epoch == last):
             _save_checkpoint(model, optimizer, history, epoch, config, manifest)
 
     if pool is not None:
