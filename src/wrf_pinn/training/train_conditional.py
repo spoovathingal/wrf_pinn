@@ -26,6 +26,7 @@ from wrf_pinn.physics.residuals_pde import (
     cartesian_zero_forcing_residuals, cartesian_zero_forcing_residuals_taylor,
 )
 from wrf_pinn.physics.residuals_boundary import no_penetration_z_wall_residuals, _surface_layer_transfer_coefficients
+from wrf_pinn.training.loss_weights import METHODS, GradBalance
 from wrf_pinn.physics.taylor import Jet, coordinate_jet, taylor_forward, transform_state_jet
 from wrf_pinn.models.conditional import (
     ConditionalModelConfig, inverse_transform_state, transform_state_output)
@@ -56,6 +57,8 @@ class ConditionalHistory:
 class ConditionalTrainConfig:
     epochs: int = 2000
     stop_epoch: int | None = None   # end early here; the lr schedule still spans epochs
+    loss_weights: str = "fixed"     # key of loss_weights.METHODS
+    optimizer: str = "adam"         # adam, adamw or soap
     batch_cases: int = 4          # cases drawn per step (per process when distributed)
     #: cases per forward/backward pass; gradients accumulate over the step's
     #: passes, so the math matches one pass over batch_cases. 0 = whole batch.
@@ -1003,17 +1006,22 @@ def train_conditional(
                   for s in range(0, len(picked), per_pass)]
         return [b.pin() for b in passes] if cuda else passes
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
-    fns = step_functions(model, compile=config.compile)
-    rng = torch.Generator().manual_seed(config.seed + rank)
-    history = ConditionalHistory()
     weights = {"data": config.weight_data, "initial": config.weight_initial,
                "flow_boundary": config.weight_flow_boundary,
                "pde": config.weight_pde, "surface": config.weight_surface}
+    balancer = METHODS[config.loss_weights](weights)
+    params = list(model.parameters())
+    if isinstance(balancer, torch.nn.Module):
+        balancer.to(device)
+        params += list(balancer.parameters())
+    optimizer = _optimizer(config.optimizer, params, config.learning_rate)
+    fns = step_functions(model, compile=config.compile)
+    rng = torch.Generator().manual_seed(config.seed + rank)
+    history = ConditionalHistory()
 
     raw_names = (  ( PDE_RAW_NAMES if config.weight_pde != 0.0 else () )
         + ( SURFACE_RAW_NAMES if config.weight_surface != 0.0 else () ) )
-    start_epoch = _maybe_resume(model, optimizer, history, config, device)
+    start_epoch = _maybe_resume(model, optimizer, history, config, device, balancer)
     k = min(config.batch_cases, n_cases)
     draw = lambda: torch.randperm(n_cases, generator=rng)[:k].tolist()
 
@@ -1071,13 +1079,17 @@ def train_conditional(
         unit_coll = (torch.rand((k, config.n_collocation, passes[0].box_lo.shape[1]),
                                 device=device) if config.weight_pde != 0.0 else None)
         first = 0
+        rebalance = isinstance(balancer, GradBalance) and (epoch == start_epoch or epoch % balancer.every == 0)
         for b in passes:
             share = b.k / k
             u = unit_coll[first:first + b.k] if unit_coll is not None else None
             first += b.k
             batch_raw = {} if raw_sums is not None else None
             batch = _batch_losses(model, b, config, u, fns, raw_mse=batch_raw)
-            total = sum(weights[name] * batch[name] for name in weights)
+            if rebalance:  # one pass's gradients are enough to set the weights
+                balancer.rebalance(batch, params)
+                rebalance = False
+            total = balancer.total(batch)
             with record_function("step/backward"):
                 (share * total).backward()
             losses += share * torch.stack([total.detach()] + [batch[n].detach() for n in weights])
@@ -1121,6 +1133,7 @@ def train_conditional(
             prof["step"] += time.perf_counter() - t
         steps_window += 1
 
+        balancer.update(dict(zip(weights, losses[1:])))
         history.total.append(losses[0])
         for name, value in zip(weights, losses[1:]):
             getattr(history, name).append(value)
@@ -1133,6 +1146,7 @@ def train_conditional(
                 write_event(config.events_path, {
                     "event": "step", "epoch": epoch,
                     "losses": dict(zip(("total", *weights), losses)),
+                    "loss_weights": dict(balancer.weights),
                     "raw_residual_rms": raw_rms,
                     "gradient_norm_before_clip": norm if math.isfinite(norm) else None,
                     "gradient_norm_finite": math.isfinite(norm),
@@ -1176,13 +1190,22 @@ def train_conditional(
 
         if rank == 0 and config.checkpoint_path and (epoch % config.checkpoint_every == 0
                                                      or epoch == last):
-            _save_checkpoint(model, optimizer, history, epoch, config, manifest)
+            _save_checkpoint(model, optimizer, history, epoch, config, manifest, balancer)
 
     if pool is not None:
         pool.shutdown()
     if readers is not None:
         readers.shutdown()
     return history
+
+
+def _optimizer(name: str, params: list, lr: float) -> torch.optim.Optimizer:
+    if name == "adamw":
+        return torch.optim.AdamW(params, lr=lr)
+    if name == "soap":
+        from pytorch_optimizer import SOAP  # optional dependency, needed only here
+        return SOAP(params, lr=lr)
+    return torch.optim.Adam(params, lr=lr)
 
 
 def _learning_rate(epoch: int, config: ConditionalTrainConfig) -> float:
@@ -1194,7 +1217,7 @@ def _learning_rate(epoch: int, config: ConditionalTrainConfig) -> float:
     return lo + 0.5 * (hi - lo) * (1.0 + math.cos(math.pi * frac))
 
 
-def _save_checkpoint(model, optimizer, history, epoch, config, manifest=None) -> None:
+def _save_checkpoint(model, optimizer, history, epoch, config, manifest=None, balancer=None) -> None:
     """Atomically write a resumable checkpoint, plus a step-tagged copy kept for good."""
     if manifest is None:
         manifest = run_manifest(model, config)    
@@ -1203,14 +1226,15 @@ def _save_checkpoint(model, optimizer, history, epoch, config, manifest=None) ->
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save({"schema_version": 7, "geometry_version": 2, "manifest": manifest,
                 "epoch": epoch, "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(), "history": vars(history)}, tmp)
+                "optimizer": optimizer.state_dict(), "history": vars(history),
+                "loss_weights": balancer.state() if balancer else None}, tmp)
     tagged = path.with_name(f"{path.stem}_step{epoch:06d}{path.suffix}")
     tagged.write_bytes(tmp.read_bytes())
     tmp.replace(path)
     write_event(config.events_path, {"event": "checkpoint", "epoch": epoch, "path": str(path)})
     print(f"checkpoint @ epoch {epoch} -> {path} (+ {tagged.name})", file=sys.stderr, flush=True)
 
-def _maybe_resume(model, optimizer, history, config, device) -> int:
+def _maybe_resume(model, optimizer, history, config, device, balancer=None) -> int:
     """Load a checkpoint if present; return the epoch to start from (1 if none)."""
     if not config.checkpoint_path or not Path(config.checkpoint_path).is_file():
         return 1
@@ -1239,6 +1263,8 @@ def _maybe_resume(model, optimizer, history, config, device) -> int:
 
     model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
+    if balancer is not None and ckpt.get("loss_weights"):
+        balancer.load(ckpt["loss_weights"])
 
     for name, values in ckpt["history"].items():
         getattr(history, name).extend(values)

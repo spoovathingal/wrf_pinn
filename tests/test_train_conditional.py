@@ -156,9 +156,11 @@ _DATA_ONLY = dict(weight_pde=0.0, weight_surface=0.0,
     source_scaling=ResidualScalingConfig(), scaling=ResidualScalingConfig())
 
 
-def test_pipeline_runs():
+@pytest.mark.parametrize("activation", ["tanh", "sin", "adaptive-tanh", "silu", "gelu"])
+def test_pipeline_runs(activation):
     cases = [_make_case(f"c{i}", i) for i in range(10)]
-    model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=32))
+    model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=32,
+                                                                activation=activation))
     cfg = ConditionalTrainConfig(epochs=50, batch_cases=4, device="cpu", log_every=50, **_DATA_ONLY)
     hist = train_conditional(model, cases, cfg)
     assert len(hist.total) == 50
@@ -251,6 +253,34 @@ def test_stop_epoch_then_resume(tmp_path):
 
     model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=16))
     assert len(train_conditional(model, cases, replace(cfg, stop_epoch=None)).total) == 20
+
+
+@pytest.mark.parametrize("method", ["grad-balance", "relobralo", "softadapt", "uncertainty"])
+def test_loss_weight_methods_train_and_resume(tmp_path, method):
+    cases = [_make_case(f"c{i}", i) for i in range(6)]
+    cfg = ConditionalTrainConfig(epochs=6, stop_epoch=3, batch_cases=3, device="cpu", log_every=1,
+                                 loss_weights=method, checkpoint_path=str(tmp_path / "run.pt"),
+                                 events_path=str(tmp_path / "events.jsonl"), **_DATA_ONLY)
+    model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=16))
+    train_conditional(model, cases, cfg)
+    saved = torch.load(str(tmp_path / "run.pt"), map_location="cpu")["loss_weights"]["weights"]
+
+    model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=16))
+    assert len(train_conditional(model, cases, replace(cfg, stop_epoch=None)).total) == 6
+    import json
+    steps = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
+    steps = [e for e in steps if e["event"] == "step"]
+    assert steps[3]["epoch"] == 4 and set(steps[3]["loss_weights"]) == set(saved)
+
+
+@pytest.mark.parametrize("optimizer", ["adamw", "soap"])
+def test_optimizers_train(optimizer):
+    cases = [_make_case(f"c{i}", i) for i in range(6)]
+    model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=16))
+    cfg = ConditionalTrainConfig(epochs=30, batch_cases=3, device="cpu", log_every=30,
+                                 optimizer=optimizer, **_DATA_ONLY)
+    hist = train_conditional(model, cases, cfg)
+    assert hist.total[-1] < hist.total[0]
 
 
 def test_latent_conditions_output():

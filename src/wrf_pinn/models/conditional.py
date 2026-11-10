@@ -16,6 +16,27 @@ from wrf_pinn.config.physics import DEFAULT_PHYSICS
 TKE_INDEX = DEFAULT_PHYSICS.variable_index("e_sgs")
 RHO_D_INDEX = DEFAULT_PHYSICS.variable_index("rho_d")
 
+class Sine(nn.Module):
+    def forward(self, x):
+        return torch.sin(x)
+
+
+class AdaptiveTanh(nn.Module):
+    """Jagtap, Kawaguchi and Karniadakis 2020: tanh(n a x) with one learned slope a per layer."""
+
+    def __init__(self, n: float = 10.0):
+        super().__init__()
+        self.n = n
+        self.a = nn.Parameter(torch.tensor(1.0 / n))
+
+    def forward(self, x):
+        return torch.tanh(self.n * self.a * x)
+
+
+ACTIVATIONS = {"tanh": nn.Tanh, "silu": nn.SiLU, "gelu": nn.GELU, "relu": nn.ReLU,
+               "sin": Sine, "adaptive-tanh": AdaptiveTanh}
+
+
 @dataclass(frozen=True)
 class ConditionalModelConfig:
     coord_dim: int = 4
@@ -242,8 +263,7 @@ class ConditionalModel(nn.Module):
 
     @staticmethod
     def _build(in_features: int, config: ConditionalModelConfig) -> nn.Sequential:
-        act = {"tanh": nn.Tanh, "silu": nn.SiLU, "gelu": nn.GELU, "relu": nn.ReLU}[
-            config.activation]
+        act = ACTIVATIONS[config.activation]
         layers: list[nn.Module] = []
         width = in_features
         for _ in range(config.hidden_layers):
