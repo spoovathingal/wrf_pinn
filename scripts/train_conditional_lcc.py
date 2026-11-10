@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import replace
 from datetime import timedelta
 
@@ -18,6 +19,7 @@ import torch
 import torch.distributed as dist
 
 from wrf_pinn.config.physics import DEFAULT_PHYSICS
+from wrf_pinn.evaluation.score import score_cases
 from wrf_pinn.config.scaling import ResidualScalingConfig, VariableScale
 from wrf_pinn.data.conditional_case import COORD_NAMES, STATE_VARS, ConditionalMetadata, read_conditional_case
 from wrf_pinn.models.conditional import (
@@ -163,6 +165,8 @@ def main() -> int:
     ap.add_argument("--activation", choices=("tanh", "silu", "gelu", "relu", "sin", "adaptive-tanh"), default="tanh")
     ap.add_argument("--surface-weight", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--score-out", type=Path, default=None,
+                    help="after training, score the model on the test cases into this JSON")
     ap.add_argument("--optimizer", choices=("adam", "adamw", "soap"), default="adam")
     ap.add_argument("--loss-weights", choices=("fixed", "grad-balance", "relobralo", "softadapt", "uncertainty"),
                     default="fixed")
@@ -346,6 +350,16 @@ def main() -> int:
                 "done. total loss: first=%.4e last=%.4e",
                 hist.total[0], hist.total[-1],
             )
+        if args.score_out and rank == 0:
+            test = sorted((args.cases_dir / "test").glob("*.npz"))
+            t0 = time.time()
+            result = score_cases(model, test, cfg, read, device, readers=args.readers)
+            result.update(step=len(hist.total), test_cases=len(test), score_seconds=time.time() - t0,
+                          train_data_loss_last500=sum(hist.data[-500:]) / len(hist.data[-500:]))
+            args.score_out.parent.mkdir(parents=True, exist_ok=True)
+            args.score_out.write_text(json.dumps(result, indent=1))
+            log.info("scored %d test cases at step %d in %.0fs -> %s",
+                     len(test), len(hist.total), time.time() - t0, args.score_out)
         return 0
 
     finally:
