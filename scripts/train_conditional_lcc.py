@@ -163,6 +163,7 @@ def main() -> int:
     ap.add_argument("--hidden-layers", type=int, default=4)
     ap.add_argument("--hidden-width", type=int, default=128)
     ap.add_argument("--activation", choices=("tanh", "silu", "gelu", "relu", "sin", "adaptive-tanh"), default="tanh")
+    ap.add_argument("--initializer", choices=("default", "xavier"), default="default")
     ap.add_argument("--surface-weight", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--score-out", type=Path, default=None,
@@ -257,7 +258,7 @@ def main() -> int:
         torch.manual_seed(args.seed)
         model_config = ConditionalModelConfig(
             hidden_layers=args.hidden_layers, hidden_width=args.hidden_width,
-            activation=args.activation,
+            activation=args.activation, initializer=args.initializer,
             tke_offset=scaling.e_sgs.offset, tke_scale=scaling.e_sgs.scale,
             rho_d_offset=scaling.rho_d.offset, rho_d_scale=scaling.rho_d.scale,
             )

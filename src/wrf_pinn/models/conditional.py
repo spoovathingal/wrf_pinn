@@ -44,6 +44,7 @@ class ConditionalModelConfig:
     hidden_width: int = 128
     hidden_layers: int = 4
     activation: str = "tanh"
+    initializer: str = "default"    # default (PyTorch) or xavier (uniform weights, zero bias)
 
     # Dataset normalization: e_physical = tke_offset + tke_scale * e_normalized.
     tke_offset: float = 0.0
@@ -270,6 +271,13 @@ class ConditionalModel(nn.Module):
             layers += [nn.Linear(width, config.hidden_width), act()]
             width = config.hidden_width
         layers.append(nn.Linear(width, config.state_dim))
+        if config.initializer == "xavier":
+            for layer in layers:
+                if isinstance(layer, nn.Linear):
+                    nn.init.xavier_uniform_(layer.weight)
+                    nn.init.zeros_(layer.bias)
+        elif config.initializer != "default":
+            raise ValueError(f"Unknown initializer: {config.initializer}.")
         return nn.Sequential(*layers)
 
     def forward(self, coordinates: torch.Tensor, z: torch.Tensor,
