@@ -25,7 +25,7 @@ from wrf_pinn.data.conditional_case import COORD_NAMES, STATE_VARS, ConditionalM
 from wrf_pinn.models.conditional import (
     RHO_D_INDEX, TKE_INDEX, ConditionalModel, ConditionalModelConfig, RawEncoder, RawProjection)
 from wrf_pinn.training.train_conditional import (
-    ConditionalTrainConfig, train_conditional,
+    SURFACE_RAW_NAMES, ConditionalTrainConfig, train_conditional,
 )
 
 log = logging.getLogger("train_conditional_lcc")
@@ -84,7 +84,7 @@ def _terrain_stats(paths: list[Path], n: int = 256) -> tuple[float, float, float
     return stats
 
 
-def main() -> int:
+def _argument_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser()
     ap.add_argument("cases_dir", type=Path)
     ap.add_argument(
@@ -160,21 +160,26 @@ def main() -> int:
     ap.add_argument("--initial-from-targets", action="store_true",
                     help="start each window at its first lead, all raw: no POD enters z or any loss "
                          "(POD-only cases such as cstldense128_5; window loses one snapshot)")
-    ap.add_argument("--hidden-layers", type=int, default=4)
-    ap.add_argument("--hidden-width", type=int, default=128)
-    ap.add_argument("--activation", choices=("tanh", "silu", "gelu", "relu", "sin", "adaptive-tanh"), default="tanh")
-    ap.add_argument("--initializer", choices=("default", "xavier"), default="default")
-    ap.add_argument("--surface-weight", type=float, default=1.0)
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="seed model/encoder initialization and sampling; use the same seed for ablations")
     ap.add_argument("--score-out", type=Path, default=None,
                     help="after training, score the model on the test cases into this JSON")
-    ap.add_argument("--optimizer", choices=("adam", "adamw", "soap"), default="adam")
-    ap.add_argument("--loss-weights", choices=("fixed", "grad-balance", "relobralo", "softadapt", "uncertainty"),
-                    default="fixed")
-    ap.add_argument("--stop-epoch", type=int, default=None,
-                    help="end early at this step; the lr schedule still spans --epochs")
+    ap.add_argument("--loss-weights", choices=("fixed", "grad-balance"), default="fixed",
+                    help="fixed baseline weights or W1 gradient-balance weights")
+    surface = ap.add_mutually_exclusive_group()
+    surface.add_argument("--surface-term", choices=("all", "none", *SURFACE_RAW_NAMES),
+                         default="all", help="surface loss terms to train on (default: all four)")
+    for name in ("none", *SURFACE_RAW_NAMES):
+        surface.add_argument(f"--{name}", dest="surface_term", action="store_const", const=name,
+                             help=("disable every surface loss term" if name == "none"
+                                   else f"enable only {name} in the surface loss"))
     ap.add_argument("--terrain-input", action="store_true",
                     help="the encoder also reads each subdomain's ground height map (--latent encoder)")
+    return ap
+
+
+def main() -> int:
+    ap = _argument_parser()
     args = ap.parse_args()
 
     if min(args.epochs, args.batch_cases, args.log_every, args.checkpoint_every) < 1:
@@ -238,6 +243,7 @@ def main() -> int:
         read = lambda p: read_conditional_case(p, read_latent, args.initial_from_targets)
         first = read(all_paths[0])
         z_dim = first.z.shape[0]
+        torch.manual_seed(args.seed)
         encoder = None
         if args.latent == "encoder":
             with np.load(all_paths[0]) as blob:
@@ -255,10 +261,7 @@ def main() -> int:
         paths = all_paths[rank::world]
         batch_cases = min(args.batch_cases, len(all_paths) // world)
 
-        torch.manual_seed(args.seed)
         model_config = ConditionalModelConfig(
-            hidden_layers=args.hidden_layers, hidden_width=args.hidden_width,
-            activation=args.activation, initializer=args.initializer,
             tke_offset=scaling.e_sgs.offset, tke_scale=scaling.e_sgs.scale,
             rho_d_offset=scaling.rho_d.offset, rho_d_scale=scaling.rho_d.scale,
             )
@@ -274,8 +277,7 @@ def main() -> int:
             log_every=args.log_every,
             learning_rate=args.lr, learning_rate_min=args.lr_min,
             weight_flow_boundary=args.boundary_weight, weight_pde=args.pde_weight,
-            weight_surface=args.surface_weight, seed=args.seed, stop_epoch=args.stop_epoch,
-            loss_weights=args.loss_weights, optimizer=args.optimizer,
+            seed=args.seed, loss_weights=args.loss_weights, surface_term=args.surface_term,
             source_scaling=source_scaling, scaling=scaling,
             terrain_xy_scale=args.grid_spacing,
             terrain_top_height=args.terrain_top_height, fe_surface_reference_z=args.fe_surface_reference_z,
@@ -288,6 +290,10 @@ def main() -> int:
             latent=read_latent, predict_change=args.predict_change,
             initial_from_targets=args.initial_from_targets,
         )
+
+        log.info("baseline=efcf5c32; network=4x128 tanh; initializer=PyTorch default; "
+                 "optimizer=Adam; loss weights=%s; surface terms=%s; seed=%d",
+                 cfg.loss_weights, ",".join(cfg.surface_terms) or "none", cfg.seed)
 
         log.info(
             "geometry: FE terrain-following; H=%.6f m;  first reference z=%.9f m; "

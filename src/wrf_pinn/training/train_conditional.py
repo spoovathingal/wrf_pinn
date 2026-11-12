@@ -56,9 +56,7 @@ class ConditionalHistory:
 @dataclass(frozen=True)
 class ConditionalTrainConfig:
     epochs: int = 2000
-    stop_epoch: int | None = None   # end early here; the lr schedule still spans epochs
     loss_weights: str = "fixed"     # key of loss_weights.METHODS
-    optimizer: str = "adam"         # adam, adamw or soap
     batch_cases: int = 4          # cases drawn per step (per process when distributed)
     #: cases per forward/backward pass; gradients accumulate over the step's
     #: passes, so the math matches one pass over batch_cases. 0 = whole batch.
@@ -72,6 +70,8 @@ class ConditionalTrainConfig:
     weight_flow_boundary: float = 1.0
     weight_pde: float = 1.0
     weight_surface: float = 1.0
+    #: All four surface residuals, none, or exactly one name from SURFACE_RAW_NAMES.
+    surface_term: str = "all"
     n_collocation: int = 2048     # PDE collocation points per case per step
     n_wall: int = 512             # surface/wall points per case per step
     grad_clip_norm: float = 1.0   # clip grads (PINN PDE gradients can spike)
@@ -143,7 +143,19 @@ class ConditionalTrainConfig:
     #: the model's output transform (predict_change builds the initial field before it);
     #: train_conditional fills it from model.config.
     model_config: "ConditionalModelConfig | None" = None
+    @property
+    def surface_terms(self) -> tuple[str, ...]:
+        if self.surface_term == "all":
+            return SURFACE_RAW_NAMES
+        return () if self.surface_term == "none" else (self.surface_term,)
+
     def __post_init__(self) -> None:
+        if self.surface_term not in ("all", "none", *SURFACE_RAW_NAMES):
+            raise ValueError(f"Unknown surface_term: {self.surface_term}.")
+        if self.loss_weights not in METHODS:
+            raise ValueError(f"Unknown loss_weights: {self.loss_weights}.")
+        if self.loss_weights == "grad-balance" and self.weight_data <= 0.0:
+            raise ValueError("grad-balance requires a positive data weight.")
         if (not math.isfinite(self.terrain_top_height) or self.terrain_top_height <= 0.0):
             raise ValueError("terrain_top_height must be finite and positive.")
 
@@ -591,6 +603,8 @@ def _surface_loss(model, b: CaseBatch, cfg, scaling, fns: StepFunctions,
 
     Wall coords come from the surface rows (x,y,t normalized; z at the floor);
     fluxes are un-normalized to physical for the no-penetration-z residual."""
+    if not cfg.surface_terms:
+        return b.surface.new_zeros(())
     surf = b.surface
     dev, dt = surf.device, surf.dtype
     h = b.surface_geometry[:, 0:1]
@@ -654,11 +668,11 @@ def _surface_loss(model, b: CaseBatch, cfg, scaling, fns: StepFunctions,
         raw_mse.update({
             name: _per_case_mean(
                 r.detach().square().reshape(-1), b.surface_sizes, b.k,
-            ).mean() for name, r in raw_fields.items()
+            ).mean() for name, r in raw_fields.items() if name in cfg.surface_terms
         })
 
     per_eq = torch.stack([_per_case_mean(r.square().reshape(-1), b.surface_sizes, b.k)
-                          for r in res.values()])                    # (n_eq, k)
+                          for name, r in res.items() if name in cfg.surface_terms])  # (n_eq, k)
     return per_eq.mean(dim=0).mean()
 
 
@@ -838,7 +852,7 @@ def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
     else:
         pde = zero
 
-    if cfg.weight_surface != 0.0:
+    if cfg.weight_surface != 0.0 and cfg.surface_terms:
         with record_function("loss/surface"):
             surface = _surface_loss(model, b, cfg, scaling, fns, raw_mse=raw_mse)
     else:
@@ -1008,19 +1022,17 @@ def train_conditional(
 
     weights = {"data": config.weight_data, "initial": config.weight_initial,
                "flow_boundary": config.weight_flow_boundary,
-               "pde": config.weight_pde, "surface": config.weight_surface}
+               "pde": config.weight_pde,
+               "surface": config.weight_surface if config.surface_terms else 0.0}
     balancer = METHODS[config.loss_weights](weights)
     params = list(model.parameters())
-    if isinstance(balancer, torch.nn.Module):
-        balancer.to(device)
-        params += list(balancer.parameters())
-    optimizer = _optimizer(config.optimizer, params, config.learning_rate)
+    optimizer = torch.optim.Adam(params, lr=config.learning_rate)
     fns = step_functions(model, compile=config.compile)
     rng = torch.Generator().manual_seed(config.seed + rank)
     history = ConditionalHistory()
 
     raw_names = (  ( PDE_RAW_NAMES if config.weight_pde != 0.0 else () )
-        + ( SURFACE_RAW_NAMES if config.weight_surface != 0.0 else () ) )
+        + ( config.surface_terms if config.weight_surface != 0.0 else () ) )
     start_epoch = _maybe_resume(model, optimizer, history, config, device, balancer)
     k = min(config.batch_cases, n_cases)
     draw = lambda: torch.randperm(n_cases, generator=rng)[:k].tolist()
@@ -1031,8 +1043,7 @@ def train_conditional(
 
     # Prefetch: the next step's batch is stacked + pinned while the GPU works, on a
     # thread, or in DataLoader worker processes (same draws, same order).
-    last = min(config.stop_epoch or config.epochs, config.epochs)
-    n_steps = last - start_epoch + 1
+    n_steps = config.epochs - start_epoch + 1
     if case_paths is not None and config.loader_workers > 0:
         loader = torch.utils.data.DataLoader(
             _CaseFiles(case_paths, config.latent, config.initial_from_targets), batch_sampler=_StepDraws(n_cases, k, config.seed + rank, n_steps),
@@ -1046,11 +1057,11 @@ def train_conditional(
         pending = pool.submit(host_batch, draw())
         next_batch = lambda: pending.result()
 
-    for epoch in range(start_epoch, last + 1):
+    for epoch in range(start_epoch, config.epochs + 1):
         t_wait = time.perf_counter()
         passes = [b.to(device) for b in next_batch()]
         wait_window += time.perf_counter() - t_wait
-        if pool is not None and epoch < last:
+        if pool is not None and epoch < config.epochs:
             pending = pool.submit(host_batch, draw())
 
         if prof is not None and cuda:
@@ -1061,7 +1072,7 @@ def train_conditional(
             group["lr"] = lr
         optimizer.zero_grad()
         log_residuals = (epoch == 1
-            or epoch == last
+            or epoch == config.epochs
             or epoch % config.log_every == 0
         )
         watch["on"] = rank == 0 and log_residuals
@@ -1079,7 +1090,7 @@ def train_conditional(
         unit_coll = (torch.rand((k, config.n_collocation, passes[0].box_lo.shape[1]),
                                 device=device) if config.weight_pde != 0.0 else None)
         first = 0
-        rebalance = isinstance(balancer, GradBalance) and (epoch == start_epoch or epoch % balancer.every == 0)
+        rebalance = isinstance(balancer, GradBalance) and (epoch == 1 or epoch % balancer.every == 0)
         for b in passes:
             share = b.k / k
             u = unit_coll[first:first + b.k] if unit_coll is not None else None
@@ -1087,7 +1098,12 @@ def train_conditional(
             batch_raw = {} if raw_sums is not None else None
             batch = _batch_losses(model, b, config, u, fns, raw_mse=batch_raw)
             if rebalance:  # one pass's gradients are enough to set the weights
-                balancer.rebalance(batch, params)
+                if rank == 0:
+                    balancer.rebalance(batch, params)
+                if world > 1:  # use the same W1 objective on every GPU
+                    values = batch["data"].new_tensor(list(balancer.weights.values()))
+                    dist.broadcast(values, src=0)
+                    balancer.weights = dict(zip(balancer.weights, values.tolist()))
                 rebalance = False
             total = balancer.total(batch)
             with record_function("step/backward"):
@@ -1154,7 +1170,7 @@ def train_conditional(
                 })
             now = time.perf_counter()
             s_step = (now - t_window) / steps_window
-            eta_h = s_step * (last - epoch) / 3600
+            eta_h = s_step * (config.epochs - epoch) / 3600
             mem = f" gpu_mem={torch.cuda.max_memory_allocated(device) / 1e9:.1f}GB" if cuda else ""
             parts = " ".join(f"{n}={v:.4e}" for n, v in zip(weights, losses[1:]))
             # stderr + flush so progress is live in the SLURM log, never buffered
@@ -1189,7 +1205,7 @@ def train_conditional(
             t_window, wait_window, steps_window = now, 0.0, 0
 
         if rank == 0 and config.checkpoint_path and (epoch % config.checkpoint_every == 0
-                                                     or epoch == last):
+                                                     or epoch == config.epochs):
             _save_checkpoint(model, optimizer, history, epoch, config, manifest, balancer)
 
     if pool is not None:
@@ -1197,15 +1213,6 @@ def train_conditional(
     if readers is not None:
         readers.shutdown()
     return history
-
-
-def _optimizer(name: str, params: list, lr: float) -> torch.optim.Optimizer:
-    if name == "adamw":
-        return torch.optim.AdamW(params, lr=lr)
-    if name == "soap":
-        from pytorch_optimizer import SOAP  # optional dependency, needed only here
-        return SOAP(params, lr=lr)
-    return torch.optim.Adam(params, lr=lr)
 
 
 def _learning_rate(epoch: int, config: ConditionalTrainConfig) -> float:
@@ -1256,7 +1263,20 @@ def _maybe_resume(model, optimizer, history, config, device, balancer=None) -> i
         raise ValueError("Checkpoint geometry, normalization, or physics differ; "
             "use a new checkpoint path.")
 
+    if (saved.get("surface_term", "all") != config.surface_term
+        or saved.get("loss_weights", "fixed") != config.loss_weights
+        or any(saved.get(f"weight_{name}", 1.0) != current[f"weight_{name}"]
+               for name in LOSS_NAMES)):
+        raise ValueError("Checkpoint surface selection or loss weights differ; "
+                         "use a new checkpoint path for each ablation.")
+    if saved.get("optimizer", "adam") != "adam":
+        raise ValueError("Checkpoint optimizer is not baseline Adam; use a new checkpoint path.")
+
     saved_model = (manifest.get("model") or {}).get("config")
+    if saved_model is not None:
+        saved_model = dict(saved_model)
+        if saved_model.get("initializer") == "default":
+            saved_model.pop("initializer")
     if saved_model != asdict(model.config):
         raise ValueError(
             "Checkpoint model configuration differs; use a new checkpoint path.")

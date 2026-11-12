@@ -156,11 +156,9 @@ _DATA_ONLY = dict(weight_pde=0.0, weight_surface=0.0,
     source_scaling=ResidualScalingConfig(), scaling=ResidualScalingConfig())
 
 
-@pytest.mark.parametrize("activation", ["tanh", "sin", "adaptive-tanh", "silu", "gelu"])
-def test_pipeline_runs(activation):
+def test_pipeline_runs():
     cases = [_make_case(f"c{i}", i) for i in range(10)]
-    model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=32,
-                                                                activation=activation))
+    model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=32))
     cfg = ConditionalTrainConfig(epochs=50, batch_cases=4, device="cpu", log_every=50, **_DATA_ONLY)
     hist = train_conditional(model, cases, cfg)
     assert len(hist.total) == 50
@@ -242,47 +240,6 @@ def test_checkpoint_save_and_resume(tmp_path):
     assert any(not torch.equal(b, a) for b, a in zip(before, after)), "weights not restored on resume"
 
 
-def test_stop_epoch_then_resume(tmp_path):
-    cases = [_make_case(f"c{i}", i) for i in range(6)]
-    ckpt = tmp_path / "run.pt"
-    cfg = ConditionalTrainConfig(epochs=20, stop_epoch=8, batch_cases=3, device="cpu", log_every=20,
-                                 checkpoint_path=str(ckpt), checkpoint_every=100, **_DATA_ONLY)
-    model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=16))
-    assert len(train_conditional(model, cases, cfg).total) == 8
-    assert torch.load(str(ckpt), map_location="cpu")["epoch"] == 8
-
-    model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=16))
-    assert len(train_conditional(model, cases, replace(cfg, stop_epoch=None)).total) == 20
-
-
-@pytest.mark.parametrize("method", ["grad-balance", "relobralo", "softadapt", "uncertainty"])
-def test_loss_weight_methods_train_and_resume(tmp_path, method):
-    cases = [_make_case(f"c{i}", i) for i in range(6)]
-    cfg = ConditionalTrainConfig(epochs=6, stop_epoch=3, batch_cases=3, device="cpu", log_every=1,
-                                 loss_weights=method, checkpoint_path=str(tmp_path / "run.pt"),
-                                 events_path=str(tmp_path / "events.jsonl"), **_DATA_ONLY)
-    model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=16))
-    train_conditional(model, cases, cfg)
-    saved = torch.load(str(tmp_path / "run.pt"), map_location="cpu")["loss_weights"]["weights"]
-
-    model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=16))
-    assert len(train_conditional(model, cases, replace(cfg, stop_epoch=None)).total) == 6
-    import json
-    steps = [json.loads(l) for l in (tmp_path / "events.jsonl").read_text().splitlines()]
-    steps = [e for e in steps if e["event"] == "step"]
-    assert steps[3]["epoch"] == 4 and set(steps[3]["loss_weights"]) == set(saved)
-
-
-@pytest.mark.parametrize("optimizer", ["adamw", "soap"])
-def test_optimizers_train(optimizer):
-    cases = [_make_case(f"c{i}", i) for i in range(6)]
-    model = ConditionalModel(LATENT_DIM, ConditionalModelConfig(hidden_layers=2, hidden_width=16))
-    cfg = ConditionalTrainConfig(epochs=30, batch_cases=3, device="cpu", log_every=30,
-                                 optimizer=optimizer, **_DATA_ONLY)
-    hist = train_conditional(model, cases, cfg)
-    assert hist.total[-1] < hist.total[0]
-
-
 def test_latent_conditions_output():
     """Changing z must change the prediction at fixed coordinates."""
     case = _make_case("c", 0).as_torch()
@@ -308,8 +265,10 @@ def test_collocation_points_independent_of_cases_per_pass(monkeypatch):
     def collocation(cases_per_pass: int) -> torch.Tensor:
         seen = []
 
-        def fake_pde(model, coll, z_rows, cfg, scaling, fns=None, *, terrain_batch):  # random data NaNs the real PDE
+        def fake_pde(model, coll, z_rows, cfg, scaling, fns=None, *, terrain_batch, raw_mse=None):
             seen.append(coll.detach().clone())
+            if raw_mse is not None:
+                raw_mse.update({name: coll.new_zeros(()) for name in tc.PDE_RAW_NAMES})
             return (model(coll, z_rows, cfg.n_collocation) * 0.0).sum()  # z per case
 
         monkeypatch.setattr(tc, "_pde_loss", fake_pde)
@@ -481,7 +440,7 @@ def test_terrain_collocation_matches_observations(monkeypatch):
     )
     seen = {}
 
-    def capture_pde(model, coll, z_rows, config, scaling, fns, *, terrain_batch):
+    def capture_pde(model, coll, z_rows, config, scaling, fns, *, terrain_batch, raw_mse=None):
         seen["coordinates"] = coll.detach().clone()
         return coll.new_zeros(())
 
@@ -510,7 +469,7 @@ def test_terrain_surface_reference_height(monkeypatch):
     def capture_surface(**kwargs):
         seen["wall"] = kwargs["coordinates"].detach().clone()
         seen["reference"] = kwargs["reference_coordinates"].detach().clone()
-        return {"test": kwargs["state"][:, :1] * 0.0}
+        return {name: kwargs["state"][:, :1] * 0.0 for name in tc.SURFACE_RAW_NAMES}
 
     monkeypatch.setattr(
         tc, "no_penetration_z_wall_residuals", capture_surface
