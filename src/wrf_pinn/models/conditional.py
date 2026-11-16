@@ -45,6 +45,11 @@ class ConditionalModelConfig:
     hidden_layers: int = 4
     activation: str = "tanh"
     initializer: str = "default"    # default (PyTorch) or xavier (uniform weights, zero bias)
+    #: Fourier features on the coordinates: 0 = off; else this many random frequencies,
+    #: the net then sees [c, cos(2 pi B c), sin(2 pi B c)] with B[:, j] ~ N(0, fourier_sigma[j]^2)
+    #: in model-coordinate units (one unit = the coordinate's normalization span).
+    fourier_features: int = 0
+    fourier_sigma: tuple[float, ...] = (1.0, 1.0, 1.0, 1.0)
 
     # Dataset normalization: e_physical = tke_offset + tke_scale * e_normalized.
     tke_offset: float = 0.0
@@ -240,7 +245,14 @@ class ConditionalModel(nn.Module):
         self.encoder = encoder
         width = encoder.out_dim if encoder is not None else latent_dim
         self.latent_norm = nn.LayerNorm(width) if encoder is not None else None
-        self.net = self._build(config.coord_dim + width, config)
+        m = config.fourier_features
+        if m:
+            if len(config.fourier_sigma) != config.coord_dim:
+                raise ValueError(f"fourier_sigma needs {config.coord_dim} values.")
+            sigma = torch.tensor(config.fourier_sigma, dtype=torch.float32)
+            self.register_buffer("fourier_b", torch.randn(m, config.coord_dim) * sigma)
+        self.coord_features = config.coord_dim + 2 * m
+        self.net = self._build(self.coord_features + width, config)
 
     def encode(self, z: torch.Tensor) -> torch.Tensor:
         """The case latent the net sees: LayerNorm(encoder(z)), or z itself."""
@@ -290,6 +302,9 @@ class ConditionalModel(nn.Module):
         count for every case). The per-case forms multiply z through the first layer
         once per case instead of once per point: same math, without building an
         (n_points, latent_dim) copy of z. ``raw``: skip the output transform."""
+        if self.config.fourier_features:
+            phase = 2.0 * math.pi * coordinates @ self.fourier_b.T
+            coordinates = torch.cat([coordinates, torch.cos(phase), torch.sin(phase)], dim=1)
         if z.shape[1] == 0:
             raw_state = self.net(coordinates)
         elif sizes is None and z.shape[0] == coordinates.shape[0]:

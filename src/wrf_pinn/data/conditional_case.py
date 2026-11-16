@@ -11,6 +11,8 @@ from pathlib import Path
 import torch
 import numpy as np
 
+from wrf_pinn.data.seven_var import COMPLETED_MEMBERS, complete_seven_var
+
 #: Variables carried in the conditioning fields and predicted by the model.
 STATE_VARS: tuple[str, ...] = ("u", "v", "w", "theta", "p_prime", "q_v", "e_sgs", "rho_d")
 #: Interior sample coordinate columns.
@@ -108,13 +110,19 @@ def read_conditional_case(npz_path: str | Path, latent: str = "pod",
         raise FileNotFoundError(f"Conditional case not found: {path}.")
 
     with np.load(path) as blob:
-        missing = [k for k in _CASE_MEMBERS if k not in blob.files]
+        seven = ("targets" in blob.files and blob["targets"].shape[-1] == len(STATE_VARS) - 1)
+        needed = [k for k in _CASE_MEMBERS if not (seven and k in COMPLETED_MEMBERS)]
+        missing = [k for k in needed if k not in blob.files]
         if missing:
             raise ValueError(f"Case {path} missing members: {missing}.")
-        members = {k: blob[k].astype(np.float32) for k in _CASE_MEMBERS}
+        members = {k: blob[k].astype(np.float32) for k in needed}
         members["interior"] = (blob["interior"].astype(np.float32) if "interior" in blob.files
                                else interior_from_grid(members["initial_coords"],
                                                        members["boundary_coords"]))
+        if seven:   # no rho_d: rebuilt from the equation of state (see seven_var)
+            if not initial_from_targets:
+                raise ValueError(f"Case {path} has 7 variables; read it with initial_from_targets.")
+            members.update(complete_seven_var(path, members, blob))
         targets = members["targets"]
 
         if targets.ndim != 2 or targets.shape[1] != len(STATE_VARS):

@@ -73,6 +73,10 @@ class ConditionalTrainConfig:
     weight_pde: float = 1.0
     weight_surface: float = 1.0
     n_collocation: int = 2048     # PDE collocation points per case per step
+    #: where PDE points go in each case's box: 'uniform' (new draws each step),
+    #: 'squared-height' (same, height draw squared: more points near the ground) or
+    #: 'fixed-grid' (n_collocation simulation grid nodes, drawn once, reused every step)
+    collocation: str = "uniform"
     n_wall: int = 512             # surface/wall points per case per step
     grad_clip_norm: float = 1.0   # clip grads (PINN PDE gradients can spike)
     #: affine scaling (physical = offset + scale*normalized) for the residuals,
@@ -579,10 +583,42 @@ def step_functions(model: nn.Module, compile: bool = False) -> StepFunctions:
     return StepFunctions(*(torch.compile(f) for f in (fns.forward, fns.taylor, fns.pde_residuals)))
 
 
+def grid_unit_points(case: ConditionalCase, n: int, seed: int) -> torch.Tensor:
+    """n distinct grid nodes of a case's interior (x, y nodes, model levels, snapshot
+    times) as [0, 1] positions in its PDE box: the box spans the interior's extremes, so
+    the same positions are grid nodes in every case of a uniform grid. (n, 4)."""
+    interior = torch.as_tensor(case.interior, dtype=torch.float64)
+    axes = [torch.unique(interior[:, j]) for j in range(interior.shape[1])]
+    unit = [(a - a[0]) / (a[-1] - a[0]) for a in axes]
+    sizes = [len(a) for a in unit]
+    total = math.prod(sizes)
+    if n > total:
+        raise ValueError(f"{n} fixed points but the grid has only {total} nodes.")
+    flat = torch.randperm(total, generator=torch.Generator().manual_seed(seed))[:n]
+    idx = []
+    for size in reversed(sizes):
+        idx.append(flat % size)
+        flat = flat // size
+    idx = idx[::-1]
+    return torch.stack([u[i] for u, i in zip(unit, idx)], 1).float()
+
+
+def _unit_collocation(k: int, config, n_coord: int, fixed_grid, device) -> torch.Tensor:
+    """(k, n_collocation, n_coord) [0, 1) positions of the step's PDE points."""
+    if fixed_grid is not None:
+        return fixed_grid.expand(k, -1, -1)
+    u = torch.rand((k, config.n_collocation, n_coord), device=device)
+    if config.collocation == "squared-height":
+        u[..., 2] = u[..., 2].square()
+    return u
+
+
 def _taylor_supported(model: nn.Module) -> bool:
     """A tanh ConditionalModel: its coordinate derivatives can be carried forward
     (``physics.taylor``) instead of taken with nested autograd."""
-    return getattr(getattr(model, "config", None), "activation", None) == "tanh"
+    config = getattr(model, "config", None)
+    return (getattr(config, "activation", None) == "tanh"
+            and not getattr(config, "fourier_features", 0))   # Taylor feeds model.net, skipping the features
 
 
 def _surface_loss(model, b: CaseBatch, cfg, scaling, fns: StepFunctions,
@@ -1024,6 +1060,16 @@ def train_conditional(
     start_epoch = _maybe_resume(model, optimizer, history, config, device, balancer)
     k = min(config.batch_cases, n_cases)
     draw = lambda: torch.randperm(n_cases, generator=rng)[:k].tolist()
+    fixed_grid = None
+    if config.collocation == "fixed-grid":
+        first = (read_conditional_case(case_paths[0], config.latent, config.initial_from_targets)
+                 if case_paths is not None else cases[0])
+        fixed_grid = grid_unit_points(first, config.n_collocation, config.seed).to(device)
+        if rank == 0:
+            print(f"PDE points: {config.n_collocation} fixed grid nodes (seed {config.seed}), "
+                  "the same every step and case", file=sys.stderr, flush=True)
+    elif config.collocation not in ("uniform", "squared-height"):
+        raise ValueError(f"Unknown collocation: {config.collocation}.")
 
     prof = {"fwd": 0.0, "bwd": 0.0, "step": 0.0} if config.profile else None
     t_start = t_window = time.perf_counter()
@@ -1076,8 +1122,8 @@ def train_conditional(
         losses = torch.zeros(1 + len(weights), device=device)
         # One collocation draw per step, sliced per pass, so the PDE points do not
         # depend on cases_per_pass.
-        unit_coll = (torch.rand((k, config.n_collocation, passes[0].box_lo.shape[1]),
-                                device=device) if config.weight_pde != 0.0 else None)
+        unit_coll = (_unit_collocation(k, config, passes[0].box_lo.shape[1], fixed_grid, device)
+                     if config.weight_pde != 0.0 else None)
         first = 0
         rebalance = isinstance(balancer, GradBalance) and (epoch == start_epoch or epoch % balancer.every == 0)
         for b in passes:

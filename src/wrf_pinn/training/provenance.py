@@ -36,7 +36,7 @@ def run_manifest(model, config, *, case_paths=None, cases=None):
     manifest = {
         "schema_version": 1,
         "model": {"type": "conditional", "config": asdict(model.config),
-                  "latent_dim": model.net[0].in_features - model.config.coord_dim},
+                  "latent_dim": model.net[0].in_features - model.coord_features},
         "state_vars": list(STATE_VARS), "coord_names": list(COORD_NAMES),
         "training": asdict(config),
         "data": {"datasets": datasets,

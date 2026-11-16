@@ -164,6 +164,14 @@ def main() -> int:
     ap.add_argument("--hidden-width", type=int, default=128)
     ap.add_argument("--activation", choices=("tanh", "silu", "gelu", "relu", "sin", "adaptive-tanh"), default="tanh")
     ap.add_argument("--initializer", choices=("default", "xavier"), default="default")
+    ap.add_argument("--collocation", choices=("uniform", "squared-height", "fixed-grid"),
+                    default="uniform", help="PDE point placement (ConditionalTrainConfig.collocation)")
+    ap.add_argument("--n-collocation", type=int, default=2048, help="PDE points per case per step")
+    ap.add_argument("--fourier-features", type=int, default=0,
+                    help="random Fourier features on the coordinates (0 = off)")
+    ap.add_argument("--fourier-sigma", type=float, nargs=4, default=(1.0, 1.0, 1.0, 1.0),
+                    metavar=("X", "Y", "Z", "T"),
+                    help="frequency spread per coordinate, cycles per model-coordinate unit")
     ap.add_argument("--surface-weight", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--score-out", type=Path, default=None,
@@ -259,6 +267,7 @@ def main() -> int:
         model_config = ConditionalModelConfig(
             hidden_layers=args.hidden_layers, hidden_width=args.hidden_width,
             activation=args.activation, initializer=args.initializer,
+            fourier_features=args.fourier_features, fourier_sigma=tuple(args.fourier_sigma),
             tke_offset=scaling.e_sgs.offset, tke_scale=scaling.e_sgs.scale,
             rho_d_offset=scaling.rho_d.offset, rho_d_scale=scaling.rho_d.scale,
             )
@@ -287,6 +296,7 @@ def main() -> int:
             checkpoint_path=args.checkpoint, checkpoint_every=args.checkpoint_every,
             latent=read_latent, predict_change=args.predict_change,
             initial_from_targets=args.initial_from_targets,
+            collocation=args.collocation, n_collocation=args.n_collocation,
         )
 
         log.info(
