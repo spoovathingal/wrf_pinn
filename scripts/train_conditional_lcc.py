@@ -167,8 +167,11 @@ def _argument_parser() -> argparse.ArgumentParser:
     ap.add_argument("--loss-weights", choices=("fixed", "grad-balance"), default="fixed",
                     help="fixed baseline weights or W1 gradient-balance weights")
     surface = ap.add_mutually_exclusive_group()
-    surface.add_argument("--surface-term", choices=("all", "none", *SURFACE_RAW_NAMES),
+    surface.add_argument("--surface-term", choices=("all", "all-except-heat-flux", "none", *SURFACE_RAW_NAMES),
                          default="all", help="surface loss terms to train on (default: all four)")
+    surface.add_argument("--no-heat-flux", dest="surface_term", action="store_const",
+                         const="all-except-heat-flux",
+                         help="enable no penetration and both surface stresses, excluding the heat-flux loss")
     for name in ("none", *SURFACE_RAW_NAMES):
         surface.add_argument(f"--{name}", dest="surface_term", action="store_const", const=name,
                              help=("disable every surface loss term" if name == "none"

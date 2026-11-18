@@ -70,7 +70,7 @@ class ConditionalTrainConfig:
     weight_flow_boundary: float = 1.0
     weight_pde: float = 1.0
     weight_surface: float = 1.0
-    #: All four surface residuals, none, or exactly one name from SURFACE_RAW_NAMES.
+    #: All, all-except-heat-flux, none, or one name from SURFACE_RAW_NAMES.
     surface_term: str = "all"
     n_collocation: int = 2048     # PDE collocation points per case per step
     n_wall: int = 512             # surface/wall points per case per step
@@ -147,10 +147,12 @@ class ConditionalTrainConfig:
     def surface_terms(self) -> tuple[str, ...]:
         if self.surface_term == "all":
             return SURFACE_RAW_NAMES
+        if self.surface_term == "all-except-heat-flux":
+            return tuple(name for name in SURFACE_RAW_NAMES if name != "surface_heat_flux")
         return () if self.surface_term == "none" else (self.surface_term,)
 
     def __post_init__(self) -> None:
-        if self.surface_term not in ("all", "none", *SURFACE_RAW_NAMES):
+        if self.surface_term not in ("all", "all-except-heat-flux", "none", *SURFACE_RAW_NAMES):
             raise ValueError(f"Unknown surface_term: {self.surface_term}.")
         if self.loss_weights not in METHODS:
             raise ValueError(f"Unknown loss_weights: {self.loss_weights}.")

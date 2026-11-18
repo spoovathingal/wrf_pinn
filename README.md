@@ -1,5 +1,27 @@
 # WRF PINN
 
+## Conditional training without the surface heat-flux loss
+
+For `scripts/train_conditional_lcc.py`, use
+`--surface-term all-except-heat-flux` (or the shorthand `--no-heat-flux`).
+This enables `no_penetration_w`, `surface_stress_xz`, and `surface_stress_yz`,
+and excludes `surface_heat_flux` from the surface loss. The surface loss is
+the mean of the three active scaled residual MSEs. Other loss groups are
+unchanged; W1 is still enabled with `--loss-weights grad-balance`.
+
+In a submit script that passes `--surface-term "$SURFACE_TERM"`, set:
+
+```bash
+SURFACE_TERM=all-except-heat-flux
+```
+
+Use a separate checkpoint path for this experiment: resuming a checkpoint with
+a different surface selection is rejected. The selection is saved in the
+checkpoint manifest, and the disabled heat-flux residual is logged as N/A
+(`null` in JSONL). Measured `htFlux` inputs remain required and are still used
+in the surface-layer stability calculations; this switch excludes only their
+heat-flux loss term.
+
 `wrf-pinn` is a PyTorch physics-informed neural network for reconstructing a
 four-dimensional atmospheric flow field from:
 

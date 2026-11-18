@@ -6,6 +6,6 @@ __pycache__/
 build/
 dist/
 *.egg-info/
-
+Tmp/
 src/wrf_pinn/config/GenesisPINN.code-workspace
 .DS_Store
