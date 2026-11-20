@@ -160,6 +160,9 @@ def main() -> int:
     ap.add_argument("--initial-from-targets", action="store_true",
                     help="start each window at its first lead, all raw: no POD enters z or any loss "
                          "(POD-only cases such as cstldense128_5; window loses one snapshot)")
+    ap.add_argument("--time-mean", action="store_true",
+                    help="train on each window's time mean: every snapshot replaced by the mean over the "
+                         "window before the initial field, walls and targets are taken (needs --initial-from-targets)")
     ap.add_argument("--hidden-layers", type=int, default=4)
     ap.add_argument("--hidden-width", type=int, default=128)
     ap.add_argument("--activation", choices=("tanh", "silu", "gelu", "relu", "sin", "adaptive-tanh"), default="tanh")
@@ -243,7 +246,7 @@ def main() -> int:
         if args.terrain_input and args.latent != "encoder":
             raise ValueError("--terrain-input needs --latent encoder")
         read_latent = "pod" if args.latent == "pod" else "raw_terrain" if args.terrain_input else "raw"
-        read = lambda p: read_conditional_case(p, read_latent, args.initial_from_targets)
+        read = lambda p: read_conditional_case(p, read_latent, args.initial_from_targets, args.time_mean)
         first = read(all_paths[0])
         z_dim = first.z.shape[0]
         encoder = None
@@ -296,6 +299,7 @@ def main() -> int:
             checkpoint_path=args.checkpoint, checkpoint_every=args.checkpoint_every,
             latent=read_latent, predict_change=args.predict_change,
             initial_from_targets=args.initial_from_targets,
+            time_mean=args.time_mean,
             collocation=args.collocation, n_collocation=args.n_collocation,
         )
 

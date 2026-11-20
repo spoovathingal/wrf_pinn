@@ -99,13 +99,17 @@ def interior_from_grid(initial_coords: np.ndarray, boundary_coords: np.ndarray) 
 
 
 def read_conditional_case(npz_path: str | Path, latent: str = "pod",
-                          initial_from_targets: bool = False) -> ConditionalCase:
+                          initial_from_targets: bool = False, time_mean: bool = False) -> ConditionalCase:
     """Load one .npz case; decode initial/boundary, mask NaN targets. A case written
     without POD (the carver's --no-pod) takes them from its raw fields instead.
     latent picks z: 'pod' (POD coeffs) or 'raw' (the full raw fields, see latent_vector).
     initial_from_targets: ignore any POD and start the window at its first lead
-    snapshot, taken raw from ``targets`` (see first_lead_as_initial)."""
+    snapshot, taken raw from ``targets`` (see first_lead_as_initial).
+    time_mean: replace every snapshot by the window's time mean first (needs initial_from_targets),
+    so the initial field, walls, latent and targets are all the 15-minute mean (see window_mean)."""
     path = Path(npz_path)
+    if time_mean and not initial_from_targets:
+        raise ValueError("time_mean needs initial_from_targets.")
     if not path.exists():
         raise FileNotFoundError(f"Conditional case not found: {path}.")
 
@@ -184,6 +188,8 @@ def read_conditional_case(npz_path: str | Path, latent: str = "pod",
         if initial_from_targets:
             if latent == "pod":
                 raise ValueError("initial_from_targets uses no POD; use a raw or encoder latent.")
+            if time_mean:
+                members["targets"] = window_mean(members["targets"], len(members["times"]))
             members.update(first_lead_as_initial(members, path))
             members["z"] = latent_vector(
                 {"bnd_raw": members.pop("bnd_raw"), "ini_raw": members["initial_raw"],
@@ -251,6 +257,17 @@ def decode_initial(blob) -> dict:
         coeffs = blob[f"ini_coeffs_{var}"]           # (nz, k)
         out[var] = mean + coeffs @ modes.T           # (nz, nx*ny)
     return out
+
+
+def window_mean(targets: np.ndarray, nt: int) -> np.ndarray:
+    """Targets (lead-major, nt - 1 leads) with every lead replaced by the mean over the leads at
+    that point and variable; NaNs are skipped, a point NaN at every lead stays NaN."""
+    lead = targets.reshape(nt - 1, -1, targets.shape[1])
+    ok = np.isfinite(lead)
+    n = ok.sum(0)
+    mean = np.where(ok, lead, 0.0).sum(0) / np.maximum(n, 1)
+    mean = np.where(n > 0, mean, np.nan).astype(np.float32)
+    return np.broadcast_to(mean, lead.shape).reshape(targets.shape).copy()
 
 
 def first_lead_as_initial(members: dict, path: Path) -> dict:
