@@ -33,8 +33,8 @@ from wrf_pinn.models.conditional import (
 from wrf_pinn.training.provenance import run_manifest, write_event
 from wrf_pinn.training.losses import PDEResidualScales
 from wrf_pinn.physics.grid_geometry import sgs_filter_width, terrain_height_jet
-#: the five losses of the conditional PINN, in order.
-LOSS_NAMES: tuple[str, ...] = ("data", "initial", "flow_boundary", "pde", "surface")
+#: the losses of the conditional PINN, in order (data_gradient only when its weight is set).
+LOSS_NAMES: tuple[str, ...] = ("data", "initial", "flow_boundary", "pde", "surface", "data_gradient")
 PDE_RAW_NAMES = ("mass", "x_momentum", "y_momentum", "z_momentum",
     "potential_temperature", "water_vapor")
 SURFACE_RAW_NAMES = ("surface_stress_xz", "surface_stress_yz",
@@ -51,6 +51,7 @@ class ConditionalHistory:
     flow_boundary: list[float] = field(default_factory=list)
     pde: list[float] = field(default_factory=list)
     surface: list[float] = field(default_factory=list)
+    data_gradient: list[float] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -72,6 +73,8 @@ class ConditionalTrainConfig:
     weight_flow_boundary: float = 1.0
     weight_pde: float = 1.0
     weight_surface: float = 1.0
+    #: grid differences of the prediction against the simulation's (_data_gradient_loss); 0 = off.
+    weight_data_gradient: float = 0.0
     n_collocation: int = 2048     # PDE collocation points per case per step
     #: where PDE points go in each case's box: 'uniform' (new draws each step),
     #: 'squared-height' (same, height draw squared: more points near the ground) or
@@ -855,6 +858,12 @@ def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
     scaling = cfg.scaling if cfg.scaling is not None else DEFAULT_RESIDUAL_SCALING
     zero = torch.zeros((), device=pred.device, dtype=pred.dtype)
 
+    if cfg.weight_data_gradient != 0.0:
+        with record_function("loss/data_gradient"):
+            data_gradient = _data_gradient_loss(pred, b, k)
+    else:
+        data_gradient = zero
+
     if cfg.weight_pde != 0.0:
         with record_function("loss/pde"):
             u = unit_coll if unit_coll is not None else torch.rand(
@@ -883,7 +892,28 @@ def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
         surface = zero
 
     return {"data": data, "initial": initial, "flow_boundary": flow,
-            "pde": pde, "surface": surface}
+            "pde": pde, "surface": surface, "data_gradient": data_gradient}
+
+
+def _data_gradient_loss(pred: torch.Tensor, b: CaseBatch, k: int) -> torch.Tensor:
+    """Squared mismatch of one-grid-step differences along x, y and z (terrain-following levels) between
+    prediction and simulation, standardized fields, averaged over measured pairs, the three directions and
+    the cases. Needs each case's interior to be its full initial grid at every lead (initial_from_targets)."""
+    ic = b.initial_coords[:int(b.initial_sizes[0])]
+    nx, ny = (int(torch.unique(ic[:, a]).numel()) for a in (0, 1))
+    nz = ic.shape[0] // (nx * ny)
+    if nx * ny * nz != ic.shape[0] or b.interior.shape[0] % (k * ic.shape[0]):
+        raise ValueError("data_gradient needs every case's interior on its full initial grid (initial_from_targets).")
+    shape = (k, -1, nx, ny, nz, pred.shape[1])            # case, lead, x, y, z, field
+    err = ((pred - b.targets) * b.target_mask).reshape(shape)
+    mask = b.target_mask.reshape(shape)
+    out = 0.0
+    for ax in (2, 3, 4):
+        n = err.shape[ax] - 1
+        both = mask.narrow(ax, 1, n) * mask.narrow(ax, 0, n)
+        d2 = (torch.diff(err, dim=ax) * both) ** 2
+        out = out + (d2.sum(dim=(1, 2, 3, 4, 5)) / both.sum(dim=(1, 2, 3, 4, 5)).clamp_min(1.0)).mean()
+    return out / 3
 
 
 def _case_losses(model: nn.Module, case: ConditionalCase,
@@ -1046,7 +1076,8 @@ def train_conditional(
 
     weights = {"data": config.weight_data, "initial": config.weight_initial,
                "flow_boundary": config.weight_flow_boundary,
-               "pde": config.weight_pde, "surface": config.weight_surface}
+               "pde": config.weight_pde, "surface": config.weight_surface,
+               "data_gradient": config.weight_data_gradient}
     balancer = METHODS[config.loss_weights](weights)
     params = list(model.parameters())
     if isinstance(balancer, torch.nn.Module):
