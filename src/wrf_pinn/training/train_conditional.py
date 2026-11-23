@@ -73,7 +73,7 @@ class ConditionalTrainConfig:
     weight_flow_boundary: float = 1.0
     weight_pde: float = 1.0
     weight_surface: float = 1.0
-    #: grid differences of the prediction against the simulation's (_data_gradient_loss); 0 = off.
+    #: spatial gradient of the prediction against the simulation's (_data_gradient_loss); 0 = off.
     weight_data_gradient: float = 0.0
     n_collocation: int = 2048     # PDE collocation points per case per step
     #: where PDE points go in each case's box: 'uniform' (new draws each step),
@@ -860,7 +860,7 @@ def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
 
     if cfg.weight_data_gradient != 0.0:
         with record_function("loss/data_gradient"):
-            data_gradient = _data_gradient_loss(pred, b, k)
+            data_gradient = _data_gradient_loss(pred, b, k, cfg)
     else:
         data_gradient = zero
 
@@ -895,25 +895,38 @@ def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
             "pde": pde, "surface": surface, "data_gradient": data_gradient}
 
 
-def _data_gradient_loss(pred: torch.Tensor, b: CaseBatch, k: int) -> torch.Tensor:
-    """Squared mismatch of one-grid-step differences along x, y and z (terrain-following levels) between
-    prediction and simulation, standardized fields, averaged over measured pairs, the three directions and
-    the cases. Needs each case's interior to be its full initial grid at every lead (initial_from_targets)."""
+def _data_gradient_loss(pred: torch.Tensor, b: CaseBatch, k: int, cfg: "ConditionalTrainConfig") -> torch.Tensor:
+    """Squared mismatch of the spatial gradient of every field, |grad(prediction) - grad(simulation)|^2 summed over
+    d/dx, d/dy, d/dz at constant altitude, times the horizontal grid spacing squared, averaged over grid points whose
+    3 x 3 x 3 neighbourhood is measured, the fields and the cases.
+
+    Both gradients use the same second-order finite differences on the case grid (one-sided at its edges), with the
+    terrain-following chain rule from the points' physical coordinates (x, y, altitude):
+        f_z = f_k / z_k,   f_x = (f_i - z_i f_z) / x_i,   f_y = (f_j - z_j f_z) / y_j
+    where i, j, k are grid index directions. The operator is linear, so it is applied once to prediction - simulation.
+    Standardized fields, gradients in 1/m. Needs each case's interior to be its full initial grid at every lead
+    (initial_from_targets)."""
     ic = b.initial_coords[:int(b.initial_sizes[0])]
     nx, ny = (int(torch.unique(ic[:, a]).numel()) for a in (0, 1))
     nz = ic.shape[0] // (nx * ny)
     if nx * ny * nz != ic.shape[0] or b.interior.shape[0] % (k * ic.shape[0]):
         raise ValueError("data_gradient needs every case's interior on its full initial grid (initial_from_targets).")
-    shape = (k, -1, nx, ny, nz, pred.shape[1])            # case, lead, x, y, z, field
-    err = ((pred - b.targets) * b.target_mask).reshape(shape)
-    mask = b.target_mask.reshape(shape)
-    out = 0.0
-    for ax in (2, 3, 4):
-        n = err.shape[ax] - 1
-        both = mask.narrow(ax, 1, n) * mask.narrow(ax, 0, n)
-        d2 = (torch.diff(err, dim=ax) * both) ** 2
-        out = out + (d2.sum(dim=(1, 2, 3, 4, 5)) / both.sum(dim=(1, 2, 3, 4, 5)).clamp_min(1.0)).mean()
-    return out / 3
+    scaling = cfg.scaling if cfg.scaling is not None else DEFAULT_RESIDUAL_SCALING
+    off, sc = _coordinate_affine(scaling, b.interior)
+    xyz = (b.interior * sc + off).reshape(k, -1, nx, ny, nz, b.interior.shape[1])   # case, lead, i, j, k, coord
+    err = (pred - b.targets).reshape(k, -1, nx, ny, nz, pred.shape[1])            # ..., field
+    d = lambda a, ax: torch.gradient(a, dim=ax)[0]
+    xi, yj = d(xyz[..., 0], 2)[..., None], d(xyz[..., 1], 3)[..., None]
+    zi, zj, zk = (d(xyz[..., 2], ax)[..., None] for ax in (2, 3, 4))
+    fz = d(err, 4) / zk
+    fx = (d(err, 2) - zi * fz) / xi
+    fy = (d(err, 3) - zj * fz) / yj
+    g2 = (fx ** 2 + fy ** 2 + fz ** 2) * cfg.terrain_xy_scale ** 2
+    m = b.target_mask.reshape(err.shape).movedim(-1, 2).reshape(-1, 1, nx, ny, nz)
+    ok = (-torch.nn.functional.max_pool3d(-m, 3, stride=1, padding=1)).reshape(
+        err.shape[0], err.shape[1], err.shape[-1], nx, ny, nz).movedim(2, -1)    # whole neighbourhood measured
+    per_case = (g2 * ok).sum(dim=(1, 2, 3, 4, 5)) / ok.sum(dim=(1, 2, 3, 4, 5)).clamp_min(1.0)
+    return per_case.mean()
 
 
 def _case_losses(model: nn.Module, case: ConditionalCase,

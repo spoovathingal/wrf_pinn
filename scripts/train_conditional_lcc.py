@@ -177,7 +177,7 @@ def main() -> int:
                     help="frequency spread per coordinate, cycles per model-coordinate unit")
     ap.add_argument("--surface-weight", type=float, default=1.0)
     ap.add_argument("--data-gradient-weight", type=float, default=0.0,
-                    help="weight of the data-gradient loss: grid differences along x, y, z of the prediction "
+                    help="weight of the data-gradient loss: d/dx, d/dy, d/dz at constant altitude of the prediction "
                          "against the simulation's (needs --initial-from-targets); 0 = off")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--score-out", type=Path, default=None,
