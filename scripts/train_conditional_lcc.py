@@ -179,6 +179,9 @@ def main() -> int:
     ap.add_argument("--data-gradient-weight", type=float, default=0.0,
                     help="weight of the data-gradient loss: d/dx, d/dy, d/dz at constant altitude of the prediction "
                          "against the simulation's (needs --initial-from-targets); 0 = off")
+    ap.add_argument("--spectral-weight", type=float, default=0.0,
+                    help="weight of the spectral energy loss: squared log difference of the horizontal energy "
+                         "spectrum of each case, prediction against simulation (needs --initial-from-targets); 0 = off")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--score-out", type=Path, default=None,
                     help="after training, score the model on the test cases into this JSON")
@@ -289,7 +292,7 @@ def main() -> int:
             log_every=args.log_every,
             learning_rate=args.lr, learning_rate_min=args.lr_min,
             weight_flow_boundary=args.boundary_weight, weight_pde=args.pde_weight,
-            weight_surface=args.surface_weight, weight_data_gradient=args.data_gradient_weight, seed=args.seed, stop_epoch=args.stop_epoch,
+            weight_surface=args.surface_weight, weight_data_gradient=args.data_gradient_weight, weight_spectral=args.spectral_weight, seed=args.seed, stop_epoch=args.stop_epoch,
             loss_weights=args.loss_weights, optimizer=args.optimizer,
             source_scaling=source_scaling, scaling=scaling,
             terrain_xy_scale=args.grid_spacing,

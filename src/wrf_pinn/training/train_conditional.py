@@ -33,8 +33,8 @@ from wrf_pinn.models.conditional import (
 from wrf_pinn.training.provenance import run_manifest, write_event
 from wrf_pinn.training.losses import PDEResidualScales
 from wrf_pinn.physics.grid_geometry import sgs_filter_width, terrain_height_jet
-#: the losses of the conditional PINN, in order (data_gradient only when its weight is set).
-LOSS_NAMES: tuple[str, ...] = ("data", "initial", "flow_boundary", "pde", "surface", "data_gradient")
+#: the losses of the conditional PINN, in order (data_gradient and spectral only when their weight is set).
+LOSS_NAMES: tuple[str, ...] = ("data", "initial", "flow_boundary", "pde", "surface", "data_gradient", "spectral")
 PDE_RAW_NAMES = ("mass", "x_momentum", "y_momentum", "z_momentum",
     "potential_temperature", "water_vapor")
 SURFACE_RAW_NAMES = ("surface_stress_xz", "surface_stress_yz",
@@ -52,6 +52,7 @@ class ConditionalHistory:
     pde: list[float] = field(default_factory=list)
     surface: list[float] = field(default_factory=list)
     data_gradient: list[float] = field(default_factory=list)
+    spectral: list[float] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,8 @@ class ConditionalTrainConfig:
     weight_surface: float = 1.0
     #: spatial gradient of the prediction against the simulation's (_data_gradient_loss); 0 = off.
     weight_data_gradient: float = 0.0
+    #: log horizontal energy spectrum of the prediction against the simulation's (_spectral_loss); 0 = off.
+    weight_spectral: float = 0.0
     n_collocation: int = 2048     # PDE collocation points per case per step
     #: where PDE points go in each case's box: 'uniform' (new draws each step),
     #: 'squared-height' (same, height draw squared: more points near the ground) or
@@ -864,6 +867,12 @@ def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
     else:
         data_gradient = zero
 
+    if cfg.weight_spectral != 0.0:
+        with record_function("loss/spectral"):
+            spectral = _spectral_loss(pred, b, k)
+    else:
+        spectral = zero
+
     if cfg.weight_pde != 0.0:
         with record_function("loss/pde"):
             u = unit_coll if unit_coll is not None else torch.rand(
@@ -892,7 +901,7 @@ def _batch_losses(model: nn.Module, b: CaseBatch, cfg: "ConditionalTrainConfig",
         surface = zero
 
     return {"data": data, "initial": initial, "flow_boundary": flow,
-            "pde": pde, "surface": surface, "data_gradient": data_gradient}
+            "pde": pde, "surface": surface, "data_gradient": data_gradient, "spectral": spectral}
 
 
 def _data_gradient_loss(pred: torch.Tensor, b: CaseBatch, k: int, cfg: "ConditionalTrainConfig") -> torch.Tensor:
@@ -927,6 +936,48 @@ def _data_gradient_loss(pred: torch.Tensor, b: CaseBatch, k: int, cfg: "Conditio
         err.shape[0], err.shape[1], err.shape[-1], nx, ny, nz).movedim(2, -1)    # whole neighbourhood measured
     per_case = (g2 * ok).sum(dim=(1, 2, 3, 4, 5)) / ok.sum(dim=(1, 2, 3, 4, 5)).clamp_min(1.0)
     return per_case.mean()
+
+
+def _spectral_loss(pred: torch.Tensor, b: CaseBatch, k: int, eps: float = 1e-6) -> torch.Tensor:
+    """Spectral energy loss, sum_k w_k [log(E_model(k) + e) - log(E_simulation(k) + e)]^2 with w_k = 1 / number of
+    wavenumbers, averaged over fields and cases.
+
+    E(k) is the horizontal energy spectrum of each case: per lead, grid level and field the level mean is removed, a
+    2D Hann taper applied (cases are not periodic), |FFT|^2 summed over shells of radial wavenumber k = 1 .. min(nx,
+    ny) // 2, then averaged over leads and levels. e = eps times the simulation's total energy of that case and field.
+    Phase-blind: rewards the right amount of variation at each scale, not where it sits. Standardized fields. Fields
+    with any unmeasured point in a case are left out for that case. Needs each case's interior to be its full initial
+    grid at every lead (initial_from_targets)."""
+    ic = b.initial_coords[:int(b.initial_sizes[0])]
+    nx, ny = (int(torch.unique(ic[:, a]).numel()) for a in (0, 1))
+    nz = ic.shape[0] // (nx * ny)
+    if nx * ny * nz != ic.shape[0] or b.interior.shape[0] % (k * ic.shape[0]):
+        raise ValueError("spectral needs every case's interior on its full initial grid (initial_from_targets).")
+    nf = pred.shape[1]
+    shape = (k, -1, nx, ny, nz, nf)                                                  # case, lead, i, j, level, field
+    taper = (torch.hann_window(nx, periodic=False, device=pred.device, dtype=pred.dtype)[:, None]
+             * torch.hann_window(ny, periodic=False, device=pred.device, dtype=pred.dtype)[None, :])[..., None, None]
+    kx = torch.fft.fftfreq(nx, 1 / nx, device=pred.device)[:, None]
+    ky = torch.fft.rfftfreq(ny, 1 / ny, device=pred.device)[None, :]
+    shell = torch.sqrt(kx ** 2 + ky ** 2).round().long()                              # (nx, ny // 2 + 1)
+    nk = min(nx, ny) // 2
+    onehot = torch.nn.functional.one_hot(shell.clamp(max=nk + 1).flatten(), nk + 2)[:, 1:nk + 1].to(pred.dtype)
+    # rfft keeps half of ky: each column with 0 < ky < ny / 2 stands for two coefficients
+    twice = torch.where((ky > 0) & (2 * ky != ny), 2.0, 1.0).expand(nx, -1).flatten().to(pred.dtype)[:, None]
+
+    def spectrum(f):
+        f = f.reshape(shape)
+        f = (f - f.mean(dim=(2, 3), keepdim=True)) * taper
+        p = torch.fft.rfft2(f, dim=(2, 3)).abs() ** 2                                # case, lead, i, ky, level, field
+        p = p.mean(dim=(1, 4)).movedim(-1, 1).flatten(2)                              # case, field, i*ky
+        return p @ (onehot * twice)                                                   # case, field, k
+
+    e_sim = spectrum(b.targets)
+    e_mod = spectrum(pred)
+    floor = eps * e_sim.sum(dim=-1, keepdim=True)
+    per = ((torch.log(e_mod + floor) - torch.log(e_sim + floor)) ** 2).mean(dim=-1)   # case, field
+    ok = b.target_mask.to(pred.dtype).reshape(shape).amin(dim=(1, 2, 3, 4))            # field fully measured
+    return ((per * ok).sum(dim=1) / ok.sum(dim=1).clamp_min(1.0)).mean()
 
 
 def _case_losses(model: nn.Module, case: ConditionalCase,
@@ -1090,7 +1141,7 @@ def train_conditional(
     weights = {"data": config.weight_data, "initial": config.weight_initial,
                "flow_boundary": config.weight_flow_boundary,
                "pde": config.weight_pde, "surface": config.weight_surface,
-               "data_gradient": config.weight_data_gradient}
+               "data_gradient": config.weight_data_gradient, "spectral": config.weight_spectral}
     balancer = METHODS[config.loss_weights](weights)
     params = list(model.parameters())
     if isinstance(balancer, torch.nn.Module):
