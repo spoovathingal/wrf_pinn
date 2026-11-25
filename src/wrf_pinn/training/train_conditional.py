@@ -81,8 +81,11 @@ class ConditionalTrainConfig:
     n_collocation: int = 2048     # PDE collocation points per case per step
     #: where PDE points go in each case's box: 'uniform' (new draws each step),
     #: 'squared-height' (same, height draw squared: more points near the ground) or
-    #: 'fixed-grid' (n_collocation simulation grid nodes, drawn once, reused every step)
+    #: 'fixed-grid' (n_collocation simulation grid nodes, drawn once, reused every step) or
+    #: 'grid' (n_collocation simulation grid nodes, drawn anew every step and case)
     collocation: str = "uniform"
+    #: the PDE residuals in the loss (subset of PDE_RAW_NAMES); all six are still logged.
+    pde_equations: tuple[str, ...] = PDE_RAW_NAMES
     n_wall: int = 512             # surface/wall points per case per step
     grad_clip_norm: float = 1.0   # clip grads (PINN PDE gradients can spike)
     #: affine scaling (physical = offset + scale*normalized) for the residuals,
@@ -156,6 +159,8 @@ class ConditionalTrainConfig:
     #: train_conditional fills it from model.config.
     model_config: "ConditionalModelConfig | None" = None
     def __post_init__(self) -> None:
+        if not self.pde_equations or set(self.pde_equations) - set(PDE_RAW_NAMES):
+            raise ValueError(f"pde_equations must be a non-empty subset of {PDE_RAW_NAMES}.")
         if (not math.isfinite(self.terrain_top_height) or self.terrain_top_height <= 0.0):
             raise ValueError("terrain_top_height must be finite and positive.")
 
@@ -591,6 +596,13 @@ def step_functions(model: nn.Module, compile: bool = False) -> StepFunctions:
     return StepFunctions(*(torch.compile(f) for f in (fns.forward, fns.taylor, fns.pde_residuals)))
 
 
+def grid_unit_axes(case: ConditionalCase) -> list[torch.Tensor]:
+    """Interior grid axes (x, y, model level, snapshot time) as [0, 1] positions in the PDE box."""
+    interior = torch.as_tensor(case.interior, dtype=torch.float64)
+    axes = [torch.unique(interior[:, j]) for j in range(interior.shape[1])]
+    return [((a - a[0]) / (a[-1] - a[0])).float() for a in axes]
+
+
 def grid_unit_points(case: ConditionalCase, n: int, seed: int) -> torch.Tensor:
     """n distinct grid nodes of a case's interior (x, y nodes, model levels, snapshot
     times) as [0, 1] positions in its PDE box: the box spans the interior's extremes, so
@@ -613,6 +625,9 @@ def grid_unit_points(case: ConditionalCase, n: int, seed: int) -> torch.Tensor:
 
 def _unit_collocation(k: int, config, n_coord: int, fixed_grid, device) -> torch.Tensor:
     """(k, n_collocation, n_coord) [0, 1) positions of the step's PDE points."""
+    if isinstance(fixed_grid, list):   # 'grid': fresh nodes, each axis index drawn uniformly
+        return torch.stack([a[torch.randint(len(a), (k, config.n_collocation), device=device)]
+                            for a in fixed_grid], dim=-1)
     if fixed_grid is not None:
         return fixed_grid.expand(k, -1, -1)
     u = torch.rand((k, config.n_collocation, n_coord), device=device)
@@ -710,7 +725,7 @@ def _pde_loss(model, coll: torch.Tensor, z: torch.Tensor, cfg, scaling, fns: Ste
               out: "Jet | None" = None,
               *, terrain_batch: CaseBatch, raw_mse: dict[str, torch.Tensor] | None = None,
               ) -> torch.Tensor:
-    """Mean of six PDE residual MSEs, using local SGS widths.
+    """Mean of the cfg.pde_equations residual MSEs, using local SGS widths.
 
     ``z`` holds one latent row per case; each case owns ``cfg.n_collocation``
     consecutive rows of ``coll``. A tanh ConditionalModel takes the forward-Taylor
@@ -762,8 +777,8 @@ def _pde_loss(model, coll: torch.Tensor, z: torch.Tensor, cfg, scaling, fns: Ste
         })
 
     return torch.stack([
-        (r / cfg.pde_residual_scales.scale_for(name)).square().mean()
-        for name, r in res.items()
+        (res[name] / cfg.pde_residual_scales.scale_for(name)).square().mean()
+        for name in cfg.pde_equations
     ]).mean()
 
 
@@ -1158,12 +1173,16 @@ def train_conditional(
     k = min(config.batch_cases, n_cases)
     draw = lambda: torch.randperm(n_cases, generator=rng)[:k].tolist()
     fixed_grid = None
-    if config.collocation == "fixed-grid":
+    if config.collocation in ("fixed-grid", "grid"):
         first = (read_conditional_case(case_paths[0], config.latent, config.initial_from_targets,
                                        config.time_mean)
                  if case_paths is not None else cases[0])
-        fixed_grid = grid_unit_points(first, config.n_collocation, config.seed).to(device)
-        if rank == 0:
+        fixed_grid = ([a.to(device) for a in grid_unit_axes(first)] if config.collocation == "grid"
+                      else grid_unit_points(first, config.n_collocation, config.seed).to(device))
+        if rank == 0 and config.collocation == "grid":
+            print(f"PDE points: {config.n_collocation} simulation grid nodes, new every step and case",
+                  file=sys.stderr, flush=True)
+        elif rank == 0:
             print(f"PDE points: {config.n_collocation} fixed grid nodes (seed {config.seed}), "
                   "the same every step and case", file=sys.stderr, flush=True)
     elif config.collocation not in ("uniform", "squared-height"):

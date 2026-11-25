@@ -25,7 +25,7 @@ from wrf_pinn.data.conditional_case import COORD_NAMES, STATE_VARS, ConditionalM
 from wrf_pinn.models.conditional import (
     RHO_D_INDEX, TKE_INDEX, ConditionalModel, ConditionalModelConfig, RawEncoder, RawProjection)
 from wrf_pinn.training.train_conditional import (
-    ConditionalTrainConfig, train_conditional,
+    PDE_RAW_NAMES, ConditionalTrainConfig, train_conditional,
 )
 
 log = logging.getLogger("train_conditional_lcc")
@@ -167,8 +167,10 @@ def main() -> int:
     ap.add_argument("--hidden-width", type=int, default=128)
     ap.add_argument("--activation", choices=("tanh", "silu", "gelu", "relu", "sin", "adaptive-tanh"), default="tanh")
     ap.add_argument("--initializer", choices=("default", "xavier"), default="default")
-    ap.add_argument("--collocation", choices=("uniform", "squared-height", "fixed-grid"),
+    ap.add_argument("--collocation", choices=("uniform", "squared-height", "fixed-grid", "grid"),
                     default="uniform", help="PDE point placement (ConditionalTrainConfig.collocation)")
+    ap.add_argument("--pde-equations", nargs="+", default=list(PDE_RAW_NAMES), choices=PDE_RAW_NAMES,
+                    help="PDE residuals in the loss; all six are still logged")
     ap.add_argument("--n-collocation", type=int, default=2048, help="PDE points per case per step")
     ap.add_argument("--fourier-features", type=int, default=0,
                     help="random Fourier features on the coordinates (0 = off)")
@@ -307,6 +309,7 @@ def main() -> int:
             initial_from_targets=args.initial_from_targets,
             time_mean=args.time_mean,
             collocation=args.collocation, n_collocation=args.n_collocation,
+            pde_equations=tuple(args.pde_equations),
         )
 
         log.info(
