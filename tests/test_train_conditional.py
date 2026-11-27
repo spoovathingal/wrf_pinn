@@ -308,8 +308,10 @@ def test_collocation_points_independent_of_cases_per_pass(monkeypatch):
     def collocation(cases_per_pass: int) -> torch.Tensor:
         seen = []
 
-        def fake_pde(model, coll, z_rows, cfg, scaling, fns=None, *, terrain_batch):  # random data NaNs the real PDE
+        def fake_pde(model, coll, z_rows, cfg, scaling, fns=None, *, terrain_batch, raw_mse=None):  # random data NaNs the real PDE
             seen.append(coll.detach().clone())
+            if raw_mse is not None:  # training logs the raw residuals on the first step
+                raw_mse.update({name: coll.new_zeros(()) for name in tc.PDE_RAW_NAMES})
             return (model(coll, z_rows, cfg.n_collocation) * 0.0).sum()  # z per case
 
         monkeypatch.setattr(tc, "_pde_loss", fake_pde)
@@ -481,7 +483,7 @@ def test_terrain_collocation_matches_observations(monkeypatch):
     )
     seen = {}
 
-    def capture_pde(model, coll, z_rows, config, scaling, fns, *, terrain_batch):
+    def capture_pde(model, coll, z_rows, config, scaling, fns, *, terrain_batch, raw_mse=None):
         seen["coordinates"] = coll.detach().clone()
         return coll.new_zeros(())
 

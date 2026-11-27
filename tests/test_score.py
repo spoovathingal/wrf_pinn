@@ -17,4 +17,4 @@ def test_score_cases_covers_every_point():
     assert sum(out["points_by_height"]) == sum(float(c.target_mask[:, 0].sum()) for c in cases)
     for name in ("r2", "rmse", "bias", "spread_pooled"):
         assert all(math.isfinite(v) for v in out["all"][name])
-    assert set(out["losses"]) == {"data", "initial", "flow_boundary", "pde", "surface"}
+    assert set(out["losses"]) == {"data", "initial", "flow_boundary", "pde", "surface", "data_gradient", "spectral"}
